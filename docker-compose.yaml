@@ -1,0 +1,21 @@
+version: '3.3'
+services:
+  semanticlidarthab:
+    shm_size: 24G
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+      args:
+        - USER_ID=$USER_ID
+        - USER_NAME=$USER_NAME
+    image: semanticlidar:0.1
+    container_name: Semantic_LiDAR_THAB
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ./dataset:/home/${USER_NAME}/data
+      - ./src:/home/${USER_NAME}/repos
+    entrypoint: ["tail", "-f", "/dev/null"]
+    privileged: true
+    runtime: nvidia
+
