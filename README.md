@@ -107,7 +107,7 @@ Ensure the following data structure:
 
 ³ See the revision log for details on changes in architecture and training procedure.
 
-⁴ Models were pre-trained on SemanticKitti
+⁴ Models pre-trained on SemanticKitti
 
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
