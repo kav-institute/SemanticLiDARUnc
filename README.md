@@ -82,7 +82,6 @@ Ensure the following data structure:
 ```
 ### Model Zoo
 
-#### SemanticKitti
 ![image info](./Images/Inference_KITTI.png)
 
 ¹ input resolution of 128x2048, no postprocessing, no augmentation
