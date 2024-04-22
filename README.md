@@ -81,6 +81,7 @@ Ensure the following data structure:
 
 #### SemanticKitti
 ![image info](./Images/Inference_KITTI.png)
+
 ¹ input resolution of 128x2048, no postprocessing, no augmentation
 
 ² input resolution of 64x2048
