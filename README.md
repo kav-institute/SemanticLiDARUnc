@@ -80,6 +80,7 @@ Ensure the following data structure:
 ### Model Zoo
 
 #### SemanticKitti
+![image info](./Images/Inference_KITTI.png)
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
 |:--------:|:----------:|:---------------:|:----:|:------:|:------:|
 | [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
