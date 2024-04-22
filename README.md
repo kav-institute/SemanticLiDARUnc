@@ -8,7 +8,6 @@ Tool for semantic lidar model training.
 ### VS-Code:
 The project is designed to be delevoped within vs-code IDE using remote container development.
 
-## Usage:
 ### Setup Docker Container
 In docker-compse.yaml all parameters are defined.
 ```bash
@@ -27,6 +26,26 @@ docker-compose up -d
 # Stop the container
 docker compose down
 ```
+## Dataset
+### Semantic THAB
+We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
+For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
+To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
+
+
+| Date | Sequences |  Status    | Size | Meta | Split
+|:----:|:---------:|:-------------:|:---------:|:------:|:------:|
+| 070324    | [[0001]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
+| 190324    | [[0001]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
+| 190324    | [[0002]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
+| 190324    | [[0003]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
+| 190324    | [[0004]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  400   | Inner City                         | Train
+| 190324    | [[0005]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  603   | Inner City                         | Test
+| 190324    | [[0006]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Inner City                          | Test
+| 190324    | [[0007]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Residential Area & Campus TH AB     | Test
+| 190324    | [[0008]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Campus TH AB                        | Train
+
+## Training:
 ### Train Semantic Kitti
 Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset [1].
 
@@ -47,22 +66,6 @@ Ensure the following data structure:
 ```
 
 ### Train Semantic THAB
-We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
-For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
-To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
-
-
-| Date | Sequences |  Status    | Size | Meta | Split
-|:----:|:---------:|:-------------:|:---------:|:------:|:------:|
-| 070324    | [[0001]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
-| 190324    | [[0001]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
-| 190324    | [[0002]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
-| 190324    | [[0003]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
-| 190324    | [[0004]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  400   | Inner City                         | Train
-| 190324    | [[0005]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  603   | Inner City                         | Test
-| 190324    | [[0006]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Inner City                          | Test
-| 190324    | [[0007]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Residential Area & Campus TH AB     | Test
-| 190324    | [[0008]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Campus TH AB                        | Train
 
 Ensure the following data structure:
 
@@ -88,26 +91,22 @@ Ensure the following data structure:
 
 ³ input resolution of 64x512, no postprocessing, no augmentation
 
-| Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
-|:--------:|:----------:|:---------------:|:----:|:------:|:------:|
-| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+You can download pre-trained models from our model zoo:
 
-#### SemanticTHAB⁴
-| Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
-|:--------:|:----------:|:---------------:|:----:|:------:|:------:|
-| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+| Dataset | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
+|:-------:|:--------:|:----------:|:---------------:|:----:|:------:|
+|SemanticKitti| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
+|SemanticKitti| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
+|SemanticKitti| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ 
 
 ¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
 
 ² Model input size is 128x2048, mIoU is measured over the Eval set.
 
-³ See the revision log for details on changes in architecture and training procedure.
-
-⁴ Models pre-trained on SemanticKitti
+³ Models pre-trained on SemanticKitti
 
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
