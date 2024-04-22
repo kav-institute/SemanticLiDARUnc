@@ -2,7 +2,6 @@
 
 Tool for semantic lidar model training.
 
-
 [![Watch the video](https://cdn.discordapp.com/attachments/709432890458374204/1219546130115727390/image.png?ex=66309bd7&is=661e26d7&hm=c48cbefebdc49abcba54b0350bd200d4fae5accf0a629c695a429e82c0eac7f9&)](https://drive.google.com/file/d/1R7l4302yjyHZzcCP7Cm9vKr7sSnPDih_/view)
 ## Development environment:
 
@@ -49,7 +48,7 @@ Ensure the following data structure:
 
 ### Train Semantic THAB
 We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
-For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [2]. 
+For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
 To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
 
 
@@ -78,4 +77,7 @@ Ensure the following data structure:
 │   │   │   │   │   ├── label
 │   │   │   │   │   │   ├── *.label
 ```
+### References
+[1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
+
 
