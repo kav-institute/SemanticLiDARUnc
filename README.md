@@ -83,15 +83,15 @@ Ensure the following data structure:
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
 |:--------:|:----------:|:---------------:|:----:|:------:|:------:|
 | [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  10ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  10ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
 
 #### SemanticTHAB
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
 |:--------:|:----------:|:---------------:|:----:|:------:|:------:|
 | [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  10ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
-| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  10ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
 
 ¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
 
