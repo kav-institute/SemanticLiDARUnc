@@ -81,6 +81,12 @@ Ensure the following data structure:
 
 #### SemanticKitti
 ![image info](./Images/Inference_KITTI.png)
+¹ input resolution of 128x2048, no postprocessing, no augmentation
+
+² input resolution of 64x2048
+
+³ input resolution of 64x512, no postprocessing, no augmentation
+
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
 |:--------:|:----------:|:---------------:|:----:|:------:|:------:|
 | [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
