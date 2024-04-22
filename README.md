@@ -1,4 +1,4 @@
-# Semantic LiDAR training tool 
+# Semantic LiDAR
 
 Tool for semantic lidar model training.
 
