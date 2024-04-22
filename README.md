@@ -95,12 +95,12 @@ You can download pre-trained models from our model zoo:
 
 | Dataset | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
 |:-------:|:--------:|:----------:|:---------------:|:----:|:------:|
-|SemanticKitti| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
-|SemanticKitti| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
-|SemanticKitti| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{green}Online}$$ 
+|SemanticKitti| [[THAB_RN18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
+|SemanticKitti| [[THAB_RN34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
+|SemanticKitti| [[THAB_RN50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{red}Oflline}$$
+|SemanticTHAB³| [[THAB_RN18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[THAB_RN34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[THAB_RN50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  50ms  | 54.5%  | $${\color{red}Oflline}$$
 
 ¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
 
