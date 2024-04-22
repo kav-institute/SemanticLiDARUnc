@@ -107,6 +107,10 @@ You can download pre-trained models from our model zoo:
 
 ³ Models pre-trained on SemanticKitti
 
+## Inference:
+You can explore /src/inference_ouster.py for an example how to use our method with a data stream from an Ouster OS2-128 sensor.
+We provide a sample sensor recording.
+
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
 
