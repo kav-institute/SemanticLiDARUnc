@@ -29,9 +29,41 @@ docker-compose up -d
 docker compose down
 ```
 ### Train Semantic Kitti
-Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset.
+Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset [1].
 
 Extract the folders to ./dataset
+
+Ensure the following data structure:
+
+```
+├── data
+│   ├── SemanticKitti
+│   │   ├── dataset
+│   │   │   ├── sequences
+│   │   │   │   ├── 00
+│   │   │   │   │   ├── velodyne
+│   │   │   │   │   │   ├── *.bin
+│   │   │   │   │   ├── label
+│   │   │   │   │   │   ├── *.label
+```
+
+### Train Semantic THAB
+We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
+For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [2]. 
+To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
+
+
+| Date | Sequences |  Status    | Size | Meta | Split
+|:----:|:---------:|:-------------:|:---------:|:------:|:------:|
+| 070324    | [[0001]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
+| 190324    | [[0001]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
+| 190324    | [[0002]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Eval
+| 190324    | [[0003]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
+| 190324    | [[0004]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  400   | Inner City                         | Train
+| 190324    | [[0005]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  603   | Inner City                         | Test
+| 190324    | [[0006]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Inner City                          | Test
+| 190324    | [[0007]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Residential Area & Campus TH AB     | Test
+| 190324    | [[0008]](https://drive.google.com/file/d/1Uvms0DD5SUiGKAVgz6WQZWCwCnaOdUBd/view?usp=sharing)    | $${\color{red}Oflline}$$  |  ??   | Campus TH AB                        | Train
 
 Ensure the following data structure:
 
