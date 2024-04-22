@@ -77,6 +77,28 @@ Ensure the following data structure:
 │   │   │   │   │   ├── label
 │   │   │   │   │   │   ├── *.label
 ```
+### Model Zoo
+
+#### SemanticKitti
+| Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
+|:--------:|:----------:|:---------------:|:----:|:------:|:------:|
+| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  10ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  10ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+
+#### SemanticTHAB
+| Backbone | Parameters | Inference Time¹ | mIoU² | Status | Revision³
+|:--------:|:----------:|:---------------:|:----:|:------:|:------:|
+| [[ResNet18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  10ms  | 54%  | $${\color{green}Online}$$ | 0.0.1
+| [[ResNet50]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  128 M     |  10ms  | 54.5%  | $${\color{green}Online}$$ | 0.0.1
+
+¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
+
+² Model input size is 128x2048, mIoU is measured over the Eval set.
+
+³ See the revision log for details on changes in architecture and training procedure.
+
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
 
