@@ -65,21 +65,32 @@ Ensure the following data structure:
 │   │   │   │   │   │   ├── *.label
 ```
 
+Run the training by:
+```bash
+python src/train_semantic_Kitti.py --model_type resnet34 --learning_rate 0.001 --num_epochs 50 --batch_size 1 --num_workers 1 --rotate --flip --visualization
+```
+
 ### Train Semantic THAB
 
 Ensure the following data structure:
 
 ```
 ├── data
-│   ├── SemanticKitti
-│   │   ├── dataset
-│   │   │   ├── sequences
-│   │   │   │   ├── 00
-│   │   │   │   │   ├── velodyne
-│   │   │   │   │   │   ├── *.bin
-│   │   │   │   │   ├── label
-│   │   │   │   │   │   ├── *.label
+│   ├── SemanticTHAB
+│   │   ├── 070323 # Date
+│   │   │   ├── 0001 # SequenceID
+│   │   │   │   ├── velodyne
+│   │   │   │   │   ├── *.bin
+│   │   │   │   ├── label
+│   │   │   │   │   ├── *.label
+
 ```
+
+Run the training by:
+```bash
+python src/train_semantic_THAB.py --model_type resnet34 --learning_rate 0.001 --num_epochs 50 --batch_size 8 --num_workers 16 --rotate --flip --visualization
+```
+
 ### Model Zoo
 
 ![image info](./Images/Inference_KITTI.png)
