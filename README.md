@@ -97,7 +97,7 @@ You can download pre-trained models from our model zoo:
 |SemanticKitti| [[THAB_RN18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 51.72%  | $${\color{green}Online}$$ 
 |SemanticKitti| [[THAB_RN34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 57%  | $${\color{green}Online}$$ 
 |SemanticTHAB³| [[THAB_RN18]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  18 M      |  10ms  | 49%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[THAB_RN34]](https://drive.google.com/file/d/1HY0PkAwEnBLZRL1_-m4tZtezJxW2Pu5Y/view?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
+|SemanticTHAB³| [[THAB_RN34]](https://drive.google.com/drive/folders/1tmyw1RNRtcm3tHld2owxVHm1-2Fvrnzn?usp=sharing) |  28 M      |  14ms  | 54%  | $${\color{green}Online}$$ 
 
 
 ¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
