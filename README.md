@@ -39,11 +39,11 @@ To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we ha
 | 190324    | [[0001]](https://drive.google.com/file/d/1I69_bAd4E_1VeGDvnlf2HgxgVJnEhc3G/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
 | 190324    | [[0002]](https://drive.google.com/file/d/1fJ2uhToOQArDZW0wQcnDWeLQViExk7Zy/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
 | 190324    | [[0003]](https://drive.google.com/file/d/167E8YQWMhifcUOtMSgp-YpCiEAR72gJA/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
-| 190324    | [[0004]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Oflline}$$  |  400   | Inner City                         | Train
-| 190324    | [[0005]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Oflline}$$  |  603   | Inner City                         | Test
-| 190324    | [[0006]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Oflline}$$  |  ??   | Inner City                          | Test
-| 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Oflline}$$  |  ??   | Residential Area & Campus TH AB     | Test
-| 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Oflline}$$  |  ??   | Campus TH AB                        | Train
+| 190324    | [[0004]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  400   | Inner City                         | Train
+| 190324    | [[0005]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  603   | Inner City                         | Test
+| 190324    | [[0006]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Inner City                          | Test
+| 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Residential Area & Campus TH AB     | Test
+| 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Campus TH AB                        | Train
 
 ## Training:
 ### Train Semantic Kitti
@@ -107,7 +107,7 @@ You can download pre-trained models from our model zoo:
 |:-------:|:--------:|:----------:|:---------------:|:----:|:------:|
 |SemanticKitti| [[THAB_RN18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18 M      |  10ms  | 51.72%  | $${\color{green}Online}$$ 
 |SemanticKitti| [[THAB_RN34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28 M      |  14ms  | 57%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[THAB_RN18]](https://de.wikipedia.org/wiki/HTTP_404) |  18 M      |  10ms  | --  | $${\color{red}Oflline}$$
+|SemanticTHAB³| [[THAB_RN18]](https://de.wikipedia.org/wiki/HTTP_404) |  18 M      |  10ms  | --  | $${\color{red}Offline}$$
 |SemanticTHAB³| [[THAB_RN34]](https://drive.google.com/drive/folders/1tmyw1RNRtcm3tHld2owxVHm1-2Fvrnzn?usp=sharing) |  28 M      |  14ms  | 72%  | $${\color{green}Online}$$ 
 
 
