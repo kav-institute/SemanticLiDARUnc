@@ -41,6 +41,7 @@ nocs_model.to(device)
 nocs_model.eval()
 
 print("num_params", count_parameters(nocs_model))
+print("Hello")
 
 pcap_path = "/home/appuser/data/Inference/190324/0006/Ouster/OS-2-128-992317000331-2048x10.pcap"
 metadata_path = "/home/appuser/data/Inference/190324/0006/Ouster/OS-2-128-992317000331-2048x10.json"
