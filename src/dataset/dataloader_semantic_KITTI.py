@@ -47,7 +47,7 @@ class SemanticKitti(Dataset):
             random_angle = np.random.randint(-180,180)
             xyzil[...,0:3] = rotate_z(xyzil[...,0:3].reshape(-1,3), random_angle)
         xyzi_img, _, _ , _ = spherical_projection(xyzil,64,2048)
-        xyzi_img = cv2.resize(xyzi_img, (2048,128), interpolation=cv2.INTER_NEAREST)
+        #xyzi_img = cv2.resize(xyzi_img, (2048,128), interpolation=cv2.INTER_NEAREST)
         
         if self.flip:
             do_flip = np.random.choice([True, False])
