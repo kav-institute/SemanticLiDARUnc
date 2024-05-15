@@ -57,8 +57,8 @@ def visualize_semantic_segmentation_cv2(mask, class_colors):
 def main(args):
     # DataLoader
     
-    data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")]
-    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")]
+    data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")][0:1000]
+    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")][0:100]
     
     depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip)
     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -163,6 +163,7 @@ def main(args):
         print(f"Train Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss}")
 
         total_loss = 0.0
+        inference_times = []
         total_loss_RMSE = 0.0
         num_classes = 20
         intersection = torch.zeros(num_classes)
@@ -175,12 +176,16 @@ def main(args):
         for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloader_test):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(device), reflectivity.to(device), xyz.to(device), normals.to(device), semantic.to(device)
             start_time = time.time()
-            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
-                    
-            curr_time = (time.time()-start_time)*1000
-            
 
-            loss_semantic = criterion_semantic(outputs_semantic, semantic)
+            # run forward path
+            start_time = time.time()
+            start.record()
+            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            end.record()
+            curr_time = (time.time()-start_time)*1000
+    
+            # Waits for everything to finish running
+            torch.cuda.synchronize()
             
             loss = loss_semantic
             
@@ -189,9 +194,9 @@ def main(args):
             intersection_, union_ = calculate_intersection_union(outputs_semantic_argmax, semantic, num_classes=20)
             intersection += intersection_
             union += union_
-            print("inference took {} ms. loss_semantic {}".format(curr_time, loss_semantic.item()))
+            print("inference took {} ms. loss_semantic {}".format(start.elapsed_time(end), loss_semantic.item()))
             
-            
+            inference_times.append(start.elapsed_time(end))
             #KNN(xyz, semseg_img, xyz_tensor)        
 
             semantics_pred = (semseg_img).permute(0, 1, 2)[0,...].cpu().detach().numpy()
@@ -243,7 +248,7 @@ def main(args):
             
         mIoU = np.nanmean(iou_per_class[1:].numpy()) # ignore background class and ignore not available classes
         writer.add_scalar('mIoU_Test', mIoU*100, epoch)
-        
+        writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         # Print average loss for the epoch
         avg_loss = total_loss / len(dataloader_test)
         avg_loss_RMSE = np.sqrt(total_loss_RMSE / len(dataloader_test))
@@ -257,15 +262,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
-    parser.add_argument('--model_type', type=str, default='resnet34',
+    parser.add_argument('--model_type', type=str, default='shufflenet_v2_x0_5',
                         help='Type of the model to be used (default: resnet34)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
-    parser.add_argument('--batch_size', type=int, default=1,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training (default: 1)')
-    parser.add_argument('--num_workers', type=int, default=1,
+    parser.add_argument('--num_workers', type=int, default=16,
                         help='Number of data loading workers (default: 1)')
     parser.add_argument('--rotate', action='store_true',
                         help='Whether to apply rotation augmentation (default: False)')
@@ -277,8 +282,4 @@ if __name__ == '__main__':
 
     main(args)
 
-
-    args = parser.parse_args()
-
-    main(args)
 
