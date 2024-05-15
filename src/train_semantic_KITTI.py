@@ -57,8 +57,8 @@ def visualize_semantic_segmentation_cv2(mask, class_colors):
 def main(args):
     # DataLoader
     
-    data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")][0:1000]
-    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")][0:100]
+    data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")]
+    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")]
     
     depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip)
     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
