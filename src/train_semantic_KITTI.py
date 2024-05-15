@@ -56,7 +56,7 @@ def main(args):
     # dataloader_test = DataLoader(depth_dataset_test, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     
     # Depth Estimation Network
-    nocs_model = SemanticNetworkWithFPN(resnet_type=args.model_type, meta_channel_dim=6, num_classes=20)
+    nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20)
     print("num_params", count_parameters(nocs_model))
     
     # Define optimizer
@@ -101,7 +101,7 @@ def main(args):
             loss_dice = criterion_dice(outputs_semantic, semantic, num_classes=20, alpha=0.9, beta=0.1)
             loss = loss_dice+loss_semantic
             
-            print("inference took time: cpu: {} ms., cuda: {} ms.".format(curr_time,start.elapsed_time(end)))
+            print("inference took time: cpu: {} ms., cuda: {} ms. loss: {}".format(curr_time,start.elapsed_time(end), loss.item()))
             
             # get the most likely class
             semseg_img = torch.argmax(outputs_semantic,dim=1)
@@ -184,5 +184,5 @@ if __name__ == '__main__':
                         help='Toggle visualization during training (default: False)')
     args = parser.parse_args()
 
-    main(args.name)
+    main(args)
 
