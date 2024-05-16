@@ -78,6 +78,7 @@ You can choose the model suitable for your application.
 
 ### SemanticKitti
 ![image info](./Images/Inference_KITTI.png)
+
 You can download pre-trained models from our model zoo:
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
 |:--------:|:----------:|:---------------:|:----:|:------:|
@@ -88,7 +89,9 @@ You can download pre-trained models from our model zoo:
 
 
 ¹ Inference time measured as forward path time at a Nivida Geforce RTX 2070 TI with batchsize of one.
-² mIoU is measured in range view representation. NaNs (from non occuring classes in SemanticKitti Val) are treated as zeros. IoU results are not directly comparable to the SemanticKitti benchmark! 
+
+² mIoU is measured in range view representation. NaNs (from non occuring classes in SemanticKitti Val) are treated as zeros.
+  IoU results are not directly comparable to the SemanticKitti benchmark! 
 
 ## Dataset
 ### Semantic THAB
