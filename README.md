@@ -26,25 +26,6 @@ docker-compose up -d
 # Stop the container
 docker compose down
 ```
-## Dataset
-### Semantic THAB
-We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
-For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
-To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
-
-
-| Date | Sequences |  Status    | Size | Meta | Split
-|:----:|:---------:|:-------------:|:---------:|:------:|:------:|
-| 070324    | [[0001]](https://drive.google.com/file/d/1v6ChrQ8eaOKVz2kEZmVoTz3aY2B46eN6/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
-| 190324    | [[0001]](https://drive.google.com/file/d/1I69_bAd4E_1VeGDvnlf2HgxgVJnEhc3G/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
-| 190324    | [[0002]](https://drive.google.com/file/d/1fJ2uhToOQArDZW0wQcnDWeLQViExk7Zy/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
-| 190324    | [[0003]](https://drive.google.com/file/d/167E8YQWMhifcUOtMSgp-YpCiEAR72gJA/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
-| 190324    | [[0004]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  400   | Inner City                         | Train
-| 190324    | [[0005]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  603   | Inner City                         | Test
-| 190324    | [[0006]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Inner City                          | Test
-| 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Residential Area & Campus TH AB     | Test
-| 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Campus TH AB                        | Train
-
 ## Training:
 ### Train Semantic Kitti
 Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset [1].
@@ -91,31 +72,43 @@ Run the training by:
 python src/train_semantic_THAB.py --model_type resnet34 --learning_rate 0.001 --num_epochs 50 --batch_size 8 --num_workers 16 --rotate --flip --visualization
 ```
 
-### Model Zoo
+## Model Zoo
+We provide a large collection of pre-trained models with different backbones, number of parameters, and inference times.
+You can choose the model suitable for your application.
 
+### SemanticKitti
 ![image info](./Images/Inference_KITTI.png)
-
-¹ input resolution of 128x2048, no postprocessing, no augmentation
-
-² input resolution of 64x2048
-
-³ input resolution of 64x512, no postprocessing, no augmentation
-
 You can download pre-trained models from our model zoo:
+| Backbone | Parameters | Inference Time¹ | mIoU² | Status 
+|:--------:|:----------:|:---------------:|:----:|:------:|
+| [[THAB_RN18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18 M      |  10ms  | 51.72%  | $${\color{green}Online}$$ 
+| [[THAB_RN34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28 M      |  14ms  | 57%  | $${\color{green}Online}$$ 
+| [[THAB_RN18]](https://de.wikipedia.org/wiki/HTTP_404) |  18 M      |  10ms  | --  | $${\color{red}Offline}$$
+| [[THAB_RN34]](https://drive.google.com/drive/folders/1tmyw1RNRtcm3tHld2owxVHm1-2Fvrnzn?usp=sharing) |  28 M      |  14ms  | 72%  | $${\color{green}Online}$$ 
 
-| Dataset | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
-|:-------:|:--------:|:----------:|:---------------:|:----:|:------:|
-|SemanticKitti| [[THAB_RN18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18 M      |  10ms  | 51.72%  | $${\color{green}Online}$$ 
-|SemanticKitti| [[THAB_RN34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28 M      |  14ms  | 57%  | $${\color{green}Online}$$ 
-|SemanticTHAB³| [[THAB_RN18]](https://de.wikipedia.org/wiki/HTTP_404) |  18 M      |  10ms  | --  | $${\color{red}Offline}$$
-|SemanticTHAB³| [[THAB_RN34]](https://drive.google.com/drive/folders/1tmyw1RNRtcm3tHld2owxVHm1-2Fvrnzn?usp=sharing) |  28 M      |  14ms  | 72%  | $${\color{green}Online}$$ 
+
+¹ Inference time measured as forward path time at a Nivida Geforce RTX 2070 TI with batchsize of one.
+² mIoU is measured in range view representation. NaNs (from non occuring classes in SemanticKitti Val) are treated as zeros. IoU results are not directly comparable to the SemanticKitti benchmark! 
+
+## Dataset
+### Semantic THAB
+We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
+For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
+To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
 
 
-¹ Inference time measured at a Nivida Geforce RTX 2070 TI.
+| Date | Sequences |  Status    | Size | Meta | Split
+|:----:|:---------:|:-------------:|:---------:|:------:|:------:|
+| 070324    | [[0001]](https://drive.google.com/file/d/1v6ChrQ8eaOKVz2kEZmVoTz3aY2B46eN6/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
+| 190324    | [[0001]](https://drive.google.com/file/d/1I69_bAd4E_1VeGDvnlf2HgxgVJnEhc3G/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
+| 190324    | [[0002]](https://drive.google.com/file/d/1fJ2uhToOQArDZW0wQcnDWeLQViExk7Zy/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
+| 190324    | [[0003]](https://drive.google.com/file/d/167E8YQWMhifcUOtMSgp-YpCiEAR72gJA/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
+| 190324    | [[0004]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  400   | Inner City                         | Train
+| 190324    | [[0005]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  603   | Inner City                         | Test
+| 190324    | [[0006]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Inner City                          | Test
+| 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Residential Area & Campus TH AB     | Test
+| 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  ??   | Campus TH AB                        | Train
 
-² Model input size is 128x2048, mIoU is measured over the Eval set.
-
-³ Models pre-trained on SemanticKitti
 
 ## Inference:
 You can explore /src/inference_ouster.py for an example how to use our method with a data stream from an Ouster OS2-128 sensor.
