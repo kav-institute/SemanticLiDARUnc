@@ -68,6 +68,7 @@ def main(args):
     
     # Depth Estimation Network
     nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20)
+    num_params = count_parameters(nocs_model)
     print("num_params", count_parameters(nocs_model))
     
     # Define optimizer
@@ -170,7 +171,7 @@ def main(args):
         union = torch.zeros(num_classes)
         nocs_model.eval()
 
-        if not (epoch % 10 == 0):
+        if (not (epoch % 10 == 0)) and (epoch != num_epochs-1):
             continue
         #vid_writer = imageio.get_writer('/workspace/data/train_SemanticKitti/ResNet50/epoch_val_{}.mp4'.format(epoch))
         for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloader_test):
@@ -187,6 +188,8 @@ def main(args):
             # Waits for everything to finish running
             torch.cuda.synchronize()
             
+            loss_semantic = criterion_semantic(outputs_semantic, semantic)
+
             loss = loss_semantic
             
             outputs_semantic_argmax = torch.argmax(outputs_semantic,dim=1)
@@ -246,9 +249,10 @@ def main(args):
                 
             writer.add_scalar('IoU_{}'.format(class_names[cls]), iou_per_class[cls].item()*100, epoch)
             
-        mIoU = np.nanmean(iou_per_class[1:].numpy()) # ignore background class and ignore not available classes
+        mIoU = np.nanmean(np.where(iou_per_class.numpy()==0, np.NaN, iou_per_class.numpy())) # ignore not available classes
         writer.add_scalar('mIoU_Test', mIoU*100, epoch)
         writer.add_scalar('Inference Time', np.median(inference_times), epoch)
+        writer.add_scalar('num_params', num_params/10e5, epoch)
         # Print average loss for the epoch
         avg_loss = total_loss / len(dataloader_test)
         avg_loss_RMSE = np.sqrt(total_loss_RMSE / len(dataloader_test))
