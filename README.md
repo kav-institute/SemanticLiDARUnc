@@ -46,9 +46,15 @@ Ensure the following data structure:
 │   │   │   │   │   │   ├── *.label
 ```
 
-Run the training by:
+Run a single training by:
 ```bash
-python src/train_semantic_Kitti.py --model_type resnet34 --learning_rate 0.001 --num_epochs 50 --batch_size 1 --num_workers 1 --rotate --flip --visualization
+appuser@a359158587ad:~/repos$ python train_semantic_Kitti.py --model_type resnet34 --learning_rate 0.001 --num_epochs 50 --batch_size 1 --num_workers 1 --rotate --flip --visualization
+```
+
+Run all trainings by:
+```bash
+appuser@a359158587ad:~/repos$ chmod +x run_training_kitti.sh
+appuser@a359158587ad:~/repos$ ./run_training_kitti.sh
 ```
 
 ### Train Semantic THAB
