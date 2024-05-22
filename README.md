@@ -88,10 +88,17 @@ You can choose the model suitable for your application.
 You can download pre-trained models from our model zoo:
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
 |:--------:|:----------:|:---------------:|:----:|:------:|
-| [[THAB_RN18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18 M      |  10ms  | 51.72%  | $${\color{green}Online}$$ 
-| [[THAB_RN34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28 M      |  14ms  | 57%  | $${\color{green}Online}$$ 
-| [[THAB_RN18]](https://de.wikipedia.org/wiki/HTTP_404) |  18 M      |  10ms  | --  | $${\color{red}Offline}$$
-| [[THAB_RN34]](https://drive.google.com/drive/folders/1tmyw1RNRtcm3tHld2owxVHm1-2Fvrnzn?usp=sharing) |  28 M      |  14ms  | 72%  | $${\color{green}Online}$$ 
+| [[resnet18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18.5 M     |  9.8 ms  | 55.6%  | $${\color{green}Online}$$ 
+| [[resnet34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28.3 M      |  13.6ms  | 57.3%  | $${\color{green}Online}$$ 
+| [[resnet50]](https://de.wikipedia.org/wiki/HTTP_404) |  128.8 M      |  43.7 ms  | 60.07%  | $${\color{red}Offline}$$
+| [[regnet_y_400mf]](https://de.wikipedia.org/wiki/HTTP_404) |  8.6 M      |  14.2 ms  | 55.0%  | $${\color{red}Offline}$$
+| [[regnet_y_800mf]](https://de.wikipedia.org/wiki/HTTP_404) |  16.7 M      |  14.4 ms  | 55.64%  | $${\color{red}Offline}$$
+| [[regnet_y_1_6gf]](https://de.wikipedia.org/wiki/HTTP_404) |  22.25 M      |  21.7 ms  | 55.78%  | $${\color{red}Offline}$$
+| [[regnet_y_3_2gf]](https://de.wikipedia.org/wiki/HTTP_404) |  52 M      |  25.1 ms  | 55.69%  | $${\color{red}Offline}$$
+| [[shufflenet_v2_x0_5]](https://de.wikipedia.org/wiki/HTTP_404) |  4.3 M      |  10.24 ms  | 55.64%  | $${\color{red}Offline}$$
+| [[shufflenet_v2_x1_0]](https://de.wikipedia.org/wiki/HTTP_404) |  13.2 M      |  15.1 ms  | 58.0%  | $${\color{red}Offline}$$
+| [[shufflenet_v2_x1_5]](https://de.wikipedia.org/wiki/HTTP_404) |  25.1 M      |  23.6 ms  | 59.38%  | $${\color{red}Offline}$$
+
 
 
 ¹ Inference time measured as forward path time at a Nivida Geforce RTX 2070 TI with batchsize of one.
