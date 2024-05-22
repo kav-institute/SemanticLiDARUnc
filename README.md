@@ -88,16 +88,16 @@ You can choose the model suitable for your application.
 You can download pre-trained models from our model zoo:
 | Backbone | Parameters | Inference Time¹ | mIoU² | Status 
 |:--------:|:----------:|:---------------:|:----:|:------:|
-| [[resnet18]](https://drive.google.com/drive/folders/1blLMyAXlmSCHIvQhBRWdbkCvDqQtW4AR?usp=sharing) |  18.5 M     |  9.8 ms  | 55.6%  | $${\color{green}Online}$$ 
-| [[resnet34]](https://drive.google.com/drive/folders/1mDyPiZBHOi1mDpw-tvoqWRuKqjcod6N4?usp=sharing) |  28.3 M      |  13.6ms  | 57.3%  | $${\color{green}Online}$$ 
-| [[resnet50]](https://de.wikipedia.org/wiki/HTTP_404) |  128.8 M      |  43.7 ms  | 60.07%  | $${\color{red}Offline}$$
-| [[regnet_y_400mf]](https://de.wikipedia.org/wiki/HTTP_404) |  8.6 M      |  14.2 ms  | 55.0%  | $${\color{red}Offline}$$
-| [[regnet_y_800mf]](https://de.wikipedia.org/wiki/HTTP_404) |  16.7 M      |  14.4 ms  | 55.64%  | $${\color{red}Offline}$$
-| [[regnet_y_1_6gf]](https://de.wikipedia.org/wiki/HTTP_404) |  22.25 M      |  21.7 ms  | 55.78%  | $${\color{red}Offline}$$
-| [[regnet_y_3_2gf]](https://de.wikipedia.org/wiki/HTTP_404) |  52 M      |  25.1 ms  | 55.69%  | $${\color{red}Offline}$$
-| [[shufflenet_v2_x0_5]](https://de.wikipedia.org/wiki/HTTP_404) |  4.3 M      |  10.24 ms  | 55.64%  | $${\color{red}Offline}$$
-| [[shufflenet_v2_x1_0]](https://de.wikipedia.org/wiki/HTTP_404) |  13.2 M      |  15.1 ms  | 58.0%  | $${\color{red}Offline}$$
-| [[shufflenet_v2_x1_5]](https://de.wikipedia.org/wiki/HTTP_404) |  25.1 M      |  23.6 ms  | 59.38%  | $${\color{red}Offline}$$
+| [resnet18](https://drive.google.com/drive/folders/1pPLbw5a5TwYnK77cjaEN5NBfhnHfZf6q?usp=sharing) |  18.5 M     |  9.8 ms  | 55.6%  | $${\color{green}Online}$$ 
+| [resnet34](https://drive.google.com/drive/folders/16VT7LU-s9LloC3w-wi2rpBeztWs1Z2az?usp=sharing) |  28.3 M      |  13.6ms  | 57.3%  | $${\color{green}Online}$$ 
+| [resnet50](https://drive.google.com/drive/folders/1bmO6shunZU20Rsr4_vZkjwXy9Av7Cmz3?usp=sharing) |  128.8 M      |  43.7 ms  | 60.07%  | $${\color{green}Online}$$ 
+| [regnet_y_400mf](https://drive.google.com/drive/folders/178phFeiDOuvMP9ML3qrivjfacUzie-JG?usp=sharing) |  8.6 M      |  14.2 ms  | 55.0%  | $${\color{green}Online}$$ 
+| [regnet_y_800mf](https://drive.google.com/drive/folders/1jaRdFrJR2vugUYf06tdT71WW0xr6oo74?usp=sharing) |  16.7 M      |  14.4 ms  | 55.64%  | $${\color{green}Online}$$ 
+| [regnet_y_1_6gf](https://drive.google.com/drive/folders/1jHjeNciRzfXASVsqWPCXW3W-ZW6lc4a8?usp=sharing) |  22.25 M      |  21.7 ms  | 55.78%  | $${\color{green}Online}$$ 
+| [regnet_y_3_2gf](https://drive.google.com/drive/folders/1f9UA4r6NWrIMmw0I9k0iNTVekjClYtmG?usp=sharing) |  52 M      |  25.1 ms  | 55.69%  | $${\color{green}Online}$$
+| [shufflenet_v2_x0_5](https://drive.google.com/drive/folders/1nk4eHfZEgeP5NBjV65vxaJfQYd8HINOg?usp=sharing) |  4.3 M      |  10.24 ms  | 53.6%  | $${\color{green}Online}$$
+| [shufflenet_v2_x1_0](https://drive.google.com/drive/folders/1OejQWT_PiGh-Y3RSVfCfOq2GKQUuhCr_?usp=sharing) |  13.2 M      |  15.1 ms  | 58.0%  | $${\color{green}Online}$$
+| [shufflenet_v2_x1_5](https://drive.google.com/drive/folders/1VVg2ns76OCPIPb2_u-nxhk7m2L8hWtEq?usp=sharing) |  25.1 M      |  23.6 ms  | 59.38%  | $${\color{green}Online}$$
 
 
 
