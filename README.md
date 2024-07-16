@@ -105,7 +105,7 @@ You can download pre-trained models from our model zoo:
 
 
 
-¹ Inference time measured as forward path time at a Nivida Geforce RTX 2070 TI with batchsize of one.
+¹ Inference time measured as forward path time at a Nivida Geforce RTX 2070 TI with batchsize of one @ 128x2048 resolution. Only the forward path through the ML Model is measured!
 
 ² mIoU is measured in range view representation. NaNs (from non occuring classes in SemanticKitti Val) are treated as zeros.
   IoU results are not directly comparable to the SemanticKitti benchmark! 
