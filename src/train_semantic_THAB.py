@@ -66,7 +66,7 @@ def main(args):
     nocs_model.to(device)
     
     # TensorBoard
-    save_path ='/home/appuser/data/train_semantic/{}/'.format(args.model_type)
+    save_path ='/home/appuser/data/train_semantic_THAB/{}/'.format(args.model_type)
     writer = SummaryWriter(save_path)
     
     for epoch in range(num_epochs):
