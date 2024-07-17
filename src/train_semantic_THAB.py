@@ -51,7 +51,7 @@ def main(args):
     nocs_model = SemanticNetworkWithFPN(resnet_type=args.model_type, meta_channel_dim=6, num_classes=20)
     print("num_params", count_parameters(nocs_model))
     if args.pretrained:
-        nocs_model.load_state_dict(torch.load("/home/appuser/data/train_semantic_kitti/ResNet18/model_final.pth"))
+        nocs_model.load_state_dict(torch.load("/home/appuser/data/train_semantic_kitti/{args.model_type}/model_final.pth"))
     
     # Define optimizer
     optimizer = optim.Adam(nocs_model.parameters(), lr=args.learning_rate)
