@@ -14,14 +14,10 @@ SMALL_NUM_WORKERS=8
 # Array of model types
 MODEL_TYPES=(
     'resnet50'
-    'regnet_y_1_6gf'
-    'regnet_y_3_2gf'
     'shufflenet_v2_x1_5'
     'resnet34'
-    'regnet_y_800mf'
     'shufflenet_v2_x1_0'
     'resnet18'
-    'regnet_y_400mf'
     'shufflenet_v2_x0_5'
 )
 
