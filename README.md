@@ -129,6 +129,8 @@ To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we ha
 | 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  517   | Residential Area & Campus TH AB     | Test
 | 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  505   | Campus TH AB                        | Train
 
+> [!NOTE]
+> For Ouster sensors the spherical projection is done by the sensor itselfe. To use the data you only have to reshape to [128,2048,4] and [128,2048] for the .bin and .label files.
 
 ## Inference:
 You can explore /src/inference_ouster.py for an example how to use our method with a data stream from an Ouster OS2-128 sensor.
