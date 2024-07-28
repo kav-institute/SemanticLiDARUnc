@@ -30,6 +30,8 @@ docker-compose up -d
 # Stop the container
 docker compose down
 ```
+> [!CAUTION]
+> xhost + is not a save operation!
 ## Training:
 ### Train Semantic Kitti
 Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset [1].
