@@ -67,7 +67,10 @@ def main(args):
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=4)
     
     # Depth Estimation Network
-    nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20)
+    if args.normals:
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention)
+    else:
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention)
     num_params = count_parameters(nocs_model)
     print("num_params", count_parameters(nocs_model))
     
@@ -79,7 +82,8 @@ def main(args):
     criterion_semantic = SemanticSegmentationLoss()
     
     # TensorBoard
-    save_path ='/home/appuser/data/train_semantic/{}/'.format(args.model_type)
+
+    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "")
     writer = SummaryWriter(save_path)
     
     # Timer
@@ -213,7 +217,7 @@ def main(args):
             
             if args.visualization:
                 cv2.imshow("inf", np.vstack((prev_sem_pred,prev_sem_gt)))
-                if (cv.waitKey(1) & 0xFF) == ord('q'):
+                if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     
                     grid_size = 50
                     step_size = 1
@@ -266,7 +270,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
-    parser.add_argument('--model_type', type=str, default='shufflenet_v2_x0_5',
+    parser.add_argument('--model_type', type=str, default='resnet34',
                         help='Type of the model to be used (default: resnet34)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
                         help='Learning rate for the model (default: 0.001)')
@@ -278,6 +282,10 @@ if __name__ == '__main__':
                         help='Number of data loading workers (default: 1)')
     parser.add_argument('--rotate', action='store_true',
                         help='Whether to apply rotation augmentation (default: False)')
+    parser.add_argument('--attention', action='store_true',
+                        help='Whether to use attention (default: False)')
+    parser.add_argument('--normals', action='store_true',
+                        help='Whether to normals as input (default: False)')
     parser.add_argument('--flip', action='store_true',
                         help='Whether to apply flip augmentation (default: False)')
     parser.add_argument('--visualization', action='store_true',
@@ -285,5 +293,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     main(args)
-
 
