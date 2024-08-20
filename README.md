@@ -34,23 +34,6 @@ docker compose down
 > xhost + is not a save operation!
 ## Training:
 ### Train Semantic Kitti
-Download the [SemanticKitti](http://www.semantic-kitti.org/) dataset [1].
-
-Extract the folders to ./dataset
-
-Ensure the following data structure:
-
-```
-├── data
-│   ├── SemanticKitti
-│   │   ├── dataset
-│   │   │   ├── sequences
-│   │   │   │   ├── 00
-│   │   │   │   │   ├── velodyne
-│   │   │   │   │   │   ├── *.bin
-│   │   │   │   │   ├── label
-│   │   │   │   │   │   ├── *.label
-```
 
 Run a single training by:
 ```bash
@@ -64,20 +47,6 @@ appuser@a359158587ad:~/repos$ ./run_training_kitti.sh
 ```
 
 ### Train Semantic THAB
-
-Ensure the following data structure:
-
-```
-├── data
-│   ├── SemanticTHAB
-│   │   ├── 070323 # Date
-│   │   │   ├── 0001 # SequenceID
-│   │   │   │   ├── velodyne
-│   │   │   │   │   ├── *.bin
-│   │   │   │   ├── label
-│   │   │   │   │   ├── *.label
-
-```
 
 Run the training by:
 ```bash
