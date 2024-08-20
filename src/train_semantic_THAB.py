@@ -206,7 +206,7 @@ def main(args):
         union = torch.zeros(num_classes)
         nocs_model.eval()
 
-        if (not (epoch % 10 == 0)) and (epoch != num_epochs-1):
+        if (not (epoch % args.test_every_nth_epoch == 0)) and (epoch != num_epochs-1):
             continue
         #vid_writer = imageio.get_writer('/workspace/data/train_SemanticKitti/ResNet50/epoch_val_{}.mp4'.format(epoch))
         for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloader_test):
@@ -284,7 +284,7 @@ def main(args):
                 
             writer.add_scalar('IoU_{}'.format(class_names[cls]), iou_per_class[cls].item()*100, epoch)
             
-        mIoU = np.nanmean(np.where(iou_per_class.numpy()==0, np.NaN, iou_per_class.numpy())) # ignore not available classes
+        mIoU = np.nanmedian(np.where(iou_per_class.numpy()==0, np.NaN, iou_per_class.numpy())) # ignore not available classes
         writer.add_scalar('mIoU_Test', mIoU*100, epoch)
         writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         writer.add_scalar('num_params', num_params/10e5, epoch)
@@ -308,6 +308,8 @@ if __name__ == '__main__':
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
+    parser.add_argument('--test_every_nth_epoch', type=int, default=10,
+                        help='Test every nth epoch (default: 10)')
     parser.add_argument('--test_id', type=int, default=1,
                         help='Test ID of the test sequence for the leave one out CV. -1 for training on all')
     parser.add_argument('--batch_size', type=int, default=8,
