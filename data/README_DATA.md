@@ -34,6 +34,7 @@ Ensure the following data structure:
 │   │   │   │   ├── label
 │   │   │   │   │   ├── *.label
 
+```
 <a name="license"></a>
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
