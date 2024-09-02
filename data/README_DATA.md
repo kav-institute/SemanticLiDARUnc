@@ -56,6 +56,16 @@ Ensure the following data structure:
 
 ```
 <a name="license"></a>
+
+## Labeling
+We use the ouster2kitty.py script to convert Ouster recordings to the kitti format. For the SLAM we use the slam provided in the Ouster API.
+```bash
+# First Create OSF file with ego motion
+ouster-cli source .../xxx.pcap slam viz --accum-num 20 -o .../xxx.osf
+# Than use OSF file to convert the recodring
+python ouster2kitti.py --save_path .../kitti --osf_path .../xxx.osf --config_path .../xxx.json
+```
+
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
 
