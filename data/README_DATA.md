@@ -66,6 +66,10 @@ ouster-cli source .../xxx.pcap slam viz --accum-num 20 -o .../xxx.osf
 python ouster2kitti.py --save_path .../kitti --osf_path .../xxx.osf --config_path .../xxx.json
 ```
 
+> [!NOTE]
+> We use the LEGACY config for our Ouster recodings and record at 2048@10Hz.
+
+
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
 
