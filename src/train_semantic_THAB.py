@@ -79,13 +79,16 @@ def main(args):
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
     
     # Depth Estimation Network
-    nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20)
+    if args.normals:
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+    else:
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
     num_params = count_parameters(nocs_model)
     print("num_params", count_parameters(nocs_model))
     
 
     if args.pretrained:
-        load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "")
+        load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
         nocs_model.load_state_dict(torch.load(os.path.join(load_path,"model_final.pth")))
     
     # Define optimizer
@@ -111,7 +114,7 @@ def main(args):
         save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format("final")
     
 
-    save_path_p2 ='{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "p" if args.pretrained else "")
+    save_path_p2 ='{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "")
 
     
     save_path = os.path.join(save_path_p1,save_path_p2)
@@ -128,7 +131,10 @@ def main(args):
             # run forward path
             start_time = time.time()
             start.record()
-            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if args.normals:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), xyz)
             end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -216,7 +222,10 @@ def main(args):
             # run forward path
             start_time = time.time()
             start.record()
-            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if args.normals:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), xyz)
             end.record()
             curr_time = (time.time()-start_time)*1000
     
