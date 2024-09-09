@@ -331,6 +331,8 @@ if __name__ == '__main__':
                         help='Whether to use attention (default: False)')
     parser.add_argument('--normals', action='store_true',
                         help='Whether to normals as input (default: False)')
+    parser.add_argument('--multi_scale_meta', action='store_true',
+                        help='Whether to to inject meta data at multiple scales (default: False)')
     parser.add_argument('--pretrained', action='store_true',
                         help='Whether to use a model pretrained on SemanticKitti (default: False)')
     parser.add_argument('--flip', action='store_true',
