@@ -68,9 +68,9 @@ def main(args):
     
     # Depth Estimation Network
     if args.normals:
-        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention)
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
     else:
-        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention)
+        nocs_model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
     num_params = count_parameters(nocs_model)
     print("num_params", count_parameters(nocs_model))
     
@@ -105,7 +105,11 @@ def main(args):
             # run forward path
             start_time = time.time()
             start.record()
-            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if args.normals:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), xyz)
+        
             end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -288,6 +292,8 @@ if __name__ == '__main__':
                         help='Whether to use attention (default: False)')
     parser.add_argument('--normals', action='store_true',
                         help='Whether to normals as input (default: False)')
+    parser.add_argument('--multi_scale_meta', action='store_true',
+                        help='Whether to to inject meta data at multiple scales (default: False)')
     parser.add_argument('--flip', action='store_true',
                         help='Whether to apply flip augmentation (default: False)')
     parser.add_argument('--visualization', action='store_true',
