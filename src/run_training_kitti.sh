@@ -41,8 +41,11 @@ do
     do
         for NORMALS_FLAG in "--normals" ""
         do
-            echo "Training with model: $MODEL_TYPE, Batch size: $BATCH_SIZE, Num workers: $NUM_WORKERS, Attention: $ATTENTION_FLAG, Normals: $NORMALS_FLAG"
-            python $SCRIPT_PATH --model_type $MODEL_TYPE --learning_rate $LEARNING_RATE --num_epochs $NUM_EPOCHS --batch_size $BATCH_SIZE --num_workers $NUM_WORKERS --rotate --flip $ATTENTION_FLAG $NORMALS_FLAG
+            for MULTI_SCALE_FLAG in "--multi_scale_meta" ""
+            do
+                echo "Training with model: $MODEL_TYPE, Batch size: $BATCH_SIZE, Num workers: $NUM_WORKERS, Attention: $ATTENTION_FLAG, Normals: $NORMALS_FLAG"
+                python $SCRIPT_PATH --model_type $MODEL_TYPE --learning_rate $LEARNING_RATE --num_epochs $NUM_EPOCHS --batch_size $BATCH_SIZE --num_workers $NUM_WORKERS --rotate --flip $ATTENTION_FLAG $NORMALS_FLAG $MULTI_SCALE_FLAG
+            done
         done
     done
 done
