@@ -52,13 +52,14 @@ class SemanticNetworkWithFPN(nn.Module):#
         attention (bool): Option to use a attention mechanism in the FPN (see: https://arxiv.org/pdf/1706.03762.pdf)
         
     """
-    def __init__(self, backbone='resnet18', meta_channel_dim=3, interpolation_mode = 'nearest', num_classes = 3, attention=True):
+    def __init__(self, backbone='resnet18', meta_channel_dim=3, interpolation_mode = 'nearest', num_classes = 3, attention=True, multi_scale_meta=True):
         super(SemanticNetworkWithFPN, self).__init__()
 
         self.backbone_name = backbone
         self.interpolation_mode = interpolation_mode
         self.num_classes = num_classes
         self.attention = attention
+        self.multi_scale_meta = multi_scale_meta
         # Load pre-trained ResNet model
         if backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=True)
@@ -199,7 +200,8 @@ class SemanticNetworkWithFPN(nn.Module):#
         
         
         # Inject meta channel before ResNet layers
-        if self.meta_channel_dim > 0:
+        #if self.meta_channel_dim > 0:
+        if self.multi_scale_meta:
             # Resize Meta Channels
             # Downsample the meta channel
             meta_channel1 = F.interpolate(meta_channel, scale_factor=1/2, mode=self.interpolation_mode)
