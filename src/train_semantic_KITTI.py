@@ -83,7 +83,7 @@ def main(args):
     
     # TensorBoard
 
-    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "")
+    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
     writer = SummaryWriter(save_path)
     
     # Timer
@@ -189,7 +189,11 @@ def main(args):
             # run forward path
             start_time = time.time()
             start.record()
-            outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if args.normals:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = nocs_model(torch.cat([range_img, reflectivity],axis=1), xyz)
+        
             end.record()
             curr_time = (time.time()-start_time)*1000
     
