@@ -88,7 +88,7 @@ def main(args):
     
 
     if args.pretrained:
-        load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
+        load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
         nocs_model.load_state_dict(torch.load(os.path.join(load_path,"model_final.pth")))
     
     # Define optimizer
@@ -114,7 +114,7 @@ def main(args):
         save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format("final")
     
 
-    save_path_p2 ='{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "")
+    save_path_p2 ='{}_{}{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "")
 
     
     save_path = os.path.join(save_path_p1,save_path_p2)
