@@ -6,7 +6,7 @@ from dataset.dataloader_semantic_KITTI import SemanticKitti
 from models.semanticFCN import SemanticNetworkWithFPN
 from models.losses import TverskyLoss, SemanticSegmentationLoss
 import torch.optim as optim
-import tqdm
+from tqdm import tqdm
 import time
 import numpy as np
 import cv2
@@ -64,7 +64,7 @@ def main(args):
     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     
     depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False)
-    dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=4)
+    dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=8)
     
     # Depth Estimation Network
     if args.normals:
@@ -83,7 +83,7 @@ def main(args):
     
     # TensorBoard
 
-    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
+    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
     writer = SummaryWriter(save_path)
     
     # Timer
@@ -99,7 +99,7 @@ def main(args):
         nocs_model.train()
         total_loss = 0.0
         # train one epoch
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(dataloader_train): #enumerate(tqdm(dataloader_train, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm(dataloader_train, desc=f"Epoch {epoch + 1}/{num_epochs}")):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(device), reflectivity.to(device), xyz.to(device), normals.to(device), semantic.to(device)
     
             # run forward path
@@ -278,17 +278,17 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
-    parser.add_argument('--model_type', type=str, default='resnet34',
+    parser.add_argument('--model_type', type=str, default='squeezenet1_1',
                         help='Type of the model to be used (default: resnet34)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
-                        help='Number of epochs for training (default: 50)')
-    parser.add_argument('--test_every_nth_epoch', type=int, default=10,
+                        help='Number of epochs for training (default: 5)')
+    parser.add_argument('--test_every_nth_epoch', type=int, default=5,
                         help='Test every nth epoch (default: 10)')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training (default: 1)')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=24,
                         help='Number of data loading workers (default: 1)')
     parser.add_argument('--rotate', action='store_true',
                         help='Whether to apply rotation augmentation (default: False)')
