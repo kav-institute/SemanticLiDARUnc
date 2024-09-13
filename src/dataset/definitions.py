@@ -1,3 +1,5 @@
+import numpy as np
+
 id_map = {
   0 : 0,     # "unlabeled"
   1 : 0,    # "outlier" mapped to "unlabeled" --------------------------mapped
@@ -171,3 +173,38 @@ class_names = {
   18: "pole",
   19: "traffic-sign",
 }
+
+color_map = {
+  0 : [0, 0, 0],
+  1 : [245, 150, 100],
+  2 : [245, 230, 100],
+  3 : [150, 60, 30],
+  4 : [180, 30, 80],
+  5 : [255, 0, 0],
+  6: [30, 30, 255],
+  7: [200, 40, 255],
+  8: [90, 30, 150],
+  9: [125,125,125],
+  10: [255, 150, 255],
+  11: [75, 0, 75],
+  12: [75, 0, 175],
+  13: [0, 200, 255],
+  14: [50, 120, 255],
+  15: [0, 175, 0],
+  16: [0, 60, 135],
+  17: [80, 240, 150],
+  18: [150, 240, 255],
+  19: [250, 250, 250],
+  20: [0, 250, 0]
+}
+
+# Create the custom color map
+custom_colormap = np.zeros((256, 1, 3), dtype=np.uint8)
+
+for i in range(256):
+    if i in color_map:
+        custom_colormap[i, 0, :] = color_map[i]
+    else:
+        # If the index is not defined in the color map, set it to black
+        custom_colormap[i, 0, :] = [0, 0, 0]
+custom_colormap = custom_colormap[...,::-1]
