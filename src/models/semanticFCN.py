@@ -97,6 +97,9 @@ class SemanticNetworkWithFPN(nn.Module):#
         elif backbone == 'shufflenet_v2_x2_0':
             self.backbone = models.shufflenet_v2_x2_0(pretrained=True)
             base_channels = [2048, 976, 488, 244, 112]
+        elif backbone == 'squeezenet1_0':
+            self.backbone = models.squeezenet1_0(pretrained=True)
+            base_channels = [512, 384, 256, 256, 112]
         else:
             raise ValueError("Invalid ResNet type. Supported types: 'resnet18', 'resnet34', 'resnet50', 'regnet_y_400mf','regnet_y_800mf', 'regnet_y_1_6gf', 'regnet_y_3_2gf', 'shufflenet_v2_x0_5', 'shufflenet_v2_x1_0', 'shufflenet_v2_x1_5', 'shufflenet_v2_x2_0.")
         
@@ -104,6 +107,7 @@ class SemanticNetworkWithFPN(nn.Module):#
         self.meta_channel_dim = meta_channel_dim
 
         is_shuffle = False
+        is_squeeze = False
         # extract features from resnet family
         if backbone in ['resnet18', 'resnet34', 'resnet50']:
             self.backbone.conv1 = nn.Conv2d(2 + meta_channel_dim, 64, kernel_size=3, stride=1, padding=1, bias=False)
@@ -114,7 +118,23 @@ class SemanticNetworkWithFPN(nn.Module):#
             self.layer2 = self.backbone.layer2
             self.layer3 = self.backbone.layer3
             self.layer4 = self.backbone.layer4
-        
+
+        elif backbone in ["squeezenet1_0"]:
+            num_channels = 64 if backbone=="squeezenet1_1" else 96
+            self.backbone.features[0] = nn.Conv2d(
+            2 + meta_channel_dim,  # Adjust the number of input channels
+            num_channels,                    # Number of output channels in the first convolutional layer
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False)
+            self.stem = self.backbone.features[0:4]
+            self.layer1 = self.backbone.features[4:6]
+            self.layer2 = self.backbone.features[6:8]
+            self.layer3 = self.backbone.features[8:10]
+            self.layer4 = self.backbone.features[10:]
+            is_squeeze = True
+            
         # extract features from regnet family
         elif backbone in ['regnet_y_400mf','regnet_y_800mf', 'regnet_y_1_6gf', 'regnet_y_3_2gf']:
             self.backbone.stem[0] = nn.Conv2d(2 + meta_channel_dim, self.backbone.stem[0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
@@ -151,15 +171,26 @@ class SemanticNetworkWithFPN(nn.Module):#
 
         # upsamle layers
         if is_shuffle:
-            self.upsample_layer_x4 = nn.ConvTranspose2d(in_channels=base_channels[1], out_channels=base_channels[1], kernel_size=4, stride=4, padding=0)
+            self.upsample_layer_x4 = nn.ConvTranspose2d(in_channels=base_channels[1], out_channels=base_channels[1]//4, kernel_size=4, stride=4, padding=0)
+            self.upsample_layer_x3 = nn.ConvTranspose2d(in_channels=base_channels[2], out_channels=base_channels[2]//4, kernel_size=4, stride=4, padding=0)
+            self.upsample_layer_x2 = nn.ConvTranspose2d(in_channels=base_channels[3], out_channels=base_channels[3]//2, kernel_size=2, stride=2, padding=0)
+            out_channels_upsample = base_channels[1]//4 + base_channels[2]//4 + base_channels[3]//2
+        elif is_squeeze:
+
+            self.upsample_layer_x4 = nn.ConvTranspose2d(in_channels=base_channels[1], out_channels=base_channels[1]//4, kernel_size=4, stride=4, padding=0)
+            self.upsample_layer_x3 = nn.ConvTranspose2d(in_channels=base_channels[2], out_channels=base_channels[2]//2, kernel_size=2, stride=2, padding=0)
+            self.upsample_layer_x2 = nn.ConvTranspose2d(in_channels=base_channels[3], out_channels=base_channels[3]//2, kernel_size=2, stride=2, padding=0)
+            out_channels_upsample = base_channels[1]//4 + base_channels[2]//2 + base_channels[3]//2
+
         else:
-            self.upsample_layer_x4 = nn.ConvTranspose2d(in_channels=base_channels[1], out_channels=base_channels[1], kernel_size=8, stride=8, padding=0)
-        self.upsample_layer_x3 = nn.ConvTranspose2d(in_channels=base_channels[2], out_channels=base_channels[2], kernel_size=4, stride=4, padding=0)
-        self.upsample_layer_x2 = nn.ConvTranspose2d(in_channels=base_channels[3], out_channels=base_channels[3], kernel_size=2, stride=2, padding=0)
-        
+            self.upsample_layer_x4 = nn.ConvTranspose2d(in_channels=base_channels[1], out_channels=base_channels[1]//8, kernel_size=8, stride=8, padding=0)
+            self.upsample_layer_x3 = nn.ConvTranspose2d(in_channels=base_channels[2], out_channels=base_channels[2]//4, kernel_size=4, stride=4, padding=0)
+            self.upsample_layer_x2 = nn.ConvTranspose2d(in_channels=base_channels[3], out_channels=base_channels[3]//2, kernel_size=2, stride=2, padding=0)
+            out_channels_upsample = base_channels[1]//8 + base_channels[2]//4 + base_channels[3]//2
+
 
         self.decoder_semantic = nn.Sequential(
-            nn.Conv2d(base_channels[1] + base_channels[2] + base_channels[3] + base_channels[4], base_channels[4], kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(out_channels_upsample + base_channels[4], base_channels[4], kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(base_channels[4]),
             nn.ReLU(inplace=True),
             nn.Conv2d(base_channels[4], base_channels[4], kernel_size=3, stride=1, padding=1),
@@ -220,6 +251,7 @@ class SemanticNetworkWithFPN(nn.Module):#
         else:
         
             # Encoder (ResNet)
+            x = torch.cat([x, meta_channel], dim=1)
             xs = self.stem(x)
             x1 = self.layer1(xs)
             x2 = self.layer2(x1)
