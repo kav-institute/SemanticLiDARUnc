@@ -57,6 +57,7 @@ do
                         echo "Training with model: $MODEL_TYPE, Batch size: $BATCH_SIZE, Num workers: $NUM_WORKERS, Attention: $ATTENTION_FLAG, Normals: $NORMALS_FLAG, Pretrain: $PRETRAIN_FLAG, Split:  $DATASET"
                         python $SCRIPT_PATH --model_type $MODEL_TYPE --learning_rate $LEARNING_RATE --num_epochs $NUM_EPOCHS --batch_size $BATCH_SIZE --num_workers $NUM_WORKERS --test_id $DATASET --flip $ATTENTION_FLAG $NORMALS_FLAG $MULTI_SCALE_FLAG $PRETRAIN_FLAG
                     done
+                done
             done
         done
     done
