@@ -67,7 +67,7 @@ def main(args):
 
     if args.test_id == -1:
         data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder)]  for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
-        data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == 2] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/dataset/{folder}/velodyne/*.bin")]
+        data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == 2] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
     else:
         data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i != args.test_id] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
         data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == args.test_id] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
