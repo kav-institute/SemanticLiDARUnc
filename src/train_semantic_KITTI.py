@@ -56,6 +56,7 @@ def visualize_semantic_segmentation_cv2(mask, class_colors):
 
 def main(args):
     # DataLoader
+    #args.visualization = True
     
     data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")]
     data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")]
@@ -278,7 +279,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
-    parser.add_argument('--model_type', type=str, default='squeezenet1_1',
+    parser.add_argument('--model_type', type=str, default='resnet50',
                         help='Type of the model to be used (default: resnet34)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
                         help='Learning rate for the model (default: 0.001)')
@@ -286,9 +287,9 @@ if __name__ == '__main__':
                         help='Number of epochs for training (default: 5)')
     parser.add_argument('--test_every_nth_epoch', type=int, default=5,
                         help='Test every nth epoch (default: 10)')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for training (default: 1)')
-    parser.add_argument('--num_workers', type=int, default=24,
+    parser.add_argument('--num_workers', type=int, default=8,
                         help='Number of data loading workers (default: 1)')
     parser.add_argument('--rotate', action='store_true',
                         help='Whether to apply rotation augmentation (default: False)')
