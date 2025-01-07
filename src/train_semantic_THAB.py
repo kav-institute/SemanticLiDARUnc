@@ -62,7 +62,7 @@ def main(args):
     # data_path_train = [(bin_path, bin_path.replace("velodyne","labels").replace("bin","label")) for bin_path in glob.glob("/home/appuser/data/SemanticTHAB/Train/*/velodyne/*.bin")]
     # data_path_test = [(bin_path, bin_path.replace("velodyne","labels").replace("bin","label")) for bin_path in glob.glob("/home/appuser/data/SemanticTHAB/Test/*/velodyne/*.bin")]
     # data_path_train += data_path_test
-    
+    #args.visualization = True
     num_folder = count_folders("/home/appuser/data/SemanticTHAB/sequences/")
 
     if args.test_id == -1:
@@ -93,6 +93,7 @@ def main(args):
     
     # Define optimizer
     optimizer = optim.Adam(nocs_model.parameters(), lr=args.learning_rate)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
     
     # Define loss functions
     criterion_dice = TverskyLoss()
@@ -125,7 +126,7 @@ def main(args):
         nocs_model.train()
         total_loss = 0.0
         # train one epoch
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(dataloader_train): #enumerate(tqdm(dataloader_train, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloader_train, desc=f"Epoch {epoch + 1}/{num_epochs}")):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(device), reflectivity.to(device), xyz.to(device), normals.to(device), semantic.to(device)
     
             # run forward path
@@ -241,7 +242,7 @@ def main(args):
             intersection_, union_ = calculate_intersection_union(outputs_semantic_argmax, semantic, num_classes=20)
             intersection += intersection_
             union += union_
-            print("inference took {} ms. loss_semantic {}".format(start.elapsed_time(end), loss_semantic.item()))
+            #print("inference took {} ms. loss_semantic {}".format(start.elapsed_time(end), loss_semantic.item()))
             
             inference_times.append(start.elapsed_time(end))
             #KNN(xyz, semseg_img, xyz_tensor)        
@@ -293,7 +294,9 @@ def main(args):
                 
             writer.add_scalar('IoU_{}'.format(class_names[cls]), iou_per_class[cls].item()*100, epoch)
             
-        mIoU = np.nanmedian(np.where(iou_per_class.numpy()==0, np.NaN, iou_per_class.numpy())) # ignore not available classes
+        mIoU = np.nanmedian(np.where(iou_per_class.numpy()<=0.1, np.NaN, iou_per_class.numpy())) # ignore not available classes
+        # Update Scheduler
+        scheduler.step(mIoU)
         writer.add_scalar('mIoU_Test', mIoU*100, epoch)
         writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         writer.add_scalar('num_params', num_params/10e5, epoch)
@@ -317,9 +320,9 @@ if __name__ == '__main__':
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
-    parser.add_argument('--test_every_nth_epoch', type=int, default=10,
-                        help='Test every nth epoch (default: 10)')
-    parser.add_argument('--test_id', type=int, default=1,
+    parser.add_argument('--test_every_nth_epoch', type=int, default=1,
+                        help='Test every nth epoch (default: 1)')
+    parser.add_argument('--test_id', type=int, default=-1,
                         help='Test ID of the test sequence for the leave one out CV. -1 for training on all')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training (default: 1)')
