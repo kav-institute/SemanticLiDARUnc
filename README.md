@@ -104,7 +104,7 @@ You can explore /src/inference_ouster.py for an example how to use our method wi
 
 ## ROS Demonstation System
 To explore a ROS2 demonstration of our system check out the following repo:
-[README.md](https://github.com/kav-institute/Semantic_LiDAR_ROS)
+[https://github.com/kav-institute/Semantic_LiDAR_ROS](https://github.com/kav-institute/Semantic_LiDAR_ROS)
 
 <a name="license"></a>
 ## License:
