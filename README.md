@@ -36,10 +36,10 @@ sudo xhost +
 sh setup.sh
 
 # Build the image from scratch using Dockerfile, can be skipped if image already exists or is loaded from docker registry
-docker-compose build --no-cache
+docker compose build --no-cache
 
 # Start the container
-docker-compose up -d
+docker compose up -d
 
 # Stop the container
 docker compose down
