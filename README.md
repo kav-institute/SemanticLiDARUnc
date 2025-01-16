@@ -103,10 +103,12 @@ appuser@a359158587ad:~/repos$ ./run_training_THAB.sh
 You can explore /src/inference_ouster.py for an example how to use our method with a data stream from an Ouster OS2-128 sensor.
 
 ## ROS Demonstation System
+To explore a ROS2 demonstration of our system check out the following repo:
+[README.md](https://github.com/kav-institute/Semantic_LiDAR_ROS)
 
 <a name="license"></a>
 ## License:
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
+This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details. Note that the dataset is provided by a different licence!
 
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
