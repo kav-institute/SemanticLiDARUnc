@@ -106,6 +106,8 @@ You can explore /src/inference_ouster.py for an example how to use our method wi
 To explore a ROS2 demonstration of our system check out the following repo:
 [https://github.com/kav-institute/Semantic_LiDAR_ROS](https://github.com/kav-institute/Semantic_LiDAR_ROS)
 
+![rgbImage](images/rviz.png)
+
 <a name="license"></a>
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details. Note that the dataset is provided by a different licence!
