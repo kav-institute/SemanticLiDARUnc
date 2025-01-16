@@ -2,27 +2,23 @@
 
 # Set common parameters
 LEARNING_RATE=0.001
-NUM_EPOCHS=30
+NUM_EPOCHS=50
 BATCH_SIZE=8
-NUM_WORKERS=16
+NUM_WORKERS=24
 SCRIPT_PATH="/home/appuser/repos/train_semantic_KITTI.py"
 
 # Specific parameters for certain models
 SMALL_BATCH_SIZE=4
-SMALL_NUM_WORKERS=8
+SMALL_NUM_WORKERS=24
 
 # Array of model types
 MODEL_TYPES=(
-    #'resnet50'
-    #'regnet_y_1_6gf'
-    #'regnet_y_3_2gf'
-    #'shufflenet_v2_x1_5'
-    'resnet34'
-    #'regnet_y_800mf'
-    #'shufflenet_v2_x1_0'
-    #'resnet18'
-    #'regnet_y_400mf'
-    #'shufflenet_v2_x0_5'
+    'resnet18'
+    'shufflenet_v2_x0_5'
+    'resnet50'
+    'shufflenet_v2_x1_5'
+    #'resnet34'
+    'shufflenet_v2_x1_0'
 )
 
 # Loop through each model type
@@ -33,18 +29,18 @@ do
         NUM_WORKERS=$SMALL_NUM_WORKERS
     else
         BATCH_SIZE=8
-        NUM_WORKERS=16
+        NUM_WORKERS=24
     fi
 
     # Loop through combinations of --attention and --normals flags
-    for ATTENTION_FLAG in "--attention" ""
+    for ATTENTION_FLAG in "--attention"
     do
-        for NORMALS_FLAG in "--normals" ""
+        for NORMALS_FLAG in "--normals" #""
         do
-            for MULTI_SCALE_FLAG in "--multi_scale_meta" ""
+            for MULTI_SCALE_FLAG in "--multi_scale_meta" #""
             do
-                echo "Training with model: $MODEL_TYPE, Batch size: $BATCH_SIZE, Num workers: $NUM_WORKERS, Attention: $ATTENTION_FLAG, Normals: $NORMALS_FLAG"
-                python $SCRIPT_PATH --model_type $MODEL_TYPE --learning_rate $LEARNING_RATE --num_epochs $NUM_EPOCHS --batch_size $BATCH_SIZE --num_workers $NUM_WORKERS --rotate --flip $ATTENTION_FLAG $NORMALS_FLAG $MULTI_SCALE_FLAG
+                echo "Training with model: $MODEL_TYPE, Batch size: $BATCH_SIZE, Num workers: $NUM_WORKERS, Attention: $ATTENTION_FLAG, Normals: $NORMALS_FLAG, MultiScale: $MULTI_SCALE_FLAG"
+                python $SCRIPT_PATH --model_type $MODEL_TYPE --learning_rate $LEARNING_RATE --num_epochs $NUM_EPOCHS --batch_size $BATCH_SIZE --flip --rotate --num_workers $NUM_WORKERS $ATTENTION_FLAG $NORMALS_FLAG $MULTI_SCALE_FLAG
             done
         done
     done
