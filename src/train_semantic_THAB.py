@@ -51,9 +51,6 @@ def main(args):
         data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i != args.test_id] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
         data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == args.test_id] for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/{folder}/velodyne/*.bin")]
     
-    data_path_train = data_path_train[0:100]
-    data_path_test = data_path_train[0:100]
-
     depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip)
     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     
@@ -112,7 +109,7 @@ if __name__ == '__main__':
                         help='Type of the model to be used (default: resnet34)')
     parser.add_argument('--learning_rate', type=float, default=0.001,
                         help='Learning rate for the model (default: 0.001)')
-    parser.add_argument('--num_epochs', type=int, default=5,
+    parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
     parser.add_argument('--test_every_nth_epoch', type=int, default=1,
                         help='Test every nth epoch (default: 1)')
