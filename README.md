@@ -7,7 +7,24 @@ A tool for training and finetuning of a semantic segmentation model on data of a
 
 ![](https://cdn.discordapp.com/attachments/1224691102284648448/1260213293596016681/point_cloud_animation.gif?ex=6695c0d6&is=66946f56&hm=8418246cc3e75192689b509672f2dea22b8bf7c9729f6ec4e562e8f1532d0c99&)
 
+
+## Datasets
+### SemanticKitti
+The SemanticKITTI dataset is a large-scale dataset designed for semantic segmentation in autonomous driving. It contains 22,000+ 3D LiDAR point clouds collected from urban environments. The dataset includes labeled point clouds with 28 semantic classes, such as road, car, pedestrian, and building. It provides ground truth annotations for training and evaluating semantic segmentation algorithms, offering a real-world benchmark for 3D scene understanding in self-driving car applications. The dataset is widely used for developing and testing models that handle point cloud data and scene interpretation in dynamic environments.
+
+### SemanticKitti
+The SemanticTHAB dataset can be seen as an extention of the SemanticKITTI dataset for modern and high resoltion 3D LiDAR sensors. It contains 4,000+ 3D LiDAR point clouds collected from urban environments. It shares a label definition with SemanticKITTI.
+
 ## Development environment:
+### Reference System
+```bash
+OS: Ubuntu 22.04.4 LTS x86_64 
+Host: B550 AORUS ELITE 
+Kernel: 6.8.0-49-generic 
+CPU: AMD Ryzen 9 3900X (24) @ 3.800G 
+GPU: NVIDIA GeForce RTX 3090 
+Memory: 32031MiB                      
+```
 
 ### VS-Code:
 The project is designed to be delevoped within vs-code IDE using remote container development.
@@ -82,7 +99,8 @@ appuser@a359158587ad:~/repos$ ./run_training_THAB.sh
 
 ## Inference:
 You can explore /src/inference_ouster.py for an example how to use our method with a data stream from an Ouster OS2-128 sensor.
-We provide a sample sensor recording.
+
+## ROS Demonstation System
 
 <a name="license"></a>
 ## License:
