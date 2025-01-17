@@ -47,7 +47,7 @@ Ensure the following data structure:
 ```
 ├── data
 │   ├── SemanticTHAB
-│   │   ├── 070323 # Date
+│   │   ├── sequences 
 │   │   │   ├── 0001 # SequenceID
 │   │   │   │   ├── velodyne
 │   │   │   │   │   ├── *.bin
