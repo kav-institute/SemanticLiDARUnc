@@ -6,11 +6,13 @@ A tool for training and finetuning of a semantic segmentation model on data of a
 ## Datasets
 See [README.md](dataset/README.md) to learn about the data preperation.
 
-### SemanticKitti
+### SemanticKitti 
 The SemanticKITTI dataset is a large-scale dataset designed for semantic segmentation in autonomous driving. It contains 22,000+ 3D LiDAR point clouds collected from urban environments. The dataset includes labeled point clouds with 28 semantic classes, such as road, car, pedestrian, and building. It provides ground truth annotations for training and evaluating semantic segmentation algorithms, offering a real-world benchmark for 3D scene understanding in self-driving car applications. The dataset is widely used for developing and testing models that handle point cloud data and scene interpretation in dynamic environments.
 
-### SemanticKitti
+### SemanticTHAB [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14677644.svg)](https://doi.org/10.5281/zenodo.14677644)
 The SemanticTHAB dataset can be seen as an extention of the SemanticKITTI dataset for modern and high resoltion 3D LiDAR sensors. It contains 4,000+ 3D LiDAR point clouds collected from urban environments. It shares the label definition with SemanticKITTI.
+
+Download the SemanticTHAB dataset from [https://zenodo.org/records/14677644](https://zenodo.org/records/14677644)
 
 ## Development environment:
 ### Reference System
@@ -62,7 +64,7 @@ appuser@a359158587ad:~/repos$ ./run_training_kitti.sh
 This will create the following results structure:
 ```
 dataset
-└───train_semantic_THAB_v2
+└───train_semantic_KITTI
 │   └───{backbone}_{model_configuration}
 │   |   │   config.json # configuration file
 │   |   │   events.out.tfevents.* # tensorflow events
@@ -79,7 +81,7 @@ python repos/train_semantic_THAB.py --model_type resnet34 --learning_rate 0.001 
 This will create the following results structure:
 ```
 dataset
-└───train_semantic_THAB_v2
+└───train_semantic_THAB
 │   └───{backbone}_{model_configuration}
 │   |   │   config.json # configuration file
 │   |   │   events.out.tfevents.* # tensorflow events
