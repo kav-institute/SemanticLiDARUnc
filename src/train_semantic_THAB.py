@@ -79,9 +79,9 @@ def main(args):
         
     # Save Path
     if args.test_id != -1:
-        save_path_p1 ='/home/appuser/data/train_semantic_THAB_v2/test_split_{}/'.format(str(args.test_id).zfill(4))
+        save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format(str(args.test_id).zfill(4))
     else:
-        save_path_p1 ='/home/appuser/data/train_semantic_THAB_v2/test_split_{}/'.format("final")
+        save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format("final")
     
 
     save_path_p2 ='{}_{}{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "")
