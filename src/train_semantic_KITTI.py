@@ -58,7 +58,7 @@ def main(args):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
 
     # Save Path
-    save_path ='/home/appuser/data/train_semantic_kitti_v2/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
+    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
     
     os.makedirs(save_path, exist_ok=True)
 
