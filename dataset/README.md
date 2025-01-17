@@ -27,17 +27,17 @@ For data annotation, we used the [Point Labeler](https://github.com/jbehley/poin
 To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we have used their class definitions.
 
 
-| Date | Sequences |  Status    | Size | Meta | Split
+| Date | Sequences |  Status    | Size | Meta | Note
 |:----:|:---------:|:-------------:|:---------:|:------:|:------:|
-| 070324    | [[0001]](https://drive.google.com/file/d/1v6ChrQ8eaOKVz2kEZmVoTz3aY2B46eN6/view?usp=sharing)    | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area | Train
-| 190324    | [[0001]](https://drive.google.com/file/d/1I69_bAd4E_1VeGDvnlf2HgxgVJnEhc3G/view?usp=sharing)    | $${\color{green}Online}$$ |  344   | City Ring Road                     | Train
-| 190324    | [[0002]](https://drive.google.com/file/d/1fJ2uhToOQArDZW0wQcnDWeLQViExk7Zy/view?usp=sharing)    | $${\color{green}Online}$$ |  228   | Inner City                         | Train
-| 190324    | [[0003]](https://drive.google.com/file/d/167E8YQWMhifcUOtMSgp-YpCiEAR72gJA/view?usp=sharing)    | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Train
-| 190324    | [[0004]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  400   | Inner City                         | Train
-| 190324    | [[0005]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  603   | Inner City                         | Test
-| 190324    | [[0006]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  320   | Inner City                          | Test
-| 190324    | [[0007]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  517   | Residential Area & Campus TH AB     | Test
-| 190324    | [[0008]](https://de.wikipedia.org/wiki/HTTP_404)    | $${\color{red}Offline}$$  |  505   | Campus TH AB                        | Train
+| 070324    | 0000 | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area |
+| 190324    | 0001 | $${\color{green}Online}$$ |  344   | City Ring Road                     |
+| 190324    | 0002 | $${\color{green}Online}$$ |  228   | Inner City                         |
+| 190324    | 0003 | $${\color{green}Online}$$ |  743   | Pedestrian Area                    |
+| 190324    | 0004 | $${\color{green}Online}$$  |  400   | Inner City                         |
+| 190324    | 0005 | $${\color{green}Online}$$  |  603   | Inner City                         |
+| 190324    | 0006 | $${\color{green}Online}$$  |  320   | Inner City                         |
+| 190324    | 0007 | $${\color{green}Online}$$  |  517   | Residential Area & Campus TH AB    | 
+| 190324    | 0008 | $${\color{red}Offline}$$  |  505   | Campus TH AB                       | Under Review 
 
 > [!NOTE]
 > For Ouster sensors the spherical projection is done by the sensor itselfe. To use the data you only have to reshape to [128,2048,4] and [128,2048] for the .bin and .label files.
