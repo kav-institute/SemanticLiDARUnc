@@ -1,7 +1,7 @@
 # Semantic LiDAR
 
 A tool for training and finetuning of a semantic segmentation model on data of an Ouster OS2-128 (Rev 7), collected @ TH AB
-
+[![Everything Is AWESOME](Images/prev_image.png)](https://www.youtube.com/watch?v=d7v6hlMiOuw)
 
 ## Datasets
 See [README.md](dataset/README.md) to learn about the data preperation.
