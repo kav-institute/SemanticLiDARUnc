@@ -108,7 +108,12 @@ To explore a ROS2 demonstration of our system check out the following repo:
 ![rgbImage](Images/rviz_screenshot.png)
 
 <a name="license"></a>
+
+
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details. Note that the dataset is provided by a different licence!
 
-
+## Contributors
+<a href="https://github.com/kav-institute/SemanticLiDAR/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=kav-institute/SemanticLiDAR" />
+</a>
