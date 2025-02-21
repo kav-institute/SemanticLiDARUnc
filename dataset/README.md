@@ -20,7 +20,7 @@ Ensure the following data structure:
 ```
 
 
-### Semantic THAB
+### Semantic THAB [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14906179.svg)](https://doi.org/10.5281/zenodo.14906179)
 
 We created our dataset using an Ouster OS2-128 (Rev 7) from sequences recorded in Aschaffenburg (Germany). 
 For data annotation, we used the [Point Labeler](https://github.com/jbehley/point_labeler) from [1]. 
