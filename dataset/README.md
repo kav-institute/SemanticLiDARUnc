@@ -32,12 +32,12 @@ To be consistent with [SemanticKitti](http://www.semantic-kitti.org/) [1], we ha
 | 070324    | 0000 | $${\color{green}Online}$$ |  1090  | Residential Area / Industrial Area |
 | 190324    | 0001 | $${\color{green}Online}$$ |  344   | City Ring Road                     |
 | 190324    | 0002 | $${\color{green}Online}$$ |  228   | Inner City                         |
-| 190324    | 0003 | $${\color{green}Online}$$ |  743   | Pedestrian Area                    |
+| 190324    | 0003 | $${\color{green}Online}$$ |  743   | Pedestrian Area                    | Fixed Lane Markings in v3
 | 190324    | 0004 | $${\color{green}Online}$$  |  400   | Inner City                         |
 | 190324    | 0005 | $${\color{green}Online}$$  |  603   | Inner City                         |
 | 190324    | 0006 | $${\color{green}Online}$$  |  320   | Inner City                         |
 | 190324    | 0007 | $${\color{green}Online}$$  |  517   | Residential Area & Campus TH AB    | 
-| 190324    | 0008 | $${\color{red}Offline}$$  |  505   | Campus TH AB                       | Under Review 
+| 190324    | 0008 | $${\color{green}Online}$$  |  505   | Campus TH AB                       | Added Labels in v3
 
 > [!NOTE]
 > For Ouster sensors the spherical projection is done by the sensor itselfe. To use the data you only have to reshape to [128,2048,4] and [128,2048] for the .bin and .label files.
