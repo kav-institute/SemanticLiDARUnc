@@ -3,6 +3,7 @@ import numpy as np
 id_map = {
   0 : 0,     # "unlabeled"
   1 : 0,    # "outlier" mapped to "unlabeled" --------------------------mapped
+  9: 0,
   10: 1,     # "car"
   11: 2,     # "bicycle"
   13: 5,     # "bus" mapped to "other-vehicle" --------------------------mapped
