@@ -57,22 +57,6 @@ Ensure the following data structure:
 ```
 <a name="license"></a>
 
-## Labeling
-We use the ouster2kitty.py script to convert Ouster recordings to the kitti format. For the SLAM we use the slam provided in the Ouster API.
-```bash
-# First Create OSF file with ego motion
-ouster-cli source .../xxx.pcap slam viz --accum-num 20 -o .../xxx.osf
-# Than use OSF file to convert the recodring
-python ouster2kitti.py --save_path .../kitti --osf_path .../xxx.osf --config_path .../xxx.json
-```
-
-> [!NOTE]
-> We use the LEGACY config for our Ouster recodings and record at 2048@10Hz.
-
-
-## License:
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
-
 ### References
 [1]   J. Behley et al., "SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences," 2019 IEEE/CVF International Conference on Computer Vision (ICCV), Seoul, Korea (South), 2019, pp. 9296-9306, doi: 10.1109/ICCV.2019.00939.
 
