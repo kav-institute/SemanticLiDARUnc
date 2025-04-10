@@ -286,3 +286,27 @@ class SemanticNetworkWithFPN(nn.Module):#
         
         return x_semantics
     
+if __name__ == "__main__":
+    import time
+    import numpy as np
+    model = SemanticNetworkWithFPN(num_classes=20, backbone="resnet50", meta_channel_dim=6).cuda()
+    pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Number of parameters: ", pytorch_total_params / 1000000, "M")
+    # Timer
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    inference_times = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(100):
+            inputs = torch.randn(1, 2, 128, 2048).to(torch.float32).cuda()
+            meta = torch.randn(1, 6, 128, 2048).to(torch.float32).cuda()
+            start.record()
+            outputs = model(inputs, meta)
+            end.record()
+            torch.cuda.synchronize()  # wait for cuda to finish (cuda is asynchronous!)
+            print("inference took {} ms".format(start.elapsed_time(end)))
+            
+            inference_times.append(start.elapsed_time(end))
+            #time.sleep(0.15)
+    print("inference mean {} ms".format(np.mean(inference_times)))
