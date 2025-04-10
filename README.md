@@ -3,6 +3,11 @@
 A tool for training and finetuning of a semantic segmentation model on data of an Ouster OS2-128 (Rev 7), collected @ TH AB
 [![Everything Is AWESOME](Images/prev_image.png)](https://www.youtube.com/watch?v=d7v6hlMiOuw)
 
+## Documentation
+1. [DATASET](documentation/dataset.md)
+2. [EVALUATION](documentation/evaluation.md)
+3. [BASELINES](documentation/baselines.md)
+
 ## Datasets
 See [README.md](dataset/README.md) to learn about the data preperation.
 
