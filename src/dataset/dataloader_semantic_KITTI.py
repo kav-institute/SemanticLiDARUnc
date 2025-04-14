@@ -93,14 +93,10 @@ def main():
         reflectivity = (reflectivity[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
         normal_img = (normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2
         prev_sem_pred = cv2.applyColorMap(np.uint8(semantics), custom_colormap)
-        #cv2.imshow("semseg", prev_sem_pred[...,::-1])
-        #cv2.imshow("reflectivity", cv2.applyColorMap(np.uint8(255*reflectivity),cv2.COLORMAP_JET))
-        cv2.imwrite("/home/appuser/data/train_semantic_kitti/vis_data/labels/{}.png".format(str(batch_idx).zfill(7)), prev_sem_pred)
-        cv2.imwrite("/home/appuser/data/train_semantic_kitti/vis_data/reflectivity/{}.png".format(str(batch_idx).zfill(7)), cv2.applyColorMap(np.uint8(255*reflectivity),cv2.COLORMAP_JET))
-        cv2.imwrite("/home/appuser/data/train_semantic_kitti/vis_data/normals/{}.png".format(str(batch_idx).zfill(7)), np.uint8(255*normal_img))
-        cv2.imwrite("/home/appuser/data/train_semantic_kitti/vis_data/stacked/{}.png".format(str(batch_idx).zfill(7)), np.vstack([cv2.applyColorMap(np.uint8(255*reflectivity),cv2.COLORMAP_JET), np.uint8(255*normal_img), prev_sem_pred[...,::-1]]))
+        cv2.imshow("semseg", prev_sem_pred[...,::-1])
+        cv2.imshow("reflectivity", cv2.applyColorMap(np.uint8(255*reflectivity),cv2.COLORMAP_JET))
 
-        #cv2.waitKey(0)
+        cv2.waitKey(0)
 
 if __name__ == "__main__":
     main()
