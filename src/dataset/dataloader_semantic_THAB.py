@@ -86,9 +86,9 @@ class SemanticKitti(Dataset):
 def main():
     import glob
     import cv2 
-    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in sorted(glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/0006/velodyne/*.bin"))]
+    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in sorted(glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/0008/velodyne/*.bin"))]
     depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False)
-    dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False)
+    dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False)#, num_workers=8)
 
     for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloader_test):
         semantics = (semantic[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
