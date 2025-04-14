@@ -57,6 +57,7 @@ class Trainer:
         self.num_classes = self.config["NUM_CLASSES"]
         self.class_names = self.config["CLASS_NAMES"]
         self.class_colors = self.config["CLASS_COLORS"]
+        self.aux = self.config["AUX"]
 
         # TensorBoard
         self.save_path = save_path
@@ -86,9 +87,10 @@ class Trainer:
             # run forward path
             start_time = time.time()
             self.start.record()
-
-            outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
-
+            if self.aux:
+                outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
+            else:
+                outputs_semantic = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
             self.end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -97,13 +99,16 @@ class Trainer:
             
             # get losses
             loss_semantic = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
-            loss_semantic_r1 = self.criterion_semantic(res_2, semantic, num_classes=self.num_classes) + self.criterion_dice(res_2, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
-            loss_semantic_r2 = self.criterion_semantic(res_3, semantic, num_classes=self.num_classes) + self.criterion_dice(res_3, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
-            loss_semantic_r3 = self.criterion_semantic(res_4, semantic, num_classes=self.num_classes) + self.criterion_dice(res_4, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
             loss_dice = self.criterion_dice(outputs_semantic, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
-            l1 = 1.0 
-            loss = loss_dice+loss_semantic + l1 * (loss_semantic_r1+loss_semantic_r2+loss_semantic_r3)
-            #loss = loss_dice+loss_semantic
+            loss = loss_semantic + loss_dice
+            if self.aux:
+                loss_semantic_r1 = self.criterion_semantic(res_2, semantic, num_classes=self.num_classes) + self.criterion_dice(res_2, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
+                loss_semantic_r2 = self.criterion_semantic(res_3, semantic, num_classes=self.num_classes) + self.criterion_dice(res_3, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
+                loss_semantic_r3 = self.criterion_semantic(res_4, semantic, num_classes=self.num_classes) + self.criterion_dice(res_4, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
+                
+                l1 = 1.0 
+                loss = loss+loss_semantic + l1 * (loss_semantic_r1+loss_semantic_r2+loss_semantic_r3)
+
             
             # get the most likely class
             semseg_img = torch.argmax(outputs_semantic,dim=1)
@@ -159,7 +164,10 @@ class Trainer:
             # run forward path
             start_time = time.time()
             self.start.record()
-            outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
+            if self.aux:
+                outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
+            else:
+                outputs_semantic = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
             self.end.record()
             curr_time = (time.time()-start_time)*1000
             
