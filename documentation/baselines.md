@@ -4,6 +4,14 @@
 ## FIDNet
 FIDNet (Fully Interpolation Decoding Network) is designed to perform semantic segmentation on LiDAR point clouds by projecting them into 2D spherical range images. This transformation allows the use of conventional 2D convolutional neural networks for processing.
 
+### Train Details ###
+```
+Pretrained: True
+Epochs: 30
+Batch Size: 2
+Learning Rate: 0.001
+Loss: Cross Entropy + Tversky
+```
 ### Publication ###
 ```
 @article{zhao2021fidnet,
@@ -21,6 +29,15 @@ The FIDNet repo does not provide a Licence File. Contantact the maintainer of th
 
 ## CENet
 CENet: Toward Concise and Efficient LiDAR Semantic Segmentation for Autonomous Driving
+
+### Train Details ###
+```
+Pretrained: True
+Epochs: 10
+Batch Size: 2
+Learning Rate: 0001
+Loss: Cross Entropy + Tversky (Plan B, Multi-Scale Loss, see CENet-Paper)
+```
 
 ### Publication ###
 ```
