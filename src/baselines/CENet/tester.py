@@ -54,6 +54,7 @@ class Tester:
         self.num_classes = self.config["NUM_CLASSES"]
         self.class_names = self.config["CLASS_NAMES"]
         self.class_colors = self.config["CLASS_COLORS"]
+        self.aux = self.config["AUX"]
 
         self.save_path = os.path.dirname(save_path)
         time.sleep(3)
@@ -82,7 +83,10 @@ class Tester:
             start_time = time.time()
             self.start.record()
 
-            outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
+            if self.aux:
+                outputs_semantic, res_2, res_3, res_4 = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
+            else:
+                outputs_semantic = self.model(torch.cat([range_img, reflectivity, xyz],axis=1))
 
             self.end.record()
             curr_time = (time.time()-start_time)*1000
