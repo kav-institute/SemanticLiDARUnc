@@ -5,11 +5,14 @@ from CENet_HardDNet import HarDNet
 from CENet_ResNet34 import ResNet_34
 
 class CENet(nn.Module):
-    def __init__(self, nclasses, aux=True, model="HarDNet"):
+    def __init__(self, nclasses, aux=True, model="HarDNet", modeldir=None):
         super(CENet, self).__init__()
         self.aux = aux
         if model=="HarDNet":
             self.model = HarDNet(nclasses, aux=aux)
+            if isinstance(modeldir, str):
+                w_dict = torch.load(modeldir,map_location=lambda storage, loc: storage)
+                self.model.load_state_dict(w_dict['state_dict'], strict=False)
         elif model=="ResNet_34":
             self.model = ResNet_34(nclasses, aux=aux)
         
