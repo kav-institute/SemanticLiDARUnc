@@ -21,7 +21,7 @@ id_map = {
   50: 13,    # "building"
   51: 14,    # "fence"
   52: 0,     # "other-structure" mapped to "unlabeled" ------------------mapped
-  60: 9,     # "lane-marking" to "road" ---------------------------------mapped
+  60: 19,     # "lane-marking" to "traffic-sign" ------------------------mapped
   70: 15,    # "vegetation"
   71: 16,    # "trunk"
   72: 17,    # "terrain"
@@ -41,6 +41,7 @@ id_map = {
 id_map_reduced = {
   0 : 0,     # "unlabeled"
   1 : 0,    # "outlier" mapped to "unlabeled" --------------------------mapped
+  9: 0,
   10: 1,     # "car"
   11: 2,     # "bicycle" mapped to "two-wheeled -------------------mapped
   13: 3,     # "bus" mapped to "other-vehicle" --------------------------mapped
