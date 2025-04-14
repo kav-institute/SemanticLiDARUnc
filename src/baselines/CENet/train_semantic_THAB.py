@@ -40,7 +40,8 @@ def main(args):
     config["CLASS_COLORS"] = color_map
     config["NUM_EPOCHS"] = args.num_epochs
     config["BATCH_SIZE"] = args.batch_size
-    config["TEST_MASK"] = [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
+    config["AUX"] = True
+    #config["TRAIN_AUX"] = False
 
     num_folder = count_folders("/home/appuser/data/SemanticTHAB/sequences/")
 
@@ -64,7 +65,7 @@ def main(args):
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
     
     # Network definition
-    model = CENet(nclasses=20,model=args.model_type)
+    model = CENet(nclasses=20,model=args.model_type,aux=config["AUX"], modeldir = "/home/appuser/data/baselines/Backbone HarDNet/hard-plus+planb/SENet_valid_best")
     num_params = count_parameters(model)
     config["NUM_PARAMS"] = num_params
     print("num_params", count_parameters(model))
@@ -101,11 +102,11 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticTHAB')
-    parser.add_argument('--model_type', type=str, default='ResNet_34',
-                        help='Type of the model to be used (default: resnet34)')
-    parser.add_argument('--learning_rate', type=float, default=0.001,
+    parser.add_argument('--model_type', type=str, default='HarDNet',
+                        help='Type of the model to be used (default: HarDNet)')
+    parser.add_argument('--learning_rate', type=float, default=0.0001,
                         help='Learning rate for the model (default: 0.001)')
-    parser.add_argument('--num_epochs', type=int, default=30,
+    parser.add_argument('--num_epochs', type=int, default=10,
                         help='Number of epochs for training (default: 50)')
     parser.add_argument('--test_every_nth_epoch', type=int, default=1,
                         help='Test every nth epoch (default: 1)')
