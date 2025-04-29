@@ -100,6 +100,18 @@ class SemanticNetworkWithFPN(nn.Module):#
         elif backbone == 'squeezenet1_0':
             self.backbone = models.squeezenet1_0(pretrained=True)
             base_channels = [512, 384, 256, 256, 112]
+        elif backbone == 'efficientnet_v2_s':
+            # Use EfficientNetV2-S from torchvision
+            self.backbone = models.efficientnet_v2_s(pretrained=True)
+            base_channels = [128, 128, 64, 48, 168] 
+        elif backbone == 'efficientnet_v2_m':
+            # Use EfficientNetV2-S from torchvision
+            self.backbone = models.efficientnet_v2_m(pretrained=True)
+            base_channels = [160, 160, 80, 48, 168] 
+        elif backbone == 'efficientnet_v2_l':
+            # Use EfficientNetV2-S from torchvision
+            self.backbone = models.efficientnet_v2_l(pretrained=True)
+            base_channels = [192, 192, 96, 64, 168] 
         else:
             raise ValueError("Invalid ResNet type. Supported types: 'resnet18', 'resnet34', 'resnet50', 'regnet_y_400mf','regnet_y_800mf', 'regnet_y_1_6gf', 'regnet_y_3_2gf', 'shufflenet_v2_x0_5', 'shufflenet_v2_x1_0', 'shufflenet_v2_x1_5', 'shufflenet_v2_x2_0.")
         
@@ -156,6 +168,17 @@ class SemanticNetworkWithFPN(nn.Module):#
             self.layer4 = self.backbone.conv5
             is_shuffle = True
 
+        elif backbone in ["efficientnet_v2_s", "efficientnet_v2_m","efficientnet_v2_l"]:
+            self.backbone.features[0][0] = nn.Conv2d(2 + meta_channel_dim, self.backbone.features[0][0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            #help_conv = nn.Conv2d(2 + meta_channel_dim, self.backbone.conv1[0].out_channels, kernel_size=3, stride=2, padding=1, bias=False)
+            # Extract feature maps using indices or named stages from ShuffleNet
+            self.stem = self.backbone.features[0]
+            self.layer1 = self.backbone.features[2]
+            self.layer2 = self.backbone.features[3]
+            self.layer3 = self.backbone.features[4]
+            self.layer4 = self.backbone.features[6:]
+            is_shuffle = True
+
         # Attention blocks
         self.attention4 = AttentionModule(base_channels[1], base_channels[1])
         self.attention3 = AttentionModule(base_channels[2], base_channels[2])
@@ -187,6 +210,7 @@ class SemanticNetworkWithFPN(nn.Module):#
             self.upsample_layer_x3 = nn.ConvTranspose2d(in_channels=base_channels[2], out_channels=base_channels[2]//4, kernel_size=4, stride=4, padding=0)
             self.upsample_layer_x2 = nn.ConvTranspose2d(in_channels=base_channels[3], out_channels=base_channels[3]//2, kernel_size=2, stride=2, padding=0)
             out_channels_upsample = base_channels[1]//8 + base_channels[2]//4 + base_channels[3]//2
+        
 
 
         self.decoder_semantic = nn.Sequential(
@@ -238,16 +262,37 @@ class SemanticNetworkWithFPN(nn.Module):#
             meta_channel1 = F.interpolate(meta_channel, scale_factor=1/2, mode=self.interpolation_mode)
             meta_channel2 = F.interpolate(meta_channel, scale_factor=1/4, mode=self.interpolation_mode)
             meta_channel3 = F.interpolate(meta_channel, scale_factor=1/8, mode=self.interpolation_mode)
-            x = torch.cat([x, meta_channel], dim=1)
-            xs = self.stem(x)
-            x1 = self.layer1(xs)
-            x = torch.cat([x1[:,0:-self.meta_channel_dim,...], meta_channel1], dim=1)
-            x2 = self.layer2(x)
-            x = torch.cat([x2[:,0:-self.meta_channel_dim,...], meta_channel2], dim=1)
-            x3 = self.layer3(x)
-            x = torch.cat([x3[:,0:-self.meta_channel_dim,...], meta_channel3], dim=1)
-            x4 = self.layer4(x)
+            
+            if self.backbone_name in ["squeezenet1_0"]:
+                x = torch.cat([x, meta_channel], dim=1)
+                xs = self.stem(x)
+                x1 = self.layer1(xs)
+                x = torch.cat([x1[:,0:-self.meta_channel_dim,...], meta_channel1], dim=1)
+                x2 = self.layer2(x)
+                x = torch.cat([x2[:,0:-self.meta_channel_dim,...], meta_channel2], dim=1)
+                x3 = self.layer3(x)
+                x4 = self.layer4(x3)
+            elif self.backbone_name in ["efficientnet_v2_s","efficientnet_v2_m","efficientnet_v2_l"]:
+                x = torch.cat([x, meta_channel], dim=1)
+                xs = self.stem(x)
+                x1 = self.layer1(xs)
+                x = torch.cat([x1[:,0:-self.meta_channel_dim,...], meta_channel1], dim=1)
+                x2 = self.layer2(x)
+                x = torch.cat([x2[:,0:-self.meta_channel_dim,...], meta_channel2], dim=1)
+                x3 = self.layer3(x)
+                x4 = torch.cat([x3[:,0:-self.meta_channel_dim,...], meta_channel3], dim=1)
+            else:
+                x = torch.cat([x, meta_channel], dim=1)
+                xs = self.stem(x)
+                x1 = self.layer1(xs)
+                x = torch.cat([x1[:,0:-self.meta_channel_dim,...], meta_channel1], dim=1)
+                x2 = self.layer2(x)
+                x = torch.cat([x2[:,0:-self.meta_channel_dim,...], meta_channel2], dim=1)
+                x3 = self.layer3(x)
+                x = torch.cat([x3[:,0:-self.meta_channel_dim,...], meta_channel3], dim=1)
+                x4 = self.layer4(x)
 
+            
         else:
         
             # Encoder (ResNet)
@@ -278,6 +323,7 @@ class SemanticNetworkWithFPN(nn.Module):#
         x2 = self.upsample_layer_x2(x2)
 
         # Concatenate feature maps
+
         x = torch.cat([x1, x2, x3, x4], dim=1)
 
 
@@ -289,7 +335,7 @@ class SemanticNetworkWithFPN(nn.Module):#
 if __name__ == "__main__":
     import time
     import numpy as np
-    model = SemanticNetworkWithFPN(num_classes=20, backbone="resnet50", meta_channel_dim=6).cuda()
+    model = SemanticNetworkWithFPN(num_classes=20, backbone="efficientnet_v2_l", meta_channel_dim=6).cuda()
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Number of parameters: ", pytorch_total_params / 1000000, "M")
     # Timer
