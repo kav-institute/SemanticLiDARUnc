@@ -35,7 +35,7 @@ Memory: 32031MiB
 ### VS-Code:
 The project is designed to be delevoped within vs-code IDE using remote container development.
 
-### Setup Docker Container
+### Setup Docker Container ![Docker Badge](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=fff&style=flat)
 In docker-compse.yaml all parameters are defined.
 ```bash
 # Enable xhost in the terminal
