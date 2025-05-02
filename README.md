@@ -1,4 +1,4 @@
-# Real Time Semantic Segmentation of High Resolution Automotive LiDAR Scans
+# Real Time Semantic Segmentation of High Resolution Automotive LiDAR Scans [![arXiv Badge](https://img.shields.io/badge/arXiv-B31B1B?logo=arxiv&logoColor=fff&style=flat)](https://arxiv.org/abs/2504.21602) [![ResearchGate Badge](https://img.shields.io/badge/ResearchGate-0CB?logo=researchgate&logoColor=fff&style=flat)](https://www.researchgate.net/publication/391328948_Real_Time_Semantic_Segmentation_of_High_Resolution_Automotive_LiDAR_Scans) [![Zenodo Badge](https://img.shields.io/badge/Zenodo-1682D4?logo=zenodo&logoColor=fff&style=flat)](https://zenodo.org/records/14906179) [![ROS Badge](https://img.shields.io/badge/ROS-22314E?logo=ros&logoColor=fff&style=flat)](https://github.com/kav-institute/Semantic_LiDAR_ROS)
 
 A tool for training and finetuning of a semantic segmentation model on data of an Ouster OS2-128 (Rev 7), collected @ TH AB
 [![Everything Is AWESOME](Images/prev_image.png)](https://www.youtube.com/watch?v=d7v6hlMiOuw)
@@ -117,6 +117,35 @@ To explore a ROS2 demonstration of our system check out the following repo:
 
 ## License:
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details. Note that the dataset is provided by a different licence!
+
+
+## Citation:
+```
+@misc{reichert2025realtimesemanticsegmentation,
+      title={Real Time Semantic Segmentation of High Resolution Automotive LiDAR Scans}, 
+      author={Hannes Reichert and Benjamin Serfling and Elijah Schüssler and Kerim Turacan and Konrad Doll and Bernhard Sick},
+      year={2025},
+      eprint={2504.21602},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2504.21602}, 
+}
+
+@dataset{reichert_2025_14906179,
+  author       = {Reichert, Hannes and
+                  Schüssler, Elijah and
+                  Serfling, Benjamin and
+                  Turacan, Kerim and
+                  Doll, Konrad and
+                  Sick, Bernhard},
+  title        = {SemanticTHAB: A High Resolution LiDAR Dataset},
+  month        = feb,
+  year         = 2025,
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.14906179},
+  url          = {https://doi.org/10.5281/zenodo.14906179},
+}
+```
 
 ## Contributors
 <a href="https://github.com/kav-institute/SemanticLiDAR/graphs/contributors">
