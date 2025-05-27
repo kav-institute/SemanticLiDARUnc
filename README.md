@@ -158,3 +158,7 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 <a href="https://github.com/kav-institute/SemanticLiDAR/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=kav-institute/SemanticLiDAR" />
 </a>
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=kav-institute/SemanticLiDAR&type=Date)](https://www.star-history.com/#kav-institute/SemanticLiDAR&Date)
