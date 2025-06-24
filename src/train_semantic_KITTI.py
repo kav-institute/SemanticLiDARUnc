@@ -22,6 +22,7 @@ def count_parameters(model):
 def main(args):
     config = {}
     config["BACKBONE"] = args.model_type
+    config["USE_REFLECTIVITY"] = False
     config["USE_ATTENTION"] = args.attention
     config["USE_NORMALS"] = args.normals
     config["USE_MULTI_SCALE"] = args.multi_scale_meta
@@ -30,32 +31,39 @@ def main(args):
     config["CLASS_COLORS"] = color_map
     config["NUM_EPOCHS"] = args.num_epochs
     config["BATCH_SIZE"] = args.batch_size
+    config["LOSS_FUNCTION"] = "Tversky"
     
     data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")]
     data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")]
-    
-    depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip)
+
+    depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip, projection=(64,512),resize=False)
     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     
-    depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False)
+    depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False, projection=(64,512),resize=False)
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=8)
     
+
+    if config["USE_REFLECTIVITY"]:
+        input_channels = 2
+    else:
+        input_channels = 1
+
     # Semantic Segmentation Network
     if args.normals:
-        model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+        model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=6, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
     else:
-        model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+        model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=3, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
 
     num_params = count_parameters(model)
     config["NUM_PARAMS"] = num_params
     print("num_params", count_parameters(model))
     
     # Define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
 
     # Save Path
-    save_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
+    save_path ='/home/appuser/data/train_semantic_kitti_unc/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
     
     os.makedirs(save_path, exist_ok=True)
 
@@ -68,11 +76,11 @@ def main(args):
 
     # train model
     trainer = Trainer(model, optimizer, save_path, config, scheduler = scheduler, visualize = True)
-    trainer(dataloader_train, dataloader_test, args.num_epochs)
+    trainer(dataloader_train, dataloader_test, args.num_epochs, test_every_nth_epoch=args.test_every_nth_epoch)
 
     # test final model
-    tester = Tester(model, save_path=os.path.join(save_path, "model_final.pth"), config=config, load=False)
-    tester(dataloader_test)
+    # tester = Tester(model, save_path=os.path.join(save_path, "model_final.pth"), config=config, load=False)
+    # tester(dataloader_test)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
@@ -82,7 +90,7 @@ if __name__ == '__main__':
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
-    parser.add_argument('--test_every_nth_epoch', type=int, default=5,
+    parser.add_argument('--test_every_nth_epoch', type=int, default=10,
                         help='Test every nth epoch (default: 10)')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for training (default: 1)')
@@ -103,4 +111,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     main(args)
-
