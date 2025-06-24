@@ -33,6 +33,7 @@ def main(args):
     config["BACKBONE"] = args.model_type
     config["USE_ATTENTION"] = args.attention
     config["USE_NORMALS"] = args.normals
+    config["USE_REFLECTIVITY"] = True
     config["USE_MULTI_SCALE"] = args.multi_scale_meta
     config["USE_PRETRAINED"] = args.pretrained
     config["TEST_SCENE"] = args.test_id
@@ -41,6 +42,7 @@ def main(args):
     config["CLASS_COLORS"] = color_map
     config["NUM_EPOCHS"] = args.num_epochs
     config["BATCH_SIZE"] = args.batch_size
+    config["LOSS_FUNCTION"] = "Tversky"
 
     num_folder = count_folders("/home/appuser/data/SemanticTHAB/sequences/")
 
@@ -58,10 +60,17 @@ def main(args):
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
     
     # Depth Estimation Network
-    if args.normals:
-        model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=6, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+    if config["USE_REFLECTIVITY"]:
+        input_channels = 2
     else:
-        model = SemanticNetworkWithFPN(backbone=args.model_type, meta_channel_dim=3, num_classes=20, attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+        input_channels = 1
+        
+    # Semantic Segmentation Network
+    if args.normals:
+        model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=6, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+    else:
+        model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=3, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
+
 
     num_params = count_parameters(model)
     config["NUM_PARAMS"] = num_params
@@ -69,22 +78,25 @@ def main(args):
     
 
     if args.pretrained:
-        load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
-        config["PRETAINED_PATH"] = load_path
-        model.load_state_dict(torch.load(os.path.join(load_path,"model_final.pth")))
+        try:
+            load_path ='/home/appuser/data/train_semantic_kitti/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
+            config["PRETAINED_PATH"] = load_path
+            model.load_state_dict(torch.load(os.path.join(load_path,"model_final.pth")))
+        except:
+            print("WARNING: No pretrained model found")
     
     # Define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
         
     # Save Path
     if args.test_id != -1:
-        save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format(str(args.test_id).zfill(4))
+        save_path_p1 ='/home/appuser/data/train_semantic_THAB_v3/test_split_{}/'.format(str(args.test_id).zfill(4))
     else:
-        save_path_p1 ='/home/appuser/data/train_semantic_THAB/test_split_{}/'.format("final")
+        save_path_p1 ='/home/appuser/data/train_semantic_THAB_v3/test_split_{}/'.format("final")
     
 
-    save_path_p2 ='{}_{}{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "")
+    save_path_p2 ='{}_{}{}{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "", "p" if args.pretrained else "", config["LOSS_FUNCTION"])
     save_path = os.path.join(save_path_p1,save_path_p2)
     os.makedirs(save_path, exist_ok=True)
 
@@ -97,10 +109,22 @@ def main(args):
 
     # train model
     trainer = Trainer(model, optimizer, save_path, config, scheduler = scheduler, visualize = True)
-    trainer(dataloader_train, dataloader_test, args.num_epochs)
+    trainer(dataloader_train, dataloader_test, args.num_epochs, test_every_nth_epoch=args.test_every_nth_epoch)
 
     # test final model
-    tester = Tester(model, save_path=os.path.join(save_path, "model_final.pth"), config=config, load=False)
+    with open(os.path.join(save_path, "config.json")) as json_data:
+        config = json.load(json_data)
+        json_data.close()
+    
+    test_mask = [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
+
+    #data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/0006/velodyne/*.bin")]
+    depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False)
+    dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=8)
+
+    save_path = config["SAVE_PATH"]
+    # test final model
+    tester = Tester(model, save_path=os.path.join(save_path, "model_final.pth"), config=config, load=True, test_mask=test_mask)
     tester(dataloader_test)
 
 if __name__ == '__main__':
@@ -111,7 +135,7 @@ if __name__ == '__main__':
                         help='Learning rate for the model (default: 0.001)')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of epochs for training (default: 50)')
-    parser.add_argument('--test_every_nth_epoch', type=int, default=1,
+    parser.add_argument('--test_every_nth_epoch', type=int, default=5,
                         help='Test every nth epoch (default: 1)')
     parser.add_argument('--test_id', type=int, default=-1,
                         help='Test ID of the test sequence for the leave one out CV. -1 for training on all')
