@@ -7,7 +7,7 @@ services:
       args:
         - USER_ID=$USER_ID
         - USER_NAME=$USER_NAME
-    image: Miniconda3-py310_24.9.2-0-Linux-x86_64_torch2.4.1
+    image: miniconda3-py310_24.9.2-0-linux-x86_64_torch2.4.1
     shm_size: 24G
     restart: unless-stopped
     privileged: true

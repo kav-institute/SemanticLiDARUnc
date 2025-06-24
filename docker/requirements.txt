@@ -1,0 +1,8 @@
+tensorboard
+open3d==0.19.0
+termcolor
+tqdm
+ouster-sdk==0.14.0
+numpy==1.26.4     
+# numpy > 2.26 requires python 3.11+
+# ouster-sdk requires numpy <2 and >1.19

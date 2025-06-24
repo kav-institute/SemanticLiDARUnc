@@ -100,7 +100,8 @@ ENV TORCH_CUDA_ARCH_LIST="7.5 8.6 8.9 12.0" \
 RUN apt-get update && \
     apt-get install -y sudo openssh-server python3-pip htop nano git && \
     apt-get install -y ffmpeg libsm6 libxext6 ninja-build libglib2.0-0 libsm6 libxrender-dev libxext6 locales
-      
+
+# apt clean up
 RUN apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -192,4 +193,10 @@ SHELL ["/bin/bash", "--login", "-c"]
 ### Install additional packages in conda base env
 # Install pytorch v2.4.1 with cuda12.1 support
 RUN pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+
+# Install packages from requirements.txt
+COPY requirements.txt /home/${USER_NAME}/requirements.txt
+RUN pip install -r /home/${USER_NAME}/requirements.txt && \
+    rm /home/${USER_NAME}/requirements.txt
+
 WORKDIR /home/${USER_NAME}/workspace
