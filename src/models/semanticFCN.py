@@ -39,6 +39,27 @@ class AttentionModule(nn.Module):
         
         return attended_features
 
+# class AttentionModule(nn.Module):
+#     def __init__(self, in_channels, out_channels):
+#         super(AttentionModule, self).__init__()
+#         self.query_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+#         self.key_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+#         self.value_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+#         self.attention_conv = nn.Conv2d(out_channels, 1, kernel_size=1)
+#         self.softmax = nn.Softmax(dim=-1)
+
+#     def forward(self, features):
+#         query = self.query_conv(features)
+#         key = self.key_conv(features)
+#         value = self.value_conv(features)
+        
+#         attention_scores = self.attention_conv(torch.tanh(query + key))
+#         B, _, H, W = attention_scores.shape
+#         attention_weights = self.softmax(attention_scores.view(B, 1, -1)).view(B, 1, H, W)
+        
+#         attended = value * attention_weights.expand_as(value)
+#         return attended
+
 class SemanticNetworkWithFPN(nn.Module):#
     """
     Semantic Segmentation Network with Feature Pyramid Network (FPN) using a ResNet backbone.
@@ -52,7 +73,7 @@ class SemanticNetworkWithFPN(nn.Module):#
         attention (bool): Option to use a attention mechanism in the FPN (see: https://arxiv.org/pdf/1706.03762.pdf)
         
     """
-    def __init__(self, backbone='resnet18', meta_channel_dim=3, interpolation_mode = 'nearest', num_classes = 3, attention=True, multi_scale_meta=True):
+    def __init__(self, backbone='resnet18', input_channels=2, meta_channel_dim=3, interpolation_mode = 'nearest', num_classes = 3, attention=True, multi_scale_meta=True):
         super(SemanticNetworkWithFPN, self).__init__()
 
         self.backbone_name = backbone
@@ -122,7 +143,7 @@ class SemanticNetworkWithFPN(nn.Module):#
         is_squeeze = False
         # extract features from resnet family
         if backbone in ['resnet18', 'resnet34', 'resnet50']:
-            self.backbone.conv1 = nn.Conv2d(2 + meta_channel_dim, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.backbone.conv1 = nn.Conv2d(input_channels + meta_channel_dim, 64, kernel_size=3, stride=1, padding=1, bias=False)
 
             # Extract feature maps from different layers of ResNet
             self.stem = nn.Sequential(self.backbone.conv1, self.backbone.relu, self.backbone.maxpool)
@@ -149,7 +170,7 @@ class SemanticNetworkWithFPN(nn.Module):#
             
         # extract features from regnet family
         elif backbone in ['regnet_y_400mf','regnet_y_800mf', 'regnet_y_1_6gf', 'regnet_y_3_2gf']:
-            self.backbone.stem[0] = nn.Conv2d(2 + meta_channel_dim, self.backbone.stem[0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            self.backbone.stem[0] = nn.Conv2d(input_channels + meta_channel_dim, self.backbone.stem[0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
             # Extract feature maps from different layers of RegNet
             self.stem = self.backbone.stem
             self.layer1 = self.backbone.trunk_output[0]
@@ -158,7 +179,7 @@ class SemanticNetworkWithFPN(nn.Module):#
             self.layer4 = self.backbone.trunk_output[3]
 
         elif backbone in ["shufflenet_v2_x0_5", "shufflenet_v2_x1_0", "shufflenet_v2_x1_5", "shufflenet_v2_x2_0"]:
-            self.backbone.conv1[0] = nn.Conv2d(2 + meta_channel_dim, self.backbone.conv1[0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            self.backbone.conv1[0] = nn.Conv2d(input_channels + meta_channel_dim, self.backbone.conv1[0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
             #help_conv = nn.Conv2d(2 + meta_channel_dim, self.backbone.conv1[0].out_channels, kernel_size=3, stride=2, padding=1, bias=False)
             # Extract feature maps using indices or named stages from ShuffleNet
             self.stem = self.backbone.conv1
@@ -169,7 +190,7 @@ class SemanticNetworkWithFPN(nn.Module):#
             is_shuffle = True
 
         elif backbone in ["efficientnet_v2_s", "efficientnet_v2_m","efficientnet_v2_l"]:
-            self.backbone.features[0][0] = nn.Conv2d(2 + meta_channel_dim, self.backbone.features[0][0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            self.backbone.features[0][0] = nn.Conv2d(input_channels + meta_channel_dim, self.backbone.features[0][0].out_channels, kernel_size=3, stride=1, padding=1, bias=False)
             #help_conv = nn.Conv2d(2 + meta_channel_dim, self.backbone.conv1[0].out_channels, kernel_size=3, stride=2, padding=1, bias=False)
             # Extract feature maps using indices or named stages from ShuffleNet
             self.stem = self.backbone.features[0]
@@ -333,9 +354,23 @@ class SemanticNetworkWithFPN(nn.Module):#
         return x_semantics
     
 if __name__ == "__main__":
+    # 'resnet18'
+    # 'shufflenet_v2_x0_5'
+    # 'resnet50'
+    # 'shufflenet_v2_x1_5'
+    # 'resnet34'
+    # 'shufflenet_v2_x1_0'
+    # 'efficientnet_v2_l'
+    # 'efficientnet_v2_m'
+    # 'efficientnet_v2_s'
+    # 'squeezenet1_0'
+    # 'regnet_y_3_2gf'
+    # 'regnet_y_1_6gf'
+    # 'regnet_y_400mf'
+    # 'regnet_y_800mf'
     import time
     import numpy as np
-    model = SemanticNetworkWithFPN(num_classes=20, backbone="efficientnet_v2_l", meta_channel_dim=6).cuda()
+    model = SemanticNetworkWithFPN(num_classes=20, backbone="regnet_y_800mf", meta_channel_dim=6).cuda()
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Number of parameters: ", pytorch_total_params / 1000000, "M")
     # Timer
@@ -343,10 +378,12 @@ if __name__ == "__main__":
     end = torch.cuda.Event(enable_timing=True)
     inference_times = []
     model.eval()
+    bs = 1
     with torch.no_grad():
-        for i in range(100):
-            inputs = torch.randn(1, 2, 128, 2048).to(torch.float32).cuda()
-            meta = torch.randn(1, 6, 128, 2048).to(torch.float32).cuda()
+        for i in range(1000):
+            inputs = torch.randn(bs, 2, 128, 2048).to(torch.float32).cuda()
+            meta = torch.randn(bs, 6, 128, 2048).to(torch.float32).cuda()
+            torch.cuda.synchronize()  # wait for cuda to finish (cuda is asynchronous!)
             start.record()
             outputs = model(inputs, meta)
             end.record()
@@ -355,4 +392,4 @@ if __name__ == "__main__":
             
             inference_times.append(start.elapsed_time(end))
             #time.sleep(0.15)
-    print("inference mean {} ms".format(np.mean(inference_times)))
+    print("inference mean {} ms".format(np.median(inference_times)))
