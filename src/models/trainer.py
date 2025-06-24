@@ -1,7 +1,7 @@
 
 import torch
 
-from models.losses import TverskyLoss, SemanticSegmentationLoss
+from models.losses import TverskyLoss, SemanticSegmentationLoss, LovaszSoftmax, DirichletSegmentationLoss
 
 import time
 import numpy as np
@@ -12,6 +12,39 @@ import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 from models.evaluator import SemanticSegmentationEvaluator
+
+from torch.special import digamma
+
+def aleatoric_uncertainty(alpha, eps=1e-10):
+    """
+    Approximates aleatoric uncertainty (expected entropy) from Dirichlet parameters.
+
+    Args:
+        alpha: Tensor of shape [B, C, H, W]
+
+    Returns:
+        Tensor of shape [B, H, W]
+    """
+    alpha0 = torch.sum(alpha, dim=1, keepdim=True) + eps
+    term1 = digamma(alpha0 + 1)
+    term2 = torch.sum((alpha * digamma(alpha + 1)), dim=1, keepdim=True) / alpha0
+    expected_entropy = term1 - term2
+    return expected_entropy.squeeze(1)
+
+def predictive_entropy(alpha, eps=1e-10):
+    """
+    Computes predictive entropy H(E[p]) from Dirichlet parameters.
+    
+    Args:
+        alpha: Tensor of shape [B, C, H, W], Dirichlet parameters per class
+
+    Returns:
+        Tensor of shape [B, H, W], entropy of expected class probabilities
+    """
+    S = torch.sum(alpha, dim=1, keepdim=True)       # Total concentration α₀
+    p = alpha / (S + eps)                           # Expected class probabilities
+    entropy = -torch.sum(p * torch.log(p + eps), dim=1)  # Entropy across classes
+    return entropy
 
 def visualize_semantic_segmentation_cv2(mask, class_colors):
     """
@@ -37,7 +70,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class Trainer:
-    def __init__(self, model, optimizer, save_path, config, scheduler= None, visualize = False):
+    def __init__(self, model, optimizer, save_path, config, scheduler= None, visualize = False, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
 
         self.model = model
         self.optimizer = optimizer
@@ -49,10 +82,12 @@ class Trainer:
         # config
         self.config = config
         self.normals = self.config["USE_NORMALS"]==True
+        self.use_reflectivity = self.config["USE_REFLECTIVITY"]==True
         self.num_classes = self.config["NUM_CLASSES"]
         self.class_names = self.config["CLASS_NAMES"]
         self.class_colors = self.config["CLASS_COLORS"]
 
+        self.loss_function = self.config["LOSS_FUNCTION"]
         # TensorBoard
         self.save_path = save_path
         self.writer = SummaryWriter(save_path)
@@ -62,11 +97,20 @@ class Trainer:
         self.end = torch.cuda.Event(enable_timing=True)
 
         # Loss
-        self.criterion_dice = TverskyLoss()
-        self.criterion_semantic = SemanticSegmentationLoss()
-        
+        if  self.loss_function == "Tversky":
+            self.criterion_dice = TverskyLoss()
+            self.criterion_semantic = SemanticSegmentationLoss()
+        elif self.loss_function == "CE":
+            self.criterion_semantic = SemanticSegmentationLoss()
+        elif  self.loss_function == "Lovasz":
+            self.criterion_lovasz = LovaszSoftmax()
+        elif self.loss_function == "Dirichlet":
+            self.criterion_unc = DirichletSegmentationLoss()
+        else:
+            raise NotImplementedError
+
         # Evaluator
-        self.evaluator = SemanticSegmentationEvaluator(self.num_classes)
+        self.evaluator = SemanticSegmentationEvaluator(self.num_classes, test_mask=test_mask)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -81,10 +125,14 @@ class Trainer:
             # run forward path
             start_time = time.time()
             self.start.record()
-            if self.normals:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if self.use_reflectivity:
+                input_img = torch.cat([range_img, reflectivity],axis=1)
             else:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), xyz)
+                input_img = range_img
+            if self.normals:
+                outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = self.model(input_img, xyz)
             self.end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -92,25 +140,42 @@ class Trainer:
             torch.cuda.synchronize()
             
             # get losses
-            loss_semantic = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
-            loss_dice = self.criterion_dice(outputs_semantic, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
-            loss = loss_dice+loss_semantic
-            
+            if  self.loss_function == "Tversky":
+                loss_semantic = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
+                loss_dice = self.criterion_dice(outputs_semantic, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
+                loss = loss_dice+loss_semantic
+            elif  self.loss_function == "CE":
+                loss = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
+            elif  self.loss_function == "Lovasz":
+                loss = self.criterion_lovasz(outputs_semantic, semantic)
+            elif self.loss_function == "Dirichlet":
+                loss = self.criterion_unc(outputs_semantic, semantic)
+            else:
+                raise NotImplementedError
             
             # get the most likely class
             semseg_img = torch.argmax(outputs_semantic,dim=1)
             
+
             if self.visualize:
+                if self.loss_function == "Dirichlet":
+                    epistemic = predictive_entropy(torch.nn.functional.softplus(outputs_semantic)+1)
+                    epistemic = (epistemic).permute(0, 1, 2)[0,...].cpu().detach().numpy()
+                    epis_img = cv2.applyColorMap(np.uint8(255*cv2.normalize(epistemic, epistemic, 0, 1, cv2.NORM_MINMAX)), cv2.COLORMAP_TURBO)
                 # visualize first sample in batch
                 semantics_pred = (semseg_img).permute(0, 1, 2)[0,...].cpu().detach().numpy()
                 semantics_gt = (semantic[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
+                error_img = np.uint8(np.where(semantics_pred[...,None]!=semantics_gt[...,None], (0,0,255), (0,0,0)))
                 xyz_img = (xyz).permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()
                 normal_img = (normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2
                 reflectivity_img = (reflectivity).permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()
                 reflectivity_img = np.uint8(255*np.concatenate(3*[reflectivity_img],axis=-1))
                 prev_sem_pred = visualize_semantic_segmentation_cv2(semantics_pred, class_colors=self.class_colors)
                 prev_sem_gt = visualize_semantic_segmentation_cv2(semantics_gt, class_colors=self.class_colors)
-                cv2.imshow("inf", np.vstack((reflectivity_img,np.uint8(255*normal_img),prev_sem_pred,prev_sem_gt)))
+                if self.loss_function == "Dirichlet":
+                    cv2.imshow("inf", np.vstack((reflectivity_img,np.uint8(255*normal_img),prev_sem_pred,prev_sem_gt,error_img, epis_img)))
+                else:
+                    cv2.imshow("inf", np.vstack((reflectivity_img,np.uint8(255*normal_img),prev_sem_pred,prev_sem_gt,error_img)))
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
 
                     #time.sleep(10)
@@ -131,8 +196,8 @@ class Trainer:
             if batch_idx % 10 == 0:
                 step = epoch * len(dataloder) + batch_idx
                 self.writer.add_scalar('Loss', loss.item(), step)
-                self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
-                self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
+                #self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
+                #self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
         
         
         # Print average loss for the epoch
@@ -165,6 +230,9 @@ class Trainer:
             inference_times.append(self.start.elapsed_time(self.end))
             
             outputs_semantic_argmax = torch.argmax(outputs_semantic,dim=1)
+
+            # get the most likely class
+            semseg_img = torch.argmax(outputs_semantic,dim=1)
 
             self.evaluator.update(outputs_semantic_argmax, semantic)
         mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
