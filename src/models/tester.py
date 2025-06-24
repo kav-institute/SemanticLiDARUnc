@@ -6,6 +6,8 @@ import json
 import numpy as np
 from tqdm import tqdm
 import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from models.evaluator import SemanticSegmentationEvaluator
 
@@ -43,7 +45,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class Tester:
-    def __init__(self, model, save_path, config, load=False, visualize=True):
+    def __init__(self, model, save_path, config, load=False, visualize=True, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
         self.visualize = visualize
         self.model = model
         if load:
@@ -51,6 +53,7 @@ class Tester:
 
         self.config = config
         self.normals = self.config["USE_NORMALS"]
+        self.use_reflectivity = self.config["USE_REFLECTIVITY"]
         self.num_classes = self.config["NUM_CLASSES"]
         self.class_names = self.config["CLASS_NAMES"]
         self.class_colors = self.config["CLASS_COLORS"]
@@ -63,12 +66,43 @@ class Tester:
         self.end = torch.cuda.Event(enable_timing=True)
         
         # Evaluator
-        self.evaluator = SemanticSegmentationEvaluator(num_classes=self.num_classes)
+        self.test_mask = test_mask
+        self.evaluator = SemanticSegmentationEvaluator(num_classes=self.num_classes, test_mask=test_mask)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
+    
+    def plot_confusion_matrix(self, cm, class_names, test_mask, save_path):
+        """Plot the confusion matrix using matplotlib and seaborn, only for classes with test_mask == 1."""
+        # Select only the classes where test_mask == 1
+        selected_classes = [i for i in range(len(test_mask)) if test_mask[i] == 1]
+        
+        # Filter the confusion matrix to only include the relevant classes
+        cm_filtered = cm[np.ix_(selected_classes, selected_classes)]
 
+        # Filter class names to match the selected classes
+        class_names_filtered = [class_names[str(i)] for i in selected_classes]
+
+        # Normalize the filtered confusion matrix by rows (i.e., by the true labels)
+        cm_normalized = cm_filtered / cm_filtered.sum(axis=1, keepdims=True)
+
+        # Set up the matplotlib figure
+        plt.figure(figsize=(8, 6))
+
+        # Create a heatmap with Seaborn
+        sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues', xticklabels=class_names_filtered, yticklabels=class_names_filtered, cbar=True)
+
+        # Set labels and title
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title('Normalized Confusion Matrix (Filtered)')
+
+        # Save the plot to the given path
+        plt.savefig(save_path)
+
+        # Optionally, close the plot to avoid memory issues when generating multiple plots
+        plt.close()
     
     def __call__(self, dataloader_test):
         self.model.eval()
@@ -80,10 +114,14 @@ class Tester:
             # run forward path
             start_time = time.time()
             self.start.record()
-            if self.normals:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            if self.use_reflectivity:
+                input_img = torch.cat([range_img, reflectivity],axis=1)
             else:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), xyz)
+                input_img = range_img
+            if self.normals:
+                outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = self.model(input_img, xyz)
             self.end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -106,6 +144,9 @@ class Tester:
                 cv2.waitKey(1)
 
             self.evaluator.update(semseg_img, semantic)
+            self.evaluator.update_confusion_matrix(semseg_img, semantic)
+        confusion_matrix = self.evaluator.get_confusion_matrix()
+        self.plot_confusion_matrix(confusion_matrix,class_names=self.class_names, test_mask=self.test_mask, save_path=os.path.join(self.save_path, "confusion_matrix.png"))
         mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
         with open(os.path.join(self.save_path, "results.json"), 'w') as fp:
             json.dump(result_dict, fp, cls=MyEncoder)
