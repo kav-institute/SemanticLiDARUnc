@@ -1,7 +1,7 @@
 
 import torch
 
-from models.losses import TverskyLoss, SemanticSegmentationLoss, LovaszSoftmax, DirichletSegmentationLoss
+from models.losses import TverskyLoss, SemanticSegmentationLoss, LovaszSoftmax, DirichletSegmentationLoss, DirichletCalibrationLoss
 
 import time
 import numpy as np
@@ -31,7 +31,7 @@ def aleatoric_uncertainty(alpha, eps=1e-10):
     expected_entropy = term1 - term2
     return expected_entropy.squeeze(1)
 
-def predictive_entropy(alpha, eps=1e-10):
+def get_predictive_entropy(alpha, eps=1e-10):
     """
     Computes predictive entropy H(E[p]) from Dirichlet parameters.
     
@@ -70,27 +70,28 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class Trainer:
-    def __init__(self, model, optimizer, save_path, config, scheduler= None, visualize = False, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
+    def __init__(self, model, optimizer, cfg, scheduler=None, visualize=False, logging=False, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
 
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        time.sleep(3)
-
+        #time.sleep(3)
+        
         self.visualize = visualize
-
+        self.logging = logging
+        
         # config
-        self.config = config
-        self.normals = self.config["USE_NORMALS"]==True
-        self.use_reflectivity = self.config["USE_REFLECTIVITY"]==True
-        self.num_classes = self.config["NUM_CLASSES"]
-        self.class_names = self.config["CLASS_NAMES"]
-        self.class_colors = self.config["CLASS_COLORS"]
+        self.cfg = cfg
+        self.normals = cfg["model_settings"]["normals"]==True
+        self.use_reflectivity = cfg["extras"]["use_reflectivity"]==True
+        self.num_classes = cfg["extras"]["num_classes"]
+        self.class_names = cfg["extras"]["class_names"]
+        self.class_colors = cfg["extras"]["class_colors"]
 
-        self.loss_function = self.config["LOSS_FUNCTION"]
+        self.loss_function = cfg["extras"]["loss_function"]
         # TensorBoard
-        self.save_path = save_path
-        self.writer = SummaryWriter(save_path)
+        self.save_path = cfg["extras"]["save_path"]
+        self.writer = SummaryWriter(self.save_path)
 
         # Timer
         self.start = torch.cuda.Event(enable_timing=True)
@@ -106,6 +107,7 @@ class Trainer:
             self.criterion_lovasz = LovaszSoftmax()
         elif self.loss_function == "Dirichlet":
             self.criterion_unc = DirichletSegmentationLoss()
+            self.criterion_smooth_calibration = DirichletCalibrationLoss()
         else:
             raise NotImplementedError
 
@@ -119,7 +121,7 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         # train one epoch
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Epoch {epoch + 1}")):
+        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Epoch {epoch + 1}/{self.num_epochs}")):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
     
             # run forward path
@@ -149,7 +151,9 @@ class Trainer:
             elif  self.loss_function == "Lovasz":
                 loss = self.criterion_lovasz(outputs_semantic, semantic)
             elif self.loss_function == "Dirichlet":
-                loss = self.criterion_unc(outputs_semantic, semantic)
+                loss_nll = self.criterion_unc(outputs_semantic, semantic)
+                loss_calibration = self.criterion_smooth_calibration(outputs_semantic, semantic)
+                loss = loss_nll + loss_calibration
             else:
                 raise NotImplementedError
             
@@ -159,9 +163,11 @@ class Trainer:
 
             if self.visualize:
                 if self.loss_function == "Dirichlet":
-                    epistemic = predictive_entropy(torch.nn.functional.softplus(outputs_semantic)+1)
-                    epistemic = (epistemic).permute(0, 1, 2)[0,...].cpu().detach().numpy()
-                    epis_img = cv2.applyColorMap(np.uint8(255*cv2.normalize(epistemic, epistemic, 0, 1, cv2.NORM_MINMAX)), cv2.COLORMAP_TURBO)
+                    pred_entropy = get_predictive_entropy(torch.nn.functional.softplus(outputs_semantic)+1)
+                    pred_entropy = (pred_entropy).permute(0, 1, 2)[0,...].cpu().detach().numpy()
+                    epis_img = cv2.applyColorMap(np.uint8(255*np.maximum(2*((pred_entropy/np.log(self.num_classes))-0.5),0.0)), cv2.COLORMAP_TURBO)
+                    print(f"pred_ent: {np.mean(pred_entropy)}, min_ent: {np.min(pred_entropy)}, max_ent: {np.max(pred_entropy)}, median_ent: {np.median(pred_entropy)}, normalized_ent: {np.mean(pred_entropy/np.log(self.num_classes))}")
+                    # epis_img = cv2.applyColorMap(np.uint8(255*cv2.normalize(epistemic, epistemic, 0, 1, cv2.NORM_MINMAX)), cv2.COLORMAP_TURBO)
                 # visualize first sample in batch
                 semantics_pred = (semseg_img).permute(0, 1, 2)[0,...].cpu().detach().numpy()
                 semantics_gt = (semantic[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
@@ -193,23 +199,30 @@ class Trainer:
             total_loss += loss.item()
             
             # Log to TensorBoard
-            if batch_idx % 10 == 0:
-                step = epoch * len(dataloder) + batch_idx
-                self.writer.add_scalar('Loss', loss.item(), step)
-                #self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
-                #self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
-        
+            if self.logging:
+                if batch_idx % 10 == 0:
+                    step = epoch * len(dataloder) + batch_idx
+                    self.writer.add_scalar('Loss/Total', loss.item(), step)
+                    if self.loss_function == "Dirichlet": 
+                        self.writer.add_scalar('Loss/NLL', loss_nll.item(), step)
+                        self.writer.add_scalar('Loss/Calibration', loss_calibration.item(), step)
+                    #self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
+                    #self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
         
         # Print average loss for the epoch
         avg_loss = total_loss / len(dataloder)
-        self.writer.add_scalar('Loss_EPOCH', avg_loss, epoch)
         print(f"Train Epoch {epoch + 1}/{self.num_epochs}, Average Loss: {avg_loss}")
+        
+        # Log to TensorBoard
+        if self.logging:
+            self.writer.add_scalar('Loss/Epoch', avg_loss, epoch)
+        
 
     def test_one_epoch(self, dataloder, epoch):
         inference_times = []
         self.model.eval()
         self.evaluator.reset()
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloder):
+        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(dataloder):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
             start_time = time.time()
 
@@ -235,34 +248,41 @@ class Trainer:
             semseg_img = torch.argmax(outputs_semantic,dim=1)
 
             self.evaluator.update(outputs_semantic_argmax, semantic)
-        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
-        for cls in range(self.num_classes):
-            self.writer.add_scalar('IoU_{}'.format(self.class_names[cls]), result_dict[self.class_names[cls]]*100, epoch)
             
-
-        self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
-        self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
+        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
         print(f"Test Epoch {epoch + 1}/{self.num_epochs}, mIoU: {mIoU}")
+        
+        # Log to TensorBoard
+        if self.logging:
+            for cls in range(self.num_classes):
+                self.writer.add_scalar('IoU_{}'.format(self.class_names[cls]), result_dict[self.class_names[cls]]*100, epoch)
+            
+            self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
+            self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
+        
         return mIoU
     
-    def __call__(self, dataloder_train, dataloder_test, num_epochs=50, test_every_nth_epoch=1, save_every_nth_epoch=-1):
-        self.num_epochs = num_epochs
-        for epoch in range(num_epochs):
+    def __call__(self, dataloder_train, dataloder_test): #, num_epochs=50, test_every_nth_epoch=1, save_every_nth_epoch=-1):
+        self.num_epochs = self.cfg["train_params"]["num_epochs"]
+        self.test_every_nth_epoch = self.cfg["logging_settings"]["test_every_nth_epoch"]
+        self.save_every_nth_epoch = self.cfg["logging_settings"]["save_every_nth_epoch"]
+        for epoch in range(self.num_epochs):
             # train one epoch
             self.train_one_epoch(dataloder_train, epoch)
             # test
-            if epoch > 0 and epoch % test_every_nth_epoch == 0:
+            if epoch > 0 and epoch % self.test_every_nth_epoch == 0:
                 mIoU = self.test_one_epoch(dataloder_test, epoch)
                 # update scheduler based on rmse
                 if not isinstance(self.scheduler, type(None)):
                     self.scheduler.step(mIoU)
             # save
-            if save_every_nth_epoch >= 1 and epoch % save_every_nth_epoch:
-                torch.save(self.model.state_dict(), os.path.join(self.save_path, "model_{}.pth".format(str(epoch).zfill(6))))
-
-            
+            if self.logging:
+                if self.save_every_nth_epoch >= 1 and epoch % self.save_every_nth_epoch:
+                    torch.save(self.model.state_dict(), os.path.join(self.save_path, f"model_{str(epoch).zfill(6)}.pt"))
+        
         # run final test
         self.test_one_epoch(dataloder_test, epoch)
         # save last epoch
-        torch.save(self.model.state_dict(), os.path.join(self.save_path, "model_final.pth"))
+        if self.logging:
+            torch.save(self.model.state_dict(), os.path.join(self.save_path, "model_final.pt"))
 

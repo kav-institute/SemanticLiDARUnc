@@ -1,0 +1,47 @@
+# path to SemanticTHAB dataset (sequences), no tailing path seperator!
+dataset_dir: "/home/devuser/workspace/data/SemanticTHAB/sequences"
+
+model_settings: {
+  ## defines model backbone architecture
+    model_type: "efficientnet_v2_l",
+  # MODEL LAYER SETTINGS
+  ## toggle attention block. type: bool
+    attention: true,
+  ## toggle use of normals as input (+3 extra meta channels). type: bool
+    normals: true,
+  ## inject meta data at multiple scales. type: bool
+    multi_scale_meta: true,
+
+  # AUGMENTATIONS
+  ## rotation augmentation. type: bool
+    rotate: true,   
+  ## flip augmentation. type: bool
+    flip: false,
+  
+  # GENERAL SETTINGS
+  ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
+    ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
+    pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
+}
+
+train_params: {
+  ## learning rate for training
+    learning_rate: 1.e-4,
+  ## Sets batch size for training
+    batch_size: 2,
+  ## Sets numbor of worker processes
+    num_workers: 4,
+  ## Sets number of total training epochs
+    num_epochs: 50
+}
+
+logging_settings: {
+  ## Test ID of the test sequence for the leave one out CV. -1 for training on all
+    test_id: -1,
+  ## Sets interval to test every nth epoch
+    test_every_nth_epoch: 5,
+  ## Sets interval to save model weights every nth epoch. -1 for saving only last epoch
+    save_every_nth_epoch: 5,
+  ## path to log directory
+    log_dir: "/home/devuser/workspace/data/train_semantic_THAB_v3"
+}

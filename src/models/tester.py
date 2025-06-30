@@ -45,18 +45,18 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class Tester:
-    def __init__(self, model, save_path, config, load=False, visualize=True, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
+    def __init__(self, model, save_path, cfg, load=False, visualize=True, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
         self.visualize = visualize
         self.model = model
         if load:
             self.model.load_state_dict(torch.load(save_path))
 
-        self.config = config
-        self.normals = self.config["USE_NORMALS"]
-        self.use_reflectivity = self.config["USE_REFLECTIVITY"]
-        self.num_classes = self.config["NUM_CLASSES"]
-        self.class_names = self.config["CLASS_NAMES"]
-        self.class_colors = self.config["CLASS_COLORS"]
+        self.cfg = cfg
+        self.normals = cfg["model_settings"]["normals"]==True
+        self.use_reflectivity = cfg["extras"]["use_reflectivity"]==True
+        self.num_classes = cfg["extras"]["num_classes"]
+        self.class_names = cfg["extras"]["class_names"]
+        self.class_colors = cfg["extras"]["class_colors"]
 
         self.save_path = os.path.dirname(save_path)
         time.sleep(3)
@@ -150,8 +150,3 @@ class Tester:
         mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
         with open(os.path.join(self.save_path, "results.json"), 'w') as fp:
             json.dump(result_dict, fp, cls=MyEncoder)
- 
-
-    
-    
-

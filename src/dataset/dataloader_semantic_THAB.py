@@ -6,8 +6,9 @@ try:
     from dataset.utils import rotate_equirectangular_image, rotate_z, build_normal_xyz, spherical_projection
     from dataset.definitions import id_map
 except:
-    from utils import rotate_equirectangular_image, rotate_z, build_normal_xyz, spherical_projection
-    from definitions import id_map, custom_colormap
+    print("Check dataset imports")
+#     from utils import rotate_equirectangular_image, rotate_z, build_normal_xyz, spherical_projection
+#     from definitions import id_map, custom_colormap
 
 
 class SemanticKitti(Dataset):

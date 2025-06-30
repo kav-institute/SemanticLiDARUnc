@@ -35,7 +35,7 @@ Ensure the following data structure:
 │   │   │   ├── 0001 # SequenceID
 │   │   │   │   ├── velodyne
 │   │   │   │   │   ├── *.bin
-│   │   │   │   ├── label
+│   │   │   │   ├── labels
 │   │   │   │   │   ├── *.label
 
 ```
