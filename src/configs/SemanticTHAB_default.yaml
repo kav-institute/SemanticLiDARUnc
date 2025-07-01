@@ -14,7 +14,7 @@ model_settings: {
 
   # AUGMENTATIONS
   ## rotation augmentation. type: bool
-    rotate: true,   
+    rotate: false,   
   ## flip augmentation. type: bool
     flip: false,
   
