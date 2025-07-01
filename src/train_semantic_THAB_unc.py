@@ -56,20 +56,7 @@ def main(args):
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
     cfg["extras"]["loss_function"] = "Dirichlet"
-    # config = {}
-    # config["BACKBONE"] = args.model_type
-    # config["USE_ATTENTION"] = args.attention
-    # config["USE_NORMALS"] = args.normals
-    # config["USE_REFLECTIVITY"] = True
-    # config["USE_MULTI_SCALE"] = args.multi_scale_meta
-    # config["USE_PRETRAINED"] = args.pretrained
-    # config["TEST_SCENE"] = args.test_id
-    # config["NUM_CLASSES"] = 20
-    # config["CLASS_NAMES"] = class_names
-    # config["CLASS_COLORS"] = color_map
-    # config["NUM_EPOCHS"] = args.num_epochs
-    # config["BATCH_SIZE"] = args.batch_size
-    # config["LOSS_FUNCTION"] = "Dirichlet"
+    cfg["extras"]["with_calibration_loss"] = False  # only in combination with Dirichlet loss_function
 
     num_folder = count_folders(cfg["dataset_dir"])
 

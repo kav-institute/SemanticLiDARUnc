@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.autograd import Function
 from torch.distributions import Dirichlet
+from models.probability_helper import logits_to_DirichletDist
 
 def smooth_one_hot(targets, num_classes, smoothing=0.1):
     """
@@ -38,27 +39,27 @@ def smooth_one_hot(targets, num_classes, smoothing=0.1):
     #one_hot = torch.nn.functional.softmax(one_hot, dim=1)
     return one_hot
 
-def logits_to_DirichletDist(predicted_logits, eps=0.01):
-    """
-    Converts logits to Dirchlet alpha concentration parameters and distribution
+# def logits_to_DirichletDist(predicted_logits, eps=0.01):
+#     """
+#     Converts logits to Dirchlet alpha concentration parameters and distribution
 
-    Args:
-        predicted_logits (Tensor): Tensor of shape [B, C, H, W], Dirichlet parameters (alpha > 0)
-        eps (float, optional): Small constant for numerical stability. Defaults to 0.01.
+#     Args:
+#         predicted_logits (Tensor): Tensor of shape [B, C, H, W], Dirichlet parameters (alpha > 0)
+#         eps (float, optional): Small constant for numerical stability. Defaults to 0.01.
 
-    Returns:
-        tuple(Tensor, Tensor): 
-            - dist: Dirichlet distribution of type torch.distributions.Dirichlet
-            - alpha: alpha concentration parameters of shape [B, H, W, C] and
-    """
-    alpha = torch.nn.functional.softplus(predicted_logits)+1
-    # Ensure alpha is strictly positive
-    alpha = alpha + eps
+#     Returns:
+#         tuple(Tensor, Tensor): 
+#             - dist: Dirichlet distribution of type torch.distributions.Dirichlet
+#             - alpha: alpha concentration parameters of shape [B, H, W, C] and
+#     """
+#     alpha = torch.nn.functional.softplus(predicted_logits)+1
+#     # Ensure alpha is strictly positive
+#     alpha = alpha + eps
     
-    alpha = alpha.permute(0, 2, 3, 1)   # [B, H, W, C] for torch.distributions
-    dist = Dirichlet(alpha)
+#     alpha = alpha.permute(0, 2, 3, 1)   # [B, H, W, C] for torch.distributions
+#     dist = Dirichlet(alpha)
     
-    return dist, alpha
+#     return dist, alpha
 
 # Dirichlet
 class DirichletSegmentationLoss(nn.Module):
