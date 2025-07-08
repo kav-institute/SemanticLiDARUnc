@@ -57,7 +57,7 @@ def main(args):
     cfg["extras"]["class_colors"] = color_map
     cfg["extras"]["loss_function"] = "Dirichlet"
     cfg["extras"]["with_calibration_loss"] = False  # only in combination with Dirichlet loss_function
-
+    
     num_folder = count_folders(cfg["dataset_dir"])
 
     if cfg["logging_settings"]["test_id"] == -1:
@@ -90,15 +90,46 @@ def main(args):
     print("num_params", num_params)
     cfg["extras"]["num_params"] = num_params
     
-    if os.path.isfile(cfg["model_settings"]["pretrained"]):
-        try:
-            model.load_state_dict(torch.load(cfg["model_settings"]["pretrained"]))
-        except:
-            print("WARNING: No pretrained model found")
+    try:
+        if os.path.isfile(cfg["model_settings"]["pretrained"]):
+            try:
+                model.load_state_dict(torch.load(cfg["model_settings"]["pretrained"]))
+            except:
+                print("WARNING: No pretrained model found")
+    except TypeError as te:
+        print("No pretrained weights found! Training from scratch...")
+        time.sleep(3)
     
     # Define optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=cfg["train_params"]["learning_rate"])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg["train_params"].get("learning_rate", 1e-3),
+        weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
+    )
+    # Linear warm-up over first N epochs
+    num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 3)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,   # start at 10% of base LR
+        end_factor=1.0,     # ramp to 100% of base LR
+        total_iters=num_warmup_epochs
+    )
+    #Cosine annealing with restarts thereafter
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,           # first restart after T_0 epochs, e.g., 15
+        T_mult=1,         # no increase in cycle length
+        eta_min=1e-6      # floor LR
+    )  
+    #Chain them: warm-up then cosine restarts
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[num_warmup_epochs]
+    ) 
+    
+    # ReduceLROnPlateau
+    #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
     
     if args.with_logging:
         # Save Path

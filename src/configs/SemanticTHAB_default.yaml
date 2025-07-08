@@ -21,7 +21,9 @@ model_settings: {
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
+    pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth" #"/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth" # "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000005.pt"
+    # dirchlet pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
+    # pretrained deterministic "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
 }
 
 train_params: {
@@ -32,16 +34,21 @@ train_params: {
   ## Sets numbor of worker processes
     num_workers: 4,
   ## Sets number of total training epochs
-    num_epochs: 50
+    num_epochs: 50,
+  ## Sets weight decay
+  weight_decay: 1.e-4,
+  ## Gradually/Linearilly increases learning rate until base learning is reached for 'num_warmup_epochs' Epochs
+  num_warmup_epochs: 3
+
 }
 
 logging_settings: {
   ## Test ID of the test sequence for the leave one out CV. -1 for training on all
     test_id: -1,
   ## Sets interval to test every nth epoch
-    test_every_nth_epoch: 5,
+    test_every_nth_epoch: -1,
   ## Sets interval to save model weights every nth epoch. -1 for saving only last epoch
-    save_every_nth_epoch: 5,
+    save_every_nth_epoch: 2,
   ## path to log directory
     log_dir: "/home/devuser/workspace/data/train_semantic_THAB_v3"
 }
