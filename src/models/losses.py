@@ -4,40 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 from torch.autograd import Function
 from torch.distributions import Dirichlet
-from models.probability_helper import logits_to_DirichletDist
-
-def smooth_one_hot(targets, num_classes, smoothing=0.1):
-    """
-    Smooths one-hot encoded target labels for semantic segmentation.
-
-    Args:
-        targets: LongTensor of shape [B, 1, H, W], class indices
-        num_classes: int, number of classes
-        smoothing: float, amount of label smoothing (0.0 = no smoothing)
-
-    Returns:
-        FloatTensor of shape [B, C, H, W], smoothed one-hot labels
-    """
-    confidence = 1.0 - smoothing
-    low_conf = smoothing / (num_classes - 1)
-
-    B, _, H, W = targets.shape
-
-    # Initialize full tensor with low confidence
-    one_hot = torch.full(
-        (B, num_classes, H, W),
-        fill_value=low_conf,
-        device=targets.device,
-        dtype=torch.float
-    )
-
-    # Squeeze channel dimension to get [B, H, W]
-    targets = targets.squeeze(1)
-
-    # Scatter high confidence to correct class
-    one_hot.scatter_(1, targets.unsqueeze(1), confidence)
-    #one_hot = torch.nn.functional.softmax(one_hot, dim=1)
-    return one_hot
+from models.probability_helper import to_alpha_concentrations, alphas_to_Dirichlet
+from models.probability_helper import smooth_one_hot
 
 # def logits_to_DirichletDist(predicted_logits, eps=0.01):
 #     """
@@ -62,12 +30,11 @@ def smooth_one_hot(targets, num_classes, smoothing=0.1):
 #     return dist, alpha
 
 # Dirichlet
-class DirichletSegmentationLoss(nn.Module):
+class DirichletNLLLoss(nn.Module):
     def __init__(self, smooth=0.1, eps=0.01):
         self.smooth = smooth
         self.eps = eps
-        super(DirichletSegmentationLoss, self).__init__()
-
+        super().__init__()
 
     def forward(self, predicted_logits, target, num_classes=20):
         """
@@ -82,7 +49,8 @@ class DirichletSegmentationLoss(nn.Module):
             Scalar loss value
         """
         # get Dirichlet distribution of NN output logits and alpha concentration parameters
-        dist, alpha = logits_to_DirichletDist(predicted_logits, self.eps)
+        alpha = to_alpha_concentrations(predicted_logits)
+        dist = alphas_to_Dirichlet(alpha)
         
         # smooth the targets 
         target = smooth_one_hot(target,num_classes=num_classes,smoothing=self.smooth)
@@ -95,6 +63,95 @@ class DirichletSegmentationLoss(nn.Module):
 
         return loss
 
+class DirichletBetaMomentLoss(nn.Module):
+    """
+    Implements the "max-norm" Dirichlet loss from:
+    Tsiligkaridis et al., Information-Aware Max-Norm Dirichlet Networks, 2020.
+
+    For each pixel i with true class c, we define the error vector
+        e = [ |1 - p_c|, p_j for j != c ]
+    and minimize its expected L_p norm under p ~ Dirichlet(alpha_i):
+        Loss_i = ( E[(1 - p_c)^p] + sum_{j != c} E[p_j^p] )^(1/p).
+
+    We compute each moment in closed form via the Beta-moment identity:
+
+        If X ~ Beta(a, b), then
+            E[X^p] = B(a + p, b) / B(a, b)
+                   = (Γ(a + p) / Γ(a)) * (Γ(a + b) / Γ(a + b + p)).
+
+    Similarly,
+        E[(1 - p_c)^p] = B(a0 - a_c + p, a_c) / B(a0 - a_c, a_c)
+                       = (Γ(a0 - a_c + p) / Γ(a0 - a_c)) * (Γ(a0) / Γ(a0 + p)).
+    """
+
+    def __init__(self, p: int = 4, eps: float = 1e-8):
+        """
+        Args:
+          p   : exponent in the L_p norm (paper uses p = 4).
+          eps : small positive constant to keep concentrations > 0.
+        """
+        super().__init__()
+        assert isinstance(p, int) and p >= 1, "p must be a positive integer"
+        self.p   = p
+        self.eps = eps
+
+    def forward(self,
+                logits: torch.Tensor,      # [B, C, H, W]
+                y_true: torch.LongTensor   # [B, 1, H, W]
+                ) -> torch.Tensor:
+        B, C, H, W = logits.shape
+
+        # 1) Convert raw logits to Dirichlet concentrations:
+        #    alpha_j = softplus(logit_j) + 1
+        alpha = F.softplus(logits).clamp_min(self.eps) + 1.0  # [B,C,H,W]
+
+        # 2) Total concentration: alpha_0 = sum_j alpha_j
+        alpha_0 = alpha.sum(dim=1, keepdim=True)              # [B,1,H,W]
+        alpha_0_s = alpha_0.squeeze(1)                        # [B,H,W]
+
+        # 3) One-hot encode the true class c
+        y = y_true.squeeze(1)                                 # [B,H,W]
+        oh = F.one_hot(y, num_classes=C)                      # [B,H,W,C]
+        oh = oh.permute(0,3,1,2).to(alpha.dtype)              # [B,C,H,W]
+
+        # 4) Extract alpha_c (true class) and a0_minus_c
+        alpha_c     = (alpha * oh).sum(dim=1, keepdim=True)   # [B,1,H,W]
+        a0_minus_c  = alpha_0 - alpha_c                       # [B,1,H,W]
+
+        # 5) Compute the common Gamma ratio:
+        #    common = Γ(alpha_0) / Γ(alpha_0 + p)
+        #    We'll use log form for stability
+        log_common = torch.lgamma(alpha_0_s) - torch.lgamma(alpha_0_s + self.p)  # [B,H,W]
+
+        # 6) True-class moment E[(1 - p_c)^p]:
+        #    = (Γ(a0_minus_c + p) / Γ(a0_minus_c)) * common
+        a = a0_minus_c.squeeze(1)                            # [B,H,W]
+        log_term_c = (torch.lgamma(a + self.p) - torch.lgamma(a)) + log_common
+        term_c = torch.exp(log_term_c)                       # [B,H,W]
+
+        # 7) All-class moments E[p_j^p]:
+        #    = (Γ(alpha_j + p) / Γ(alpha_j)) * common
+        # We compute for all j, then mask out the true class.
+        log_alpha = torch.lgamma(alpha)                      # [B,C,H,W]
+        log_alpha_p = torch.lgamma(alpha + self.p)           # [B,C,H,W]
+        log_term_all = (log_alpha_p - log_alpha) + log_common.unsqueeze(1)
+        term_all = torch.exp(log_term_all)                   # [B,C,H,W]
+
+        # 8) Sum over j != c
+        term_all = term_all * (1.0 - oh)                     # zero out j=c
+        sum_others = term_all.sum(dim=1)                     # [B,H,W]
+
+        # 9) Sum of p-th moments: E[||e||_p^p] = term_c + sum_others
+        E_norm_p_p = term_c + sum_others                    # [B,H,W]
+
+        # 10) Take the 1/p power: E[||e||_p] = (E_norm_p_p)^(1/p)
+        loss_map = E_norm_p_p.clamp_min(0).pow(1.0 / self.p) # [B,H,W]
+
+        # 11) Mean over all pixels and batch
+        return loss_map.mean()
+
+    
+    
 # class DirichletCalibrationLoss(nn.Module):
 #     def __init__(self, tau=0.03, eps=0.01, n_samples=32, num_classes=20, smooth=0.1, levels=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]):
 #         self.tau = tau
