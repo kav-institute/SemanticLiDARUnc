@@ -14,10 +14,18 @@ import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from models.evaluator import SemanticSegmentationEvaluator
 from models.probability_helper import get_predictive_entropy, get_aleatoric_uncertainty, to_alpha_concentrations, reliability_dirichlet
+from models.probability_helper import compute_mc_reliability_bins
+from models.probability_helper import save_reliability_diagram
+from models.probability_helper import compute_entropy_error_iou
+from models.probability_helper import plot_mIOU_errorEntropy
+from models.probability_helper import compute_entropy_reliability
+
 from models.probability_helper import smooth_one_hot
 from models.probability_helper import compute_ece_and_reliability
-from models.probability_helper import sample_accuracy_check
-from models.probability_helper import save_empirical_reliability_plot
+from models.probability_helper import brier_mc_decomp
+
+#from models.probability_helper import plot_reliability_and_sharpness
+
 from torch.special import digamma
 
 def add_horizontal_uncertainty_colorbar(image, num_classes, colormap=cv2.COLORMAP_TURBO, height=20,
@@ -99,6 +107,65 @@ def visualize_semantic_segmentation_cv2(mask, class_colors):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+def set_model_inputs(range_img, reflectivity, xyz, normals, cfg):
+    """
+    Build a list of input tensors for your baseline:
+        - [main]                       for single-input nets
+        - [main, metadata]             for nets that take two inputs
+    """
+    baseline = cfg["model_settings"]["baseline"].lower()
+
+    # ----------------------------
+    # 1) build "main" channels
+    # ----------------------------
+    main_channels = [range_img]  # always present
+
+    if cfg["model_settings"].get("reflectivity", 0):
+        main_channels.append(reflectivity)
+
+    # for SalsaNext also append xyz/normals here
+    if baseline == "salsanext":
+        main_channels.append(xyz)
+        if cfg["model_settings"].get("normals", 0):
+            main_channels.append(normals)
+
+        # single‐tensor input = cat all main channels
+        main = torch.cat(main_channels, dim=1)
+        return [main]
+
+    # ----------------------------
+    # 2) Reichert baseline needs metadata
+    # ----------------------------
+    elif baseline == "reichert":
+        # "main" for Reichert is just range+reflectivity
+        main = torch.cat(main_channels, dim=1)
+
+        # metadata is xyz+normals if requested
+        
+        if cfg["model_settings"].get("normals", 0):
+            metadata = torch.cat([xyz, normals], dim=1)
+        else:
+            # if no normals, you could pass an empty tensor or skip:
+            metadata = xyz
+
+        # always return a 2‐element list
+        return [main, metadata]
+
+    else:
+        raise ValueError(f"Unknown baseline: {cfg['model_settings']['baseline']}")
+
+        # if cfg["model_settings"].get("reflectivity", 0):
+        #     input_channels +=1  # reflectivity adds 1 extra channel to input_channels
+        # if cfg["model_settings"].get("normals", 0):
+        #     meta_channel_dim +=3  # n:
+        #     input_img = torch.cat([range_img, reflectivity],axis=1)
+        #         else:
+        #             input_img = range_img
+        #         if self.use_normals:
+        #             outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
+        #         else:
+        #             outputs_semantic = self.model(input_img, xyz)
+
 class Trainer:
     def __init__(self, model, optimizer, cfg, scheduler=None, visualize=False, logging=False, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
 
@@ -110,44 +177,54 @@ class Trainer:
         self.visualize = visualize
         if self.visualize:
             cv2.namedWindow("inf", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("inf", width=1500, height=800)   # width=800, height=600
+            cv2.resizeWindow("inf", width=int(1500), height=int(800))   # width=800, height=600
             
-            plt.ion()
-            self.fig, ax = plt.subplots()
-            self.reliability_plot, = ax.plot([], [], marker='s', label='ECE Reliability')#, label='Empirical Accuracy')
-            #self.confs, = ax.plot([], [], marker='s', label='Sample Accuracy Reliability')
-            ax.plot([0, 1], [0, 1], linestyle='--', label='Ideal Calibration')
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1)
-            ax.set_xlabel('Confidence')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Reliability Diagram')
-            ax.legend()
-            ax.grid(True)
+            # plt.ion()
+            # self.fig, ax = plt.subplots()
+            # self.reliability_plot, = ax.plot([], [], marker='s', label='ECE Reliability')#, label='Empirical Accuracy')
+            # #self.confs, = ax.plot([], [], marker='s', label='Sample Accuracy Reliability')
+            # ax.plot([0, 1], [0, 1], linestyle='--', label='Ideal Calibration')
+            # ax.set_xlim(0, 1)
+            # ax.set_ylim(0, 1)
+            # ax.set_xlabel('Confidence')
+            # ax.set_ylabel('Accuracy')
+            # ax.set_title('Reliability Diagram')
+            # ax.legend()
+            # ax.grid(True)
             
-            self.ece_text = ax.text(
-                0.05, 0.95,
-                '',                    # start empty
-                transform=ax.transAxes,
-                va='top'
-            )
+            # self.ece_text = ax.text(
+            #     0.05, 0.95,
+            #     '',                    # start empty
+            #     transform=ax.transAxes,
+            #     va='top'
+            # )
             
         self.logging = logging
         
         # config
         self.cfg = cfg
-        self.normals = cfg["model_settings"]["normals"]==True
-        self.use_reflectivity = cfg["extras"]["use_reflectivity"]==True
+        self.use_normals = cfg["model_settings"]["normals"]==True
+        self.use_reflectivity = cfg["model_settings"]["reflectivity"]==True
         self.num_classes = cfg["extras"]["num_classes"]
         self.class_names = cfg["extras"]["class_names"]
         self.class_colors = cfg["extras"]["class_colors"]
+        
+            ## important for which arguments are input of the model's forward pass 
+        self.baseline  = cfg["model_settings"]["baseline"]
 
         self.loss_function = cfg["extras"]["loss_function"]
+        # labda loss factors
+        self.lambda_nll = 1.0
+        # target ratio 0.8:0.2=4:1 (weight_nll:weight_betaMoment) -> consider magnitude from first loss values (0.7:16.9)
+        # -> weight_nll/weight_betaMoment = 0.8/0.2 * 0.7/16.9 approx. 0.1657
+        self.lambda_betaMoment = 1/ 0.1657
+        
         # TensorBoard
         if cfg["extras"].get("save_path", 0):
             self.save_path = cfg["extras"]["save_path"]
             self.writer = SummaryWriter(self.save_path)
-
+        else:
+            self.save_path = ""
         # Timer
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
@@ -162,9 +239,7 @@ class Trainer:
             self.criterion_lovasz = LovaszSoftmax()
         elif self.loss_function == "Dirichlet":
             self.criterion_unc_nll = DirichletNLLLoss()
-            self.criterion_unc_betaMoment = DirichletBetaMomentLoss()
-            if self.cfg["extras"]["with_calibration_loss"]:
-                self.criterion_smooth_calibration = DirichletCalibrationLoss()
+            self.criterion_unc_betaMoment = DirichletBetaMomentLoss(p=2)
         else:
             raise NotImplementedError
 
@@ -177,7 +252,16 @@ class Trainer:
     def train_one_epoch(self, dataloder, epoch):
         self.model.train()
         total_loss = 0.0
-        confs_list, accs_list, ece_list = [],[],[]
+        pred_entropy_norm_list = [] # list of total entropies
+        
+        # confs_list, accs_list, ece_list = [],[],[]
+        # bs_metrics = {
+        #     'bs_sum': 0.,
+        #     'rel_sum': 0.,
+        #     'res_sum': 0.,
+        #     'unc_sum': 0.,
+        #     'n_events': 0
+        # }
         # train one epoch
         for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Training - Epoch {epoch + 1}/{self.num_epochs}")):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
@@ -185,14 +269,9 @@ class Trainer:
             # run forward path
             start_time = time.time()
             self.start.record()
-            if self.use_reflectivity:
-                input_img = torch.cat([range_img, reflectivity],axis=1)
-            else:
-                input_img = range_img
-            if self.normals:
-                outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
-            else:
-                outputs_semantic = self.model(input_img, xyz)
+            # model expects input channels (min. range image) and meta channels (min. xyz image)
+            input_img = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
+            outputs_semantic = self.model(*input_img)
             self.end.record()
             curr_time = (time.time()-start_time)*1000
     
@@ -200,7 +279,7 @@ class Trainer:
             torch.cuda.synchronize()
             
             # get losses
-            if  self.loss_function == "Tversky":
+            if self.loss_function == "Tversky":
                 loss_semantic = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
                 loss_dice = self.criterion_dice(outputs_semantic, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
                 loss = loss_dice+loss_semantic
@@ -211,10 +290,7 @@ class Trainer:
             elif self.loss_function == "Dirichlet":
                 loss_nll = self.criterion_unc_nll(outputs_semantic, semantic)
                 loss_betaMoment = self.criterion_unc_betaMoment(outputs_semantic, semantic)
-                loss = loss_betaMoment
-                if self.cfg["extras"]["with_calibration_loss"]:
-                    loss_calibration = self.criterion_smooth_calibration(outputs_semantic, semantic)
-                    loss += loss_calibration
+                loss = loss_nll #+ loss_betaMoment #self.lambda_nll * loss_nll + self.lambda_betaMoment * loss_betaMoment
             else:
                 raise NotImplementedError
             
@@ -225,50 +301,24 @@ class Trainer:
             
             # get alpha concentration parameters form model output logits
             alpha = to_alpha_concentrations(outputs_semantic)
+
+            # predictive entropy /total uncertainty (H)
+            pred_entropy = get_predictive_entropy(alpha)
+            pred_entropy = (pred_entropy).permute(0, 1, 2)[0,...].cpu().detach().numpy()    # [B,H,W] -> [B,W,H] and use first element in batch
             
-            # reliability calibration
-            if batch_idx % 10 == 0:
-                #emp_freq, bin_centers = sample_accuracy_check(alpha, semantic, n_samples=150)
-                confs, accs, ece = compute_ece_and_reliability(alpha, semantic, n_bins=10)
-                confs_list.append(confs)
-                accs_list.append(accs)
-                ece_list.append(ece)
-                #coverages = np.arange(0, 11, dtype=float) * 0.1
-                #reliability_dict = reliability_dirichlet(alpha, semantic, coverages=coverages, n_samples=64, device="cuda")
-            
-            # reliability plot
-            if self.visualize and batch_idx % 10 == 0:
-                # Plotting the reliability diagram
-                with np.errstate(invalid='ignore'):
-                    confs_avg = np.nanmean(np.array(confs_list), axis=0)
-                    accs_avg = np.nanmean(np.array(accs_list), axis=0)
-                    ece_avg = np.nanmean(np.array(ece_list), axis=0)
-                self.reliability_plot.set_data(confs_avg, accs_avg)
-                #self.confs.set_data(bin_centers, emp_freq)
-                # Update the ECE text:
-                self.ece_text.set_text(f'ECE = {ece_avg:.4f}')
-                self.fig.canvas.draw()
-                self.fig.canvas.flush_events()
+            # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
+                # H = -∑_j (α_j / α₀) * ln(α_j / α₀)
+                # at α_j=1 ∀j -> H_max = -∑_j (1/K) * ln(1/K) = ln(K)
+            pred_entropy_norm = pred_entropy/np.log(self.num_classes)
+            pred_entropy_norm_list.append(pred_entropy_norm.mean())
 
             # plots cv2 image with gt vs pred and uncertainties
             if self.visualize:
                 if self.loss_function == "Dirichlet":
                     colormap_unc = cv2.COLORMAP_TURBO   # cv2.COLORMAP_TURBO or cv2.COLORMAP_MAGMA
-                    # get alpha concentration parameters
-                    #alpha = to_alpha_concentrations(outputs_semantic)
-                    
-                    # predictive entropy /total uncertainty (H)
-                    pred_entropy = get_predictive_entropy(alpha)
-                    pred_entropy = (pred_entropy).permute(0, 1, 2)[0,...].cpu().detach().numpy()    # [B,H,W] -> [B,W,H] and use first element in batch
-                    
-                    # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
-                        # H = -∑_j (α_j / α₀) * ln(α_j / α₀)
-                        # at α_j=1 ∀j -> H_max = -∑_j (1/K) * ln(1/K) = ln(K)
-                    pred_entropy_norm = pred_entropy/np.log(self.num_classes)
-                    
                     # pred_entropy_img = cv2.applyColorMap(np.uint8(255*np.maximum(2*(pred_entropy_norm - 0.5), 0.0)), cv2.COLORMAP_TURBO)
                     pred_entropy_img = cv2.applyColorMap(np.uint8(255*np.maximum(pred_entropy_norm, 0.0)), colormap=colormap_unc)
-                    pred_entropy_img = add_horizontal_uncertainty_colorbar(pred_entropy_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
+                    #pred_entropy_img = add_horizontal_uncertainty_colorbar(pred_entropy_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
                     
                     # aleatoric uncertainty (AU)
                     aleatoric_uncertainty = get_aleatoric_uncertainty(alpha)
@@ -280,7 +330,7 @@ class Trainer:
                     aleatoric_uncertainty_norm = aleatoric_uncertainty / (digamma(torch.tensor(self.num_classes+1.)) - digamma(torch.tensor(2.)))
                     
                     au_img = cv2.applyColorMap(np.uint8(255*np.maximum(aleatoric_uncertainty_norm, 0.0)), colormap=colormap_unc)
-                    au_img = add_horizontal_uncertainty_colorbar(au_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
+                    #au_img = add_horizontal_uncertainty_colorbar(au_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
                     
                     # epistemic uncertainty (EU)
                     epistemic_uncertainty = pred_entropy - aleatoric_uncertainty 
@@ -291,8 +341,8 @@ class Trainer:
                     epistemic_uncertainty_norm = epistemic_uncertainty / (np.log(self.num_classes) - ( digamma(torch.tensor(self.num_classes+1.)) - digamma(torch.tensor(2.)) ) )
                     
                     eu_img = cv2.applyColorMap(np.uint8(255*np.maximum(epistemic_uncertainty_norm, 0.0)), colormap=colormap_unc)
-                    eu_img = add_horizontal_uncertainty_colorbar(eu_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
-                    print("pred_entropy: {}, aleatoric_unc: {}, epistemic_unc: {}".format(pred_entropy.mean(), aleatoric_uncertainty.mean(), epistemic_uncertainty.mean()))
+                    #eu_img = add_horizontal_uncertainty_colorbar(eu_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
+                    #print("pred_entropy: {}, aleatoric_unc: {}, epistemic_unc: {}".format(pred_entropy.mean(), aleatoric_uncertainty.mean(), epistemic_uncertainty.mean()))
                     
                 # visualize first sample in batch
                 semantics_pred = (semseg_img).permute(0, 1, 2)[0,...].cpu().detach().numpy()
@@ -335,15 +385,20 @@ class Trainer:
                     if self.loss_function == "Dirichlet": 
                         self.writer.add_scalar('Loss/NLL', loss_nll.item(), step)
                         self.writer.add_scalar('Loss/BetaMoment', loss_betaMoment.item(), step)
-                        if self.cfg["extras"]["with_calibration_loss"]:
-                            self.writer.add_scalar('Loss/Calibration', loss_calibration.item(), step)
+                        self.writer.add_scalar('Unc/Total_norm', np.array(pred_entropy_norm_list).mean(), step)
                     #self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
                     #self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
-        
+
+        # ~ END of epoch 
         # Print average loss for the epoch
         avg_loss = total_loss / len(dataloder)
         print(f"Train Epoch {epoch + 1}/{self.num_epochs}, Average Loss: {avg_loss}")
         
+        # final epoch‐wide bnier score decomposed averages
+        # total = bs_metrics['n_events']
+        # overall = { k: bs_metrics[f"{k}_sum"]/total
+        #             for k in ['bs','rel','res','unc'] }
+
         # Log to TensorBoard
         if self.logging:
             self.writer.add_scalar('Loss/Epoch', avg_loss, epoch)
@@ -354,9 +409,23 @@ class Trainer:
         self.model.eval()
         self.evaluator.reset()
         
-        # reliability stuff
-        total_emp_freq = []
-        n_bins = 10
+        # METRICS inits when dirichlet is used
+        if self.logging and self.loss_function == "Dirichlet":
+            n_bins=10
+            thresholds = np.linspace(0.0, 1.0, n_bins, endpoint=False)
+        
+            # MC confidence reliability statistics
+            if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
+                mcConfReliability_global_hits  = np.zeros(n_bins)
+                mcConfReliability_global_tot   = np.zeros(n_bins)
+            # IOU Error-Mask vs Entropy with tresholding entropy inits
+            if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
+                all_ious_errorAndEntropy = []
+            # entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
+            if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
+                entropyErrorReliability_global_error  = np.zeros(n_bins)
+                entropyErrorReliability_global_tot   = np.zeros(n_bins)
+        
         for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Testing - Epoch {epoch + 1}/{self.num_epochs}")):
             range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
             start_time = time.time()
@@ -364,10 +433,17 @@ class Trainer:
             # run forward path
             start_time = time.time()
             self.start.record()
-            if self.normals:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), torch.cat([xyz, normals],axis=1))
+            
+            # model expects input channels (min. range image) and meta channels (min. xyz image)
+            if self.use_reflectivity:
+                input_img = torch.cat([range_img, reflectivity],axis=1)
             else:
-                outputs_semantic = self.model(torch.cat([range_img, reflectivity],axis=1), xyz)
+                input_img = range_img
+            if self.use_normals:
+                outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
+            else:
+                outputs_semantic = self.model(input_img, xyz)
+            
             self.end.record()
             curr_time = (time.time()-start_time)*1000
             
@@ -385,27 +461,109 @@ class Trainer:
             # get alpha concentration parameters form model output logits
             alpha = to_alpha_concentrations(outputs_semantic)
             
-            emp_freq = sample_accuracy_check(alpha, semantic, n_samples=150, n_bins=n_bins)
-            total_emp_freq.append(emp_freq)
+            # aggregation for reliability/sharpness plot
+            if self.logging and self.loss_function == "Dirichlet":
+                if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
+                    hits, tot = compute_mc_reliability_bins(alpha, semantic, n_bins, n_samples=120)
+                    mcConfReliability_global_hits += hits
+                    mcConfReliability_global_tot  += tot
+
+                # IOU between error mask and predictive entropy
+                    # get predictive entropy/total uncertainty
+                pred_entropy = get_predictive_entropy(alpha)
+                    # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
+                        # H = -∑_j (α_j / α₀) * ln(α_j / α₀)
+                        # at α_j=1 ∀j -> H_max = -∑_j (1/K) * ln(1/K) = ln(K)
+                pred_entropy_norm = pred_entropy/np.log(self.num_classes)
+                
+                # error mask
+                error_mask = torch.where(outputs_semantic_argmax != semantic.squeeze(1), 1, 0)
+                
+                if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
+                    ious = compute_entropy_error_iou(pred_entropy_norm, error_mask, thresholds=thresholds)
+                    all_ious_errorAndEntropy.append(ious.cpu().numpy())
+                
+                if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
+                    tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, error_mask)
+                    entropyErrorReliability_global_error += err
+                    entropyErrorReliability_global_tot  += tot
+            # empirical_acc, tot_counts = sample_accuracy_check(alpha, semantic, n_samples=120, n_bins=10)
+            # total_emp_freq.append(empirical_acc)
+            # total_bin_counts.append(tot_counts)
+            
+            # emp_freq = sample_accuracy_check(alpha, semantic, n_samples=120, n_bins=n_bins)
+            # total_emp_freq.append(emp_freq)
             #outputs_semantic_argmax = torch.argmax(outputs_semantic,dim=1)
 
             # get the most likely class
             #semseg_img = torch.argmax(outputs_semantic,dim=1)
 
             self.evaluator.update(outputs_semantic_argmax, semantic)
-            
+            # END OF EPOCH
+        
         mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
         print(f"Test Epoch {epoch + 1}/{self.num_epochs}, mIoU: {mIoU}")
         
-        # reliability plot
-        if self.logging:
-            total_emp_freq_np = np.array(total_emp_freq)
-            bin_edges = np.linspace(0.0, 1.0, n_bins+1)
-            bin_centers  = ((bin_edges[:-1] + bin_edges[1:]) / 2)           # [n_bins]
+        # METRICS
+        if self.logging and self.loss_function == "Dirichlet":
+            # MC Mean Confidence vs. Empirical Most-Likely Accuracy Reliability Plot
+            if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
+                empirical_acc_mcAcc = np.divide(
+                    mcConfReliability_global_hits,
+                    mcConfReliability_global_tot,
+                    out=np.zeros_like(mcConfReliability_global_hits),
+                    where=mcConfReliability_global_tot>0
+                )
+                bin_edges   = np.linspace(0.0, 1.0, n_bins+1)
+                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                
+                out_path = os.path.join(self.save_path, "eval", f"reliability_plot_epoch_{str(epoch).zfill(6)}.png")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                save_reliability_diagram(
+                        empirical_acc_mcAcc, 
+                        bin_centers, 
+                        mcConfReliability_global_tot,
+                        output_path=out_path,
+                        title='Reliability diagram\n(dot area ∝ #pixels per confidence bin - Sharpness)',
+                        xlabel='Predicted confidence (MC estimate)',
+                        ylabel='Empirical accuracy'
+                        )
             
-            save_path = os.path.join(self.save_path, "eval", f"reliability_plot_epoch_{str(epoch).zfill(6)}.png")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            save_empirical_reliability_plot(total_emp_freq_np, bin_centers, save_path)
+            # entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
+            if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
+                empirical_acc_entropyError = np.divide(
+                    entropyErrorReliability_global_error,
+                    entropyErrorReliability_global_tot,
+                    out=np.zeros_like(entropyErrorReliability_global_error),
+                    where=entropyErrorReliability_global_tot>0
+                )
+                out_path = os.path.join(self.save_path, "eval", f"entropy_error_reliability_epoch_{str(epoch).zfill(6)}.png")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                save_reliability_diagram(
+                    empirical_acc = empirical_acc_entropyError,     # now “observed error rate” per bin
+                    bin_centers   = bin_centers,      # the same 0.05, 0.15, … midpoints
+                    tot_counts    = entropyErrorReliability_global_tot,       # pixel counts per entropy‐bin
+                    output_path   = out_path,
+                    title='Reliability of Entropy as Error Predictor\n(dot area ∝ #pixels per Entropy bin - Sharpness)',
+                    xlabel='Normalized Entropy',
+                    ylabel='Observed Error Rate'
+                )
+
+            # IOU between error mask and predictive entropy
+            if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
+                all_ious = np.stack(all_ious_errorAndEntropy, axis=0)              # [num_batches, T]
+                mean_ious = all_ious.mean(axis=0)                  # [T]
+                out_path = os.path.join(self.save_path, "eval", f"mean_iou_curve_epoch_{str(epoch).zfill(6)}.png")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                plot_mIOU_errorEntropy(
+                    mean_ious, 
+                    thresholds, 
+                    output_path=out_path)
+            
+        #save_path = os.path.join(self.save_path, "eval", f"reliability_plot_epoch_{str(epoch).zfill(6)}.png")
+        #os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        #save_empirical_reliability_plot(total_emp_freq_np, bin_centers, total_bin_counts_np)
+            #save_empirical_reliability_plot(total_emp_freq_np, bin_centers, save_path)
 
 
         # Log to TensorBoard
@@ -428,7 +586,7 @@ class Trainer:
             # Update learning rate scheduler when ReduceLROnPlateau is NOT used
             if (not isinstance(self.scheduler, type(None))) and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step()
-            # test
+            # test, also after 1 epoch for early impressions
             if epoch % self.test_every_nth_epoch == 0:    # if epoch > 0 and epoch % self.test_every_nth_epoch == 0:
                 mIoU = self.test_one_epoch(dataloder_test, epoch)
                 # update scheduler based on rmse, and is ReduceLROnPlateau
@@ -444,4 +602,44 @@ class Trainer:
         # save last epoch
         if self.logging:
             torch.save(self.model.state_dict(), os.path.join(self.save_path, "model_final.pt"))
+            
+            
+
+# reliability calibration
+# if batch_idx % 10 == 0:
+#     n_samples = 64
+#     use_exp = False
+#     with_binning = True
+    
+#     plot_reliability_and_sharpness(alpha, semantic, n_samples)
+    
+#     decomp, factor = brier_mc_decomp(alpha, semantic, use_exp=use_exp, n_samples=n_samples, with_binning=with_binning)
+#     bs_metrics['bs_sum']   += decomp['brier']       * factor
+#     bs_metrics['rel_sum']  += decomp['reliability'] * factor
+#     bs_metrics['res_sum']  += decomp['resolution']  * factor
+#     bs_metrics['unc_sum']  += decomp['uncertainty'] * factor
+#     bs_metrics['n_events'] += factor
+        
+    
+#     #emp_freq, bin_centers = sample_accuracy_check(alpha, semantic, n_samples=150)
+#     confs, accs, ece = compute_ece_and_reliability(alpha, semantic, n_bins=10)
+#     confs_list.append(confs)
+#     accs_list.append(accs)
+#     ece_list.append(ece)
+    #coverages = np.arange(0, 11, dtype=float) * 0.1
+    #reliability_dict = reliability_dirichlet(alpha, semantic, coverages=coverages, n_samples=64, device="cuda")
+
+# reliability plot
+# if self.visualize and batch_idx % 10 == 0:
+#     # Plotting the reliability diagram
+#     with np.errstate(invalid='ignore'):
+#         confs_avg = np.nanmean(np.array(confs_list), axis=0)
+#         accs_avg = np.nanmean(np.array(accs_list), axis=0)
+#         ece_avg = np.nanmean(np.array(ece_list), axis=0)
+#     self.reliability_plot.set_data(confs_avg, accs_avg)
+#     #self.confs.set_data(bin_centers, emp_freq)
+#     # Update the ECE text:
+#     self.ece_text.set_text(f'ECE = {ece_avg:.4f}')
+#     self.fig.canvas.draw()
+#     self.fig.canvas.flush_events()
 
