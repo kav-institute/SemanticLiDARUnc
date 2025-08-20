@@ -370,7 +370,7 @@ if __name__ == "__main__":
     # 'regnet_y_800mf'
     import time
     import numpy as np
-    model = SemanticNetworkWithFPN(num_classes=20, backbone="regnet_y_800mf", meta_channel_dim=6).cuda()
+    model = SemanticNetworkWithFPN(num_classes=20, backbone="efficientnet_v2_l", meta_channel_dim=6).cuda()
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Number of parameters: ", pytorch_total_params / 1000000, "M")
     # Timer

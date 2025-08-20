@@ -1,0 +1,82 @@
+# path to SemanticTHAB dataset (sequences), no tailing path seperator!
+dataset_dir: "/home/devuser/workspace/data/SemanticKitti/dataset/sequences"
+
+model_settings: {
+  # Defines model backbone architecture
+  # Baseline model. type: str. options: SalsaNext | Reichert
+    baseline: "Reichert", 
+  # Backbone architecture
+    model_type: "efficientnet_v2_l",
+  # Model Layer settings
+  ## toggle attention block. type: bool
+    attention: true,
+  ## inject meta data at multiple scales. type: bool
+    multi_scale_meta: true,
+  
+  # Define what optional input channel types are used
+    # range (1 channel) and xyz (3 channels) are always considered -> min.4 channels
+  ## toggle use of normals as input (+3 extra channels). type: bool
+    normals: true,
+  ## toggle use of reflectivity as input (+1 extra channels). type: bool
+    reflectivity: true,
+
+  # AUGMENTATIONS
+  ## rotation augmentation. type: bool
+    rotate: false,   
+  ## flip augmentation. type: bool
+    flip: false,
+  
+  # Toggle use of Dropout
+  use_dropout: false,
+
+  # GENERAL SETTINGS
+  ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
+    ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
+    pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
+    # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
+    # Reichert Dirchlet: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
+    # Reichert pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
+}
+
+train_params: {
+  ## learning rate for training
+    learning_rate: 1.e-3,
+  ## Sets batch size for training
+    batch_size: 2,
+  ## Sets numbor of worker processes
+    num_workers: 4,
+  ## Sets number of total training epochs
+    num_epochs: 100,
+  ## Sets weight decay
+  weight_decay: 1.e-4,
+  ## Gradually/Linearilly increases learning rate until base learning is reached for 'num_warmup_epochs' Epochs
+  num_warmup_epochs: 2
+
+}
+
+logging_settings: {
+  ## Test ID of the test sequence for the leave one out CV. -1 for training on all
+    test_id: 8,
+  ## Sets interval to test every nth epoch
+    test_every_nth_epoch: 2,
+  ## Sets interval to save model weights every nth epoch. -1 for saving only last epoch
+    save_every_nth_epoch: 2,
+  ## path to log directory
+    log_dir: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext",
+    metrics: {
+      McConfEmpAcc: false, # bool, MC Mean Confidence vs. Empirical Most-Likely Accuracy Reliability Plot
+      EntErrRel: false, # bool, entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
+      IouPlt: true
+    }
+}
+calibration: 
+  enable: false
+  run_each_eval: false      # true = refit every eval; false = fit once when T is None
+  cache_mode: "mc"     # "default" or "mc"
+  optimizer: "lbfgs"        # "lbfgs" or "adam"
+  lr: 0.05
+  epochs: 2
+  chunk_size: 1000000
+  max_iter: 100
+  mc_samples: 30
+  save_path: ""             # optional: save {"temperature": T}

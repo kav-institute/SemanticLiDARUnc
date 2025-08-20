@@ -18,9 +18,11 @@ import yaml
 
 import time
 
+import matplotlib
+matplotlib.use("TkAgg")  # often more robust than Tk
+
 def count_folders(directory):
     return len([name for name in os.listdir(directory) if os.path.isdir(os.path.join(directory, name))])
-
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -44,6 +46,7 @@ def load_config(path):
     return cfg
 
 def main(args):
+    assert args.mode in {"train", "test"}, "Set script mode at argumentparser to be one of 'train' OR 'test'"
     cfg = load_config(args.cfg_path)
 
     # add additional configurations to config file
@@ -52,7 +55,7 @@ def main(args):
     cfg["extras"]["num_classes"] = 20
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
-    cfg["extras"]["loss_function"] = "Dirichlet"    # Tversky   Dirichlet
+    cfg["extras"]["loss_function"] = "Dirichlet"    # Tversky | Dirichlet
     # choose model architecture, type str
     baseline = cfg["model_settings"].get("baseline", "Reichert")
     cfg["model_settings"]["baseline"] = baseline    # ensure that the basline parameter is set if not pre-initialized in config
@@ -64,7 +67,7 @@ def main(args):
     depth_dataset_train = SemanticKitti(data_path_train, rotate=cfg["model_settings"]["rotate"], flip=cfg["model_settings"]["flip"], projection=(64,512),resize=False)
     dataloader_train = DataLoader(depth_dataset_train, batch_size=cfg["train_params"]["batch_size"], shuffle=True, num_workers=cfg["train_params"]["num_workers"])
     
-    depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False, projection=(64,512),resize=False)
+    depth_dataset_test = SemanticKitti(data_path_test[:1000], rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=cfg["train_params"]["num_workers"])
     
     # defines model architecture and input dimensions
@@ -184,8 +187,27 @@ def main(args):
         #     json.dump(cfg, fp)
 
     # train model
-    trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
-    trainer(dataloader_train, dataloader_test)
+    if args.mode=="train":
+        trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
+        trainer(dataloader_train, dataloader_test)
+    elif args.mode=="test":
+        tester = Tester(
+            model=model,
+            cfg=cfg,
+            visualize=args.visualization,
+            logging=args.with_logging,
+            checkpoint=cfg["model_settings"].get("pretrained")  # or a separate path
+        )
+
+        do_calib = cfg["logging_settings"].get("do_temp_scaling", True)
+        tester.run(
+            dataloader_test=dataloader_test,
+            calib_loader=dataloader_test,   # or a dedicated calib loader
+            do_calibration=do_calib,
+            ts_mode="default",              # or "mc" (averages logits with dropout)
+            mc_samples=30
+        )
+    
     #cfg["train_params"]["num_epochs"], test_every_nth_epoch=cfg["logging_settings"]["test_every_nth_epoch"], save_every_nth_epoch=cfg["logging_settings"]["save_every_nth_epoch"])
 
 if __name__ == '__main__':
@@ -194,7 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--visualization', 
                         #action='store_true',
                         type=bool, 
-                        default=False,
+                        default=True,
                         help='Toggle visualization during training (default: False)')
     parser.add_argument('--with_logging', 
                         #action='store_true',
@@ -206,6 +228,11 @@ if __name__ == '__main__':
                         type=str, 
                         default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
                         help='Path to the config file used for training')
+    parser.add_argument('--mode', 
+                        #action='store_true',
+                        type=str, 
+                        default="train",
+                        help="Training option whether to 'train' or 'test' the model")
     args = parser.parse_args()
     main(args)
     
