@@ -1,645 +1,545 @@
+# models/trainer.py
+from __future__ import annotations
 
-import torch
-
-from models.losses import TverskyLoss, SemanticSegmentationLoss, LovaszSoftmax, DirichletNLLLoss, DirichletCalibrationLoss, DirichletBetaMomentLoss
-
-import time
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
 import os
-import open3d as o3d
+import math
+import time
+import json
+import numpy as np
 import tqdm
-
+import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+
+# --- project modules (refactored) ---
 from models.evaluator import SemanticSegmentationEvaluator
-from models.probability_helper import get_predictive_entropy, get_aleatoric_uncertainty, to_alpha_concentrations, reliability_dirichlet
-from models.probability_helper import compute_mc_reliability_bins
-from models.probability_helper import save_reliability_diagram
-from models.probability_helper import compute_entropy_error_iou
-from models.probability_helper import plot_mIOU_errorEntropy
-from models.probability_helper import compute_entropy_reliability
 
-from models.probability_helper import smooth_one_hot
-from models.probability_helper import compute_ece_and_reliability
-from models.probability_helper import brier_mc_decomp
+from models.temp_scaling import (
+    cache_calib_logits,
+    calibrate_temperature_from_cache,
+)
 
-#from models.probability_helper import plot_reliability_and_sharpness
+from utils.mc_dropout import (
+    set_dropout_mode,
+    mc_dropout_probs,
+    predictive_entropy_mc,
+)
 
-from torch.special import digamma
+from utils.inputs import set_model_inputs
 
-def add_horizontal_uncertainty_colorbar(image, num_classes, colormap=cv2.COLORMAP_TURBO, height=20,
-                                        num_ticks=5, font_scale=0.7, thickness=1, color=(225, 225, 225)):
-    """
-    Adds a horizontal colorbar for uncertainty values (0 to log(num_classes)) with ticks and labels below the image.
+from utils.vis_cv2 import (
+    visualize_semantic_segmentation_cv2,
+    open_window,
+    close_window,
+    show_stack
+)
 
-    Args:
-        image: Colored uncertainty image (H, W, 3) as BGR numpy array
-        num_classes: Number of classes to compute max uncertainty = log(num_classes)
-        colormap: OpenCV colormap to use
-        height: Height of the colorbar in pixels
-        num_ticks: Number of tick labels (e.g., 5 → 0, 0.5, 1, 1.5, 2)
-        font_scale: Font size for labels
-        thickness: Line and text thickness
+# optional / uncertainty helpers (unchanged file)
+from models.probability_helper import (
+    to_alpha_concentrations,
+    get_predictive_entropy,
+    get_predictive_entropy_norm,
+    get_aleatoric_uncertainty,
+    compute_mc_reliability_bins,
+    save_reliability_diagram,
+    compute_entropy_error_iou,
+    plot_mIOU_errorEntropy,
+    compute_entropy_reliability,
+    get_dirichlet_uncertainty_imgs
+)
 
-    Returns:
-        Concatenated image with labeled horizontal colorbar below
-    """
-    max_uncertainty = np.log(num_classes)
-    width = image.shape[1]
+from utils.o3d_env import (
+    ensure_o3d_runtime, 
+    has_display
+)
 
-    # Generate horizontal gradient (left = 0, right = max_uncertainty)
-    gradient = np.linspace(0, max_uncertainty, width).astype(np.float32).reshape(1, -1)
-    gradient_norm = np.clip((gradient / max_uncertainty) * 255.0, 0, 255).astype(np.uint8)
-    gradient_resized = cv2.resize(gradient_norm, (width, height), interpolation=cv2.INTER_LINEAR)
-    colorbar = cv2.applyColorMap(gradient_resized, colormap)
+def create_ia_plots(args_cv2, args_o3d, save_dir=""):
+    assert len(args_o3d)==2, "create_cv2_plots function args_o3d requires 2 arguments, xyz and pcl colors"
+    import cv2
+    img = show_stack(args_cv2, scale=1.5)
 
-    bar_with_ticks = colorbar.copy()
+    key = cv2.waitKey(1) & 0xFF
+    if key in (ord('q'),):
+    # if (cv2.waitKey(1) & 0xFF) == ord('q'):
+        import open3d as o3d
+        if not has_display():
+            # Headless session: save a PLY instead of opening a window
+            if save_dir:
+                xyz, color_bgr = args_o3d
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(xyz.reshape(-1, 3))
+                # convert BGR [0..255] to RGB [0..1]
+                rgb = (color_bgr[..., ::-1].reshape(-1, 3).astype(np.float32)) / 255.0
+                pcd.colors = o3d.utility.Vector3dVector(rgb)
+                out = os.path.join(save_dir, "snapshot.ply")
+                o3d.io.write_point_cloud(out, pcd)
+                print(f"[viz] No display; saved point cloud to {out}")
+            else:
+                print("[viz] No display available (DISPLAY/WAYLAND_DISPLAY not set).")
+            return
 
-    # Draw ticks and labels along width (x-axis)
-    text_labels = ["Certain", "Confident", "Ambiguous", "Doubtful", "Uncertain"]
-    for i in range(5):
-        x = int(i * (width - 1) / (num_ticks - 1))
-        value = i * max_uncertainty / (num_ticks - 1)
-        label = text_labels[i]
+        # GUI path: make sure XDG_RUNTIME_DIR exists
+        ensure_o3d_runtime()
 
-        # Draw vertical tick mark
-        #cv2.line(bar_with_ticks, (x, 0), (x, 20), color=color, thickness=thickness)
+        # Build and show point cloud
+        xyz, color_bgr = args_o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz.reshape(-1, 3))
+        rgb = (color_bgr[..., ::-1].reshape(-1, 3).astype(np.float32)) / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
 
-        # Get text size for horizontal centering
-        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        if i <= 2:
-            text_x = x #+ text_size[0]#// 2  # center label horizontally on tick
-        elif i == 2:
-            text_x = x #- text_size[0] // 2  # center label horizontally on tick
-        else:
-            text_x = x - text_size[0] #// 2  # center label horizontally on tick
-        text_y = text_size[1]  # below tick mark
-
-        # Put label text
-        cv2.putText(bar_with_ticks, label, (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, lineType=cv2.LINE_AA)
-
-    # Concatenate colorbar below the image
-    return np.concatenate((image, bar_with_ticks), axis=0)
-
-
-def visualize_semantic_segmentation_cv2(mask, class_colors):
-    """
-    Visualize semantic segmentation mask using class colors with cv2.
-
-    Parameters:
-    - mask: 2D NumPy array containing class IDs for each pixel.
-    - class_colors: Dictionary mapping class IDs to BGR colors.
-
-    Returns:
-    - visualization: Colored semantic segmentation image in BGR format.
-    """
-    h, w = mask.shape
-    visualization = np.zeros((h, w, 3), dtype=np.uint8)
-
-    for class_id, color in class_colors.items():
-        visualization[mask == class_id] = color
-
-    return visualization
-
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def set_model_inputs(range_img, reflectivity, xyz, normals, cfg):
-    """
-    Build a list of input tensors for your baseline:
-        - [main]                       for single-input nets
-        - [main, metadata]             for nets that take two inputs
-    """
-    baseline = cfg["model_settings"]["baseline"].lower()
-
-    # ----------------------------
-    # 1) build "main" channels
-    # ----------------------------
-    main_channels = [range_img]  # always present
-
-    if cfg["model_settings"].get("reflectivity", 0):
-        main_channels.append(reflectivity)
-
-    # for SalsaNext also append xyz/normals here
-    if baseline == "salsanext":
-        main_channels.append(xyz)
-        if cfg["model_settings"].get("normals", 0):
-            main_channels.append(normals)
-
-        # single‐tensor input = cat all main channels
-        main = torch.cat(main_channels, dim=1)
-        return [main]
-
-    # ----------------------------
-    # 2) Reichert baseline needs metadata
-    # ----------------------------
-    elif baseline == "reichert":
-        # "main" for Reichert is just range+reflectivity
-        main = torch.cat(main_channels, dim=1)
-
-        # metadata is xyz+normals if requested
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame()
+        o3d.visualization.draw_geometries([mesh, pcd])
         
-        if cfg["model_settings"].get("normals", 0):
-            metadata = torch.cat([xyz, normals], dim=1)
-        else:
-            # if no normals, you could pass an empty tensor or skip:
-            metadata = xyz
 
-        # always return a 2‐element list
-        return [main, metadata]
+        #time.sleep(10)
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(args_o3d[0].reshape(-1,3))
+        # pcd.colors = o3d.utility.Vector3dVector(np.float32(args_o3d[1][...,::-1].reshape(-1,3))/255.0)
 
-    else:
-        raise ValueError(f"Unknown baseline: {cfg['model_settings']['baseline']}")
-
-        # if cfg["model_settings"].get("reflectivity", 0):
-        #     input_channels +=1  # reflectivity adds 1 extra channel to input_channels
-        # if cfg["model_settings"].get("normals", 0):
-        #     meta_channel_dim +=3  # n:
-        #     input_img = torch.cat([range_img, reflectivity],axis=1)
-        #         else:
-        #             input_img = range_img
-        #         if self.use_normals:
-        #             outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
-        #         else:
-        #             outputs_semantic = self.model(input_img, xyz)
+        # mesh = o3d.geometry.TriangleMesh.create_coordinate_frame()
+        # o3d.visualization.draw_geometries([mesh, pcd])
 
 class Trainer:
-    def __init__(self, model, optimizer, cfg, scheduler=None, visualize=False, logging=False, test_mask=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
+    """
+    Minimal, clean Trainer with:
+      - standard train loop
+      - test loop (optionally MC-dropout and Dirichlet-based diagnostics)
+      - optional post-hoc Temperature Scaling (TS) on cached logits
 
+    Expectation:
+      - Your model exposes `forward_logits(*inputs)` for raw logits.
+      - Your model's default `forward(*inputs)` returns probabilities (softmaxed),
+        used as fallback when `forward_logits` does not exist.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        cfg: dict,
+        scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
+        visualize: bool = False,
+        logging: bool = False,
+        test_mask=None,
+    ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        #time.sleep(3)
-        
-        self.visualize = visualize
-        if self.visualize:
-            cv2.namedWindow("inf", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("inf", width=int(1500), height=int(800))   # width=800, height=600
-            
-            # plt.ion()
-            # self.fig, ax = plt.subplots()
-            # self.reliability_plot, = ax.plot([], [], marker='s', label='ECE Reliability')#, label='Empirical Accuracy')
-            # #self.confs, = ax.plot([], [], marker='s', label='Sample Accuracy Reliability')
-            # ax.plot([0, 1], [0, 1], linestyle='--', label='Ideal Calibration')
-            # ax.set_xlim(0, 1)
-            # ax.set_ylim(0, 1)
-            # ax.set_xlabel('Confidence')
-            # ax.set_ylabel('Accuracy')
-            # ax.set_title('Reliability Diagram')
-            # ax.legend()
-            # ax.grid(True)
-            
-            # self.ece_text = ax.text(
-            #     0.05, 0.95,
-            #     '',                    # start empty
-            #     transform=ax.transAxes,
-            #     va='top'
-            # )
-            
-        self.logging = logging
-        
-        # config
         self.cfg = cfg
-        self.use_normals = cfg["model_settings"]["normals"]==True
-        self.use_reflectivity = cfg["model_settings"]["reflectivity"]==True
-        self.num_classes = cfg["extras"]["num_classes"]
+        self.visualize = visualize
+        self.logging = logging
+
+        if test_mask is None:
+            test_mask = [1] * cfg["extras"]["num_classes"]
+
+        # data / task meta
+        self.num_classes = int(cfg["extras"]["num_classes"])
         self.class_names = cfg["extras"]["class_names"]
         self.class_colors = cfg["extras"]["class_colors"]
-        
-            ## important for which arguments are input of the model's forward pass 
-        self.baseline  = cfg["model_settings"]["baseline"]
 
-        self.loss_function = cfg["extras"]["loss_function"]
-        # labda loss factors
-        self.lambda_nll = 1.0
-        # target ratio 0.8:0.2=4:1 (weight_nll:weight_betaMoment) -> consider magnitude from first loss values (0.7:16.9)
-        # -> weight_nll/weight_betaMoment = 0.8/0.2 * 0.7/16.9 approx. 0.1657
-        self.lambda_betaMoment = 1/ 0.1657
-        
-        # TensorBoard
-        if cfg["extras"].get("save_path", 0):
-            self.save_path = cfg["extras"]["save_path"]
-            self.writer = SummaryWriter(self.save_path)
-        else:
-            self.save_path = ""
-        # Timer
-        self.start = torch.cuda.Event(enable_timing=True)
-        self.end = torch.cuda.Event(enable_timing=True)
+        # loss selection
+        self.loss_name = cfg["extras"]["loss_function"]
 
-        # Loss
-        if  self.loss_function == "Tversky":
-            self.criterion_dice = TverskyLoss()
-            self.criterion_semantic = SemanticSegmentationLoss()
-        elif self.loss_function == "CE":
-            self.criterion_semantic = SemanticSegmentationLoss()
-        elif  self.loss_function == "Lovasz":
-            self.criterion_lovasz = LovaszSoftmax()
-        elif self.loss_function == "Dirichlet":
-            self.criterion_unc_nll = DirichletNLLLoss()
-            self.criterion_unc_betaMoment = DirichletBetaMomentLoss(p=2)
-        else:
-            raise NotImplementedError
-
-        # Evaluator
+        # evaluator
         self.evaluator = SemanticSegmentationEvaluator(self.num_classes, test_mask=test_mask)
 
+        # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-    def train_one_epoch(self, dataloder, epoch):
+        self.save_path = cfg["extras"].get("save_path", "")
+        self.writer = SummaryWriter(self.save_path) if self.logging and self.save_path else None
+
+        # timers
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._end = torch.cuda.Event(enable_timing=True)
+
+        # temperature value (optional, filled once calibrated)
+        self.T_value: float | None = None
+
+        # build criterion(s)
+        self._init_losses()
+
+    # ------------------------------
+    # loss setup
+    # ------------------------------
+    def _init_losses(self):
+        from models.losses import (
+            TverskyLoss,
+            SemanticSegmentationLoss,
+            LovaszSoftmax,
+            DirichletNLLLoss,
+            DirichletBetaMomentLoss,
+        )
+
+        if self.loss_name == "Tversky":
+            self.criterion_sem = SemanticSegmentationLoss()
+            self.criterion_tversky = TverskyLoss()
+        elif self.loss_name == "CE":
+            self.criterion_sem = SemanticSegmentationLoss()
+        elif self.loss_name == "Lovasz":
+            self.criterion_lovasz = LovaszSoftmax()
+        elif self.loss_name == "Dirichlet":
+            self.criterion_dir_nll = DirichletNLLLoss()
+            self.criterion_dir_bm = DirichletBetaMomentLoss(p=2)  # optional second term
+        else:
+            raise NotImplementedError(f"Unknown loss function: {self.loss_name}")
+
+    # ------------------------------
+    # training
+    # ------------------------------
+    def train_one_epoch(self, loader, epoch: int):
         self.model.train()
         total_loss = 0.0
-        pred_entropy_norm_list = [] # list of total entropies
+
+        # >>> additional initialization
+        # Dirichlet specific
+        if self.loss_name == "Dirichlet":
+            get_predictive_entropy_norm.reset()
         
-        # confs_list, accs_list, ece_list = [],[],[]
-        # bs_metrics = {
-        #     'bs_sum': 0.,
-        #     'rel_sum': 0.,
-        #     'res_sum': 0.,
-        #     'unc_sum': 0.,
-        #     'n_events': 0
-        # }
-        # train one epoch
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Training - Epoch {epoch + 1}/{self.num_epochs}")):
-            range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
-    
-            # run forward path
-            start_time = time.time()
-            self.start.record()
-            # model expects input channels (min. range image) and meta channels (min. xyz image)
-            input_img = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
-            outputs_semantic = self.model(*input_img)
-            self.end.record()
-            curr_time = (time.time()-start_time)*1000
-    
-            # Waits for everything to finish running
+        for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
+            tqdm.tqdm(loader, desc=f"train {epoch+1}")
+        ):
+            range_img = range_img.to(self.device)
+            reflectivity = reflectivity.to(self.device)
+            xyz = xyz.to(self.device)
+            normals = normals.to(self.device)
+            labels = labels.to(self.device)  # [B,1,H,W] or [B,H,W]
+
+            # if labels.ndim == 4:
+            #     labels = labels.squeeze(1).long()
+            # else:
+            #     labels = labels.long()
+
+            inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
+
+            self._start.record()
+            outputs = self.model(*inputs)  # default: probabilities (for most baselines)
+            self._end.record()
             torch.cuda.synchronize()
-            
-            # get losses
-            if self.loss_function == "Tversky":
-                loss_semantic = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
-                loss_dice = self.criterion_dice(outputs_semantic, semantic, num_classes=self.num_classes, alpha=0.9, beta=0.1)
-                loss = loss_dice+loss_semantic
-            elif  self.loss_function == "CE":
-                loss = self.criterion_semantic(outputs_semantic, semantic, num_classes=self.num_classes)
-            elif  self.loss_function == "Lovasz":
-                loss = self.criterion_lovasz(outputs_semantic, semantic)
-            elif self.loss_function == "Dirichlet":
-                loss_nll = self.criterion_unc_nll(outputs_semantic, semantic)
-                loss_betaMoment = self.criterion_unc_betaMoment(outputs_semantic, semantic)
-                loss = loss_nll #+ loss_betaMoment #self.lambda_nll * loss_nll + self.lambda_betaMoment * loss_betaMoment
+
+            # ---- compute loss (by selected head) ----
+            if self.loss_name == "Tversky":
+                loss_sem = self.criterion_sem(outputs, labels, num_classes=self.num_classes)
+                loss_t = self.criterion_tversky(outputs, labels, num_classes=self.num_classes)
+                loss = loss_sem + loss_t
+            elif self.loss_name == "CE":
+                loss = self.criterion_sem(outputs, labels, num_classes=self.num_classes)
+            elif self.loss_name == "Lovasz":
+                loss = self.criterion_lovasz(outputs, labels)
+            elif self.loss_name == "Dirichlet":
+                # If your model returns raw logits for Dirichlet, point outputs there.
+                loss_nll = self.criterion_dir_nll(outputs, labels)
+                # loss_bm = self.criterion_dir_bm(outputs, labels)  # optional term
+                loss = loss_nll
+                
+                # >>> additional initializations
+                alpha = None
             else:
-                raise NotImplementedError
+                raise RuntimeError("unreachable")
+
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += float(loss.item())
+                
+            # detach model output tensor from auto-gradient graph, and put to cpu
+            outputs = outputs.detach().cpu()
+            labels  = labels .detach().cpu()
             
-            # detach model output tensor from auto-gradient graph
-            outputs_semantic = outputs_semantic.detach()
             # get the most likely class
-            semseg_img = torch.argmax(outputs_semantic,dim=1)
+            outputs_argmax = torch.argmax(outputs,dim=1)
             
-            # get alpha concentration parameters form model output logits
-            alpha = to_alpha_concentrations(outputs_semantic)
-
-            # predictive entropy /total uncertainty (H)
-            pred_entropy = get_predictive_entropy(alpha)
-            pred_entropy = (pred_entropy).permute(0, 1, 2)[0,...].cpu().detach().numpy()    # [B,H,W] -> [B,W,H] and use first element in batch
-            
-            # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
-                # H = -∑_j (α_j / α₀) * ln(α_j / α₀)
-                # at α_j=1 ∀j -> H_max = -∑_j (1/K) * ln(1/K) = ln(K)
-            pred_entropy_norm = pred_entropy/np.log(self.num_classes)
-            pred_entropy_norm_list.append(pred_entropy_norm.mean())
-
-            # plots cv2 image with gt vs pred and uncertainties
+            if self.loss_name=="Dirichlet":
+                if alpha is None: alpha = to_alpha_concentrations(outputs)
+                unc_tot_batch_sum = get_predictive_entropy_norm.accumulate(alpha)
+                # alternative usage: 
+                    # unc_tot = get_predictive_entropy_norm(alpha)
+                    # get_predictive_entropy_norm.add(unc_tot)
+                    
+            # logging
+            if self.logging and self.writer and step % 10 == 0:
+                global_step = epoch * len(loader) + step
+                self.writer.add_scalar("train/loss/iter", loss.item(), global_step)
+                self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], global_step)
+                
             if self.visualize:
-                if self.loss_function == "Dirichlet":
-                    colormap_unc = cv2.COLORMAP_TURBO   # cv2.COLORMAP_TURBO or cv2.COLORMAP_MAGMA
-                    # pred_entropy_img = cv2.applyColorMap(np.uint8(255*np.maximum(2*(pred_entropy_norm - 0.5), 0.0)), cv2.COLORMAP_TURBO)
-                    pred_entropy_img = cv2.applyColorMap(np.uint8(255*np.maximum(pred_entropy_norm, 0.0)), colormap=colormap_unc)
-                    #pred_entropy_img = add_horizontal_uncertainty_colorbar(pred_entropy_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
-                    
-                    # aleatoric uncertainty (AU)
-                    aleatoric_uncertainty = get_aleatoric_uncertainty(alpha)
-                    aleatoric_uncertainty = aleatoric_uncertainty.permute(0, 1, 2)[0,...].cpu().detach().numpy()
-                    
-                    # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
-                        # AU = -∑_j (α_j / α₀) * [ψ(α_j + 1) − ψ(α₀ + 1)]
-                        # at α_j=1 ∀j -> AU_max = -∑_j (1/K) * [ψ(1 + 1) − ψ(K + 1)] = -ψ(2) + ψ(K + 1)
-                    aleatoric_uncertainty_norm = aleatoric_uncertainty / (digamma(torch.tensor(self.num_classes+1.)) - digamma(torch.tensor(2.)))
-                    
-                    au_img = cv2.applyColorMap(np.uint8(255*np.maximum(aleatoric_uncertainty_norm, 0.0)), colormap=colormap_unc)
-                    #au_img = add_horizontal_uncertainty_colorbar(au_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
-                    
-                    # epistemic uncertainty (EU)
-                    epistemic_uncertainty = pred_entropy - aleatoric_uncertainty 
-                    # or get_epistemic_uncertainty(alpha).permute(0, 1, 2)[0,...].cpu().detach().numpy()
-                    
-                    # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
-                        # as EU = H - AU -> EU_max = ln K − [ψ(K+1) − ψ(2)] 
-                    epistemic_uncertainty_norm = epistemic_uncertainty / (np.log(self.num_classes) - ( digamma(torch.tensor(self.num_classes+1.)) - digamma(torch.tensor(2.)) ) )
-                    
-                    eu_img = cv2.applyColorMap(np.uint8(255*np.maximum(epistemic_uncertainty_norm, 0.0)), colormap=colormap_unc)
-                    #eu_img = add_horizontal_uncertainty_colorbar(eu_img, num_classes=self.num_classes, height=20, colormap=colormap_unc)
-                    #print("pred_entropy: {}, aleatoric_unc: {}, epistemic_unc: {}".format(pred_entropy.mean(), aleatoric_uncertainty.mean(), epistemic_uncertainty.mean()))
-                    
-                # visualize first sample in batch
-                semantics_pred = (semseg_img).permute(0, 1, 2)[0,...].cpu().detach().numpy()
-                semantics_gt = (semantic[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
+                # for visualization use first element in batch,  [B,H,W] -> [B,W,H]
+                semantics_pred = (outputs_argmax).permute(0, 1, 2)[0,...].numpy()
+                semantics_gt = (labels).squeeze(1).permute(0, 1, 2)[0,...].numpy()
                 error_img = np.uint8(np.where(semantics_pred[...,None]!=semantics_gt[...,None], (0,0,255), (0,0,0)))
                 xyz_img = (xyz).permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()
-                #normal_img = (normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2
                 reflectivity_img = (reflectivity).permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()
                 reflectivity_img = np.uint8(255*np.concatenate(3*[reflectivity_img],axis=-1))
                 prev_sem_pred = visualize_semantic_segmentation_cv2(semantics_pred, class_colors=self.class_colors)
                 prev_sem_gt = visualize_semantic_segmentation_cv2(semantics_gt, class_colors=self.class_colors)
-                if self.loss_function == "Dirichlet":
-                    cv2.imshow("inf", np.vstack((reflectivity_img, prev_sem_pred, prev_sem_gt, error_img, pred_entropy_img, au_img, eu_img)))
-                    # cv2.imshow("inf", np.vstack((reflectivity_img,np.uint8(255*normal_img),prev_sem_pred,prev_sem_gt,error_img, pred_entropy_img)))
+                normal_img = np.uint8(255*(normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2 )
+                if self.loss_name == "Dirichlet":
+                    # get alpha concentration parameters form model output logits
+                    if alpha is None: alpha = to_alpha_concentrations(outputs)
+
+                    unc_tot_img, unc_a_img, unc_e_img = get_dirichlet_uncertainty_imgs(alpha)
+                    create_ia_plots(args_cv2=(reflectivity_img, normal_img, prev_sem_pred, prev_sem_gt, error_img, unc_tot_img, unc_a_img, unc_e_img), 
+                                    args_o3d=(xyz_img, prev_sem_pred))
                 else:
-                    normal_img = (normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2
-                    cv2.imshow("inf", np.vstack((reflectivity_img,np.uint8(255*normal_img),prev_sem_pred,prev_sem_gt,error_img)))
-                if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                    create_ia_plots(args_cv2=(reflectivity_img, normal_img, prev_sem_pred, prev_sem_gt, error_img), 
+                                    args_o3d=(xyz_img, prev_sem_pred))
 
-                    #time.sleep(10)
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(xyz_img.reshape(-1,3))
-                    pcd.colors = o3d.utility.Vector3dVector(np.float32(prev_sem_pred[...,::-1].reshape(-1,3))/255.0)
-        
-                    mesh = o3d.geometry.TriangleMesh.create_coordinate_frame()
-                    o3d.visualization.draw_geometries([mesh, pcd])
-                
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-    
-            total_loss += loss.item()
-            
-            # Log to TensorBoard
-            if self.logging:
-                if batch_idx % 10 == 0:
-                    step = epoch * len(dataloder) + batch_idx
-                    self.writer.add_scalar('Loss/Total', loss.item(), step)
-                    self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], step)
-                    if self.loss_function == "Dirichlet": 
-                        self.writer.add_scalar('Loss/NLL', loss_nll.item(), step)
-                        self.writer.add_scalar('Loss/BetaMoment', loss_betaMoment.item(), step)
-                        self.writer.add_scalar('Unc/Total_norm', np.array(pred_entropy_norm_list).mean(), step)
-                    #self.writer.add_scalar('Semantic_Loss', loss_semantic.item(), step)
-                    #self.writer.add_scalar('Dice_Loss', loss_dice.item(), step)
+        avg = total_loss / max(1, len(loader))
+        print(f"[train] epoch {epoch+1}  loss={avg:.4f}")
+        if self.logging and self.writer:
+            self.writer.add_scalar("train/loss/epoch", avg, epoch)
+            if self.loss_name=="Dirichlet":
+                self.writer.add_scalar('train/unc_tot/epoch', get_predictive_entropy_norm.mean(reset=True), global_step)
 
-        # ~ END of epoch 
-        # Print average loss for the epoch
-        avg_loss = total_loss / len(dataloder)
-        print(f"Train Epoch {epoch + 1}/{self.num_epochs}, Average Loss: {avg_loss}")
-        
-        # final epoch‐wide bnier score decomposed averages
-        # total = bs_metrics['n_events']
-        # overall = { k: bs_metrics[f"{k}_sum"]/total
-        #             for k in ['bs','rel','res','unc'] }
-
-        # Log to TensorBoard
-        if self.logging:
-            self.writer.add_scalar('Loss/Epoch', avg_loss, epoch)
-        
-
-    def test_one_epoch(self, dataloder, epoch):
-        inference_times = []
+    # ------------------------------
+    # evaluation
+    # ------------------------------
+    @torch.no_grad()
+    def test_one_epoch(self, loader, epoch: int):
         self.model.eval()
         self.evaluator.reset()
-        
-        # METRICS inits when dirichlet is used
-        if self.logging and self.loss_function == "Dirichlet":
-            n_bins=10
-            thresholds = np.linspace(0.0, 1.0, n_bins, endpoint=False)
-        
-            # MC confidence reliability statistics
-            if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
-                mcConfReliability_global_hits  = np.zeros(n_bins)
-                mcConfReliability_global_tot   = np.zeros(n_bins)
-            # IOU Error-Mask vs Entropy with tresholding entropy inits
-            if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
-                all_ious_errorAndEntropy = []
-            # entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
-            if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
-                entropyErrorReliability_global_error  = np.zeros(n_bins)
-                entropyErrorReliability_global_tot   = np.zeros(n_bins)
-        
-        for batch_idx, (range_img, reflectivity, xyz, normals, semantic) in enumerate(tqdm.tqdm(dataloder, desc=f"Testing - Epoch {epoch + 1}/{self.num_epochs}")):
-            range_img, reflectivity, xyz, normals, semantic = range_img.to(self.device), reflectivity.to(self.device), xyz.to(self.device), normals.to(self.device), semantic.to(self.device)
-            start_time = time.time()
 
-            # run forward path
-            start_time = time.time()
-            self.start.record()
-            
-            # model expects input channels (min. range image) and meta channels (min. xyz image)
-            if self.use_reflectivity:
-                input_img = torch.cat([range_img, reflectivity],axis=1)
+        # toggles
+        use_dropout = bool(self.cfg["model_settings"].get("use_dropout", 0))
+        want_dirichlet_metrics = (self.loss_name == "Dirichlet")
+
+        # optional uncertainty plots config
+        metrics_cfg = self.cfg.get("logging_settings", {}).get("metrics", {})
+        do_mc_conf_acc = bool(metrics_cfg.get("McConfEmpAcc", 0))
+        do_entropy_iou = bool(metrics_cfg.get("IouPlt", 0))
+        do_entropy_rel = bool(metrics_cfg.get("EntErrRel", 0))
+
+        if (do_mc_conf_acc or do_entropy_iou or do_entropy_rel) and not want_dirichlet_metrics and not use_dropout:
+            # nothing to compute; silently skip
+            do_mc_conf_acc = do_entropy_iou = do_entropy_rel = False
+
+        # prepare aggregators
+        n_bins = 10
+        thresholds = np.linspace(0.0, 1.0, n_bins, endpoint=False)
+
+        if do_mc_conf_acc:
+            mc_hits = np.zeros(n_bins, dtype=np.float64)
+            mc_tot = np.zeros(n_bins, dtype=np.float64)
+
+        if do_entropy_iou:
+            all_ious = []
+
+        if do_entropy_rel:
+            ent_err_tot = np.zeros(n_bins, dtype=np.float64)
+            ent_err_err = np.zeros(n_bins, dtype=np.float64)
+
+        for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
+            tqdm.tqdm(loader, desc=f"eval {epoch+1}")
+        ):
+            range_img = range_img.to(self.device)
+            reflectivity = reflectivity.to(self.device)
+            xyz = xyz.to(self.device)
+            normals = normals.to(self.device)
+            labels = labels.to(self.device)
+
+            if labels.ndim == 4:
+                labels = labels.squeeze(1).long()
             else:
-                input_img = range_img
-            if self.use_normals:
-                outputs_semantic = self.model(input_img, torch.cat([xyz, normals],axis=1))
+                labels = labels.long()
+
+            inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
+
+            # ---- forward (+ TS) ----
+            if hasattr(self.model, "forward_logits"):
+                logits = self.model.forward_logits(*inputs)
+                T = max(1e-3, float(self.T_value)) if self.T_value is not None else 1.0
+                probs = torch.softmax(logits / T, dim=1)
             else:
-                outputs_semantic = self.model(input_img, xyz)
-            
-            self.end.record()
-            curr_time = (time.time()-start_time)*1000
-            
-            # Waits for everything to finish running
-            torch.cuda.synchronize()
+                # model returns probabilities directly
+                probs = self.model(*inputs)
+                # optional TS approx: map probs -> logits -> apply T -> softmax
+                if self.T_value is not None:
+                    p = probs.clamp_min(1e-12)
+                    logits = torch.log(p) / max(1e-3, float(self.T_value))
+                    probs = torch.softmax(logits, dim=1)
 
-            # log inference times
-            inference_times.append(self.start.elapsed_time(self.end))
-            
-            # detach model output tensor from auto-gradient graph
-            outputs_semantic = outputs_semantic.detach()
-            # get the most likely class
-            outputs_semantic_argmax = torch.argmax(outputs_semantic,dim=1)
-            
-            # get alpha concentration parameters form model output logits
-            alpha = to_alpha_concentrations(outputs_semantic)
-            
-            # aggregation for reliability/sharpness plot
-            if self.logging and self.loss_function == "Dirichlet":
-                if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
-                    hits, tot = compute_mc_reliability_bins(alpha, semantic, n_bins, n_samples=120)
-                    mcConfReliability_global_hits += hits
-                    mcConfReliability_global_tot  += tot
+            preds = probs.argmax(dim=1)  # [B,H,W]
+            self.evaluator.update(preds, labels)
 
-                # IOU between error mask and predictive entropy
-                    # get predictive entropy/total uncertainty
-                pred_entropy = get_predictive_entropy(alpha)
-                    # normalization: maximum uncertainty with "flattest" Dirichlet, which is at α_j=1 ∀j:
-                        # H = -∑_j (α_j / α₀) * ln(α_j / α₀)
-                        # at α_j=1 ∀j -> H_max = -∑_j (1/K) * ln(1/K) = ln(K)
-                pred_entropy_norm = pred_entropy/np.log(self.num_classes)
-                
-                # error mask
-                error_mask = torch.where(outputs_semantic_argmax != semantic.squeeze(1), 1, 0)
-                
-                if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
-                    ious = compute_entropy_error_iou(pred_entropy_norm, error_mask, thresholds=thresholds)
-                    all_ious_errorAndEntropy.append(ious.cpu().numpy())
-                
-                if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
-                    tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, error_mask)
-                    entropyErrorReliability_global_error += err
-                    entropyErrorReliability_global_tot  += tot
-            # empirical_acc, tot_counts = sample_accuracy_check(alpha, semantic, n_samples=120, n_bins=10)
-            # total_emp_freq.append(empirical_acc)
-            # total_bin_counts.append(tot_counts)
-            
-            # emp_freq = sample_accuracy_check(alpha, semantic, n_samples=120, n_bins=n_bins)
-            # total_emp_freq.append(emp_freq)
-            #outputs_semantic_argmax = torch.argmax(outputs_semantic,dim=1)
+            # ---- optional uncertainty metrics ----
+            if want_dirichlet_metrics:
+                # Need logits to form alpha; if not available, skip gracefully
+                if hasattr(self.model, "forward_logits"):
+                    # reuse logits computed above if present, else rebuild
+                    if 'logits' not in locals():
+                        logits = self.model.forward_logits(*inputs)
+                    alpha = to_alpha_concentrations(logits)  # [B,C,H,W]
+                    pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
+                    pred_entropy_norm = pred_entropy / math.log(self.num_classes)
 
-            # get the most likely class
-            #semseg_img = torch.argmax(outputs_semantic,dim=1)
+                    if do_mc_conf_acc:
+                        hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
+                        mc_hits += hits
+                        mc_tot += tot
 
-            self.evaluator.update(outputs_semantic_argmax, semantic)
-            # END OF EPOCH
-        
-        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
-        print(f"Test Epoch {epoch + 1}/{self.num_epochs}, mIoU: {mIoU}")
-        
-        # METRICS
-        if self.logging and self.loss_function == "Dirichlet":
-            # MC Mean Confidence vs. Empirical Most-Likely Accuracy Reliability Plot
-            if self.cfg["logging_settings"]["metrics"].get("McConfEmpAcc", 0):
-                empirical_acc_mcAcc = np.divide(
-                    mcConfReliability_global_hits,
-                    mcConfReliability_global_tot,
-                    out=np.zeros_like(mcConfReliability_global_hits),
-                    where=mcConfReliability_global_tot>0
-                )
-                bin_edges   = np.linspace(0.0, 1.0, n_bins+1)
-                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-                
-                out_path = os.path.join(self.save_path, "eval", f"reliability_plot_epoch_{str(epoch).zfill(6)}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    if do_entropy_iou:
+                        err_mask = (preds != labels).to(torch.int32)
+                        ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
+                        all_ious.append(ious.cpu().numpy())
+
+                    if do_entropy_rel:
+                        err_mask = (preds != labels).to(torch.int32)
+                        tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
+                        ent_err_tot += tot
+                        ent_err_err += err
+
+            elif use_dropout:
+                # MC-dropout with TS (if available)
+                T = self.T_value
+                mc_probs = mc_dropout_probs(self.model, inputs, T=30, temperature=T)
+                probs_mc = mc_probs.mean(dim=0)  # [B,C,H,W]
+                preds_mc = probs_mc.argmax(dim=1)
+                self.evaluator.update(preds_mc, labels)  # keep evaluator consistent with MC decision
+
+                if (do_entropy_iou or do_entropy_rel) and self.logging:
+                    ent_mc = predictive_entropy_mc(mc_probs, normalize=True)  # [B,H,W]
+                    err_mask = (preds_mc != labels).to(torch.int32)
+
+                    if do_entropy_iou:
+                        ious = compute_entropy_error_iou(ent_mc, err_mask, thresholds=thresholds)
+                        all_ious.append(ious.cpu().numpy())
+
+                    if do_entropy_rel:
+                        tot, err, err_rate, ece = compute_entropy_reliability(ent_mc, err_mask, n_bins=n_bins)
+                        ent_err_tot += tot
+                        ent_err_err += err
+
+        mIoU, per_class = self.evaluator.compute_final_metrics(class_names=self.class_names)
+        print(f"[eval] epoch {epoch+1}  mIoU={mIoU:.4f}")
+
+        # --- plots / logs ---
+        if self.logging and self.save_path:
+            out_dir = os.path.join(self.save_path, "eval")
+            os.makedirs(out_dir, exist_ok=True)
+
+            if do_mc_conf_acc and mc_tot.sum() > 0:
+                emp_acc = np.divide(mc_hits, mc_tot, out=np.zeros_like(mc_hits), where=mc_tot > 0)
+                edges = np.linspace(0.0, 1.0, n_bins + 1)
+                centers = 0.5 * (edges[:-1] + edges[1:])
                 save_reliability_diagram(
-                        empirical_acc_mcAcc, 
-                        bin_centers, 
-                        mcConfReliability_global_tot,
-                        output_path=out_path,
-                        title='Reliability diagram\n(dot area ∝ #pixels per confidence bin - Sharpness)',
-                        xlabel='Predicted confidence (MC estimate)',
-                        ylabel='Empirical accuracy'
-                        )
-            
-            # entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
-            if self.cfg["logging_settings"]["metrics"].get("EntErrRel", 0):
-                empirical_acc_entropyError = np.divide(
-                    entropyErrorReliability_global_error,
-                    entropyErrorReliability_global_tot,
-                    out=np.zeros_like(entropyErrorReliability_global_error),
-                    where=entropyErrorReliability_global_tot>0
-                )
-                out_path = os.path.join(self.save_path, "eval", f"entropy_error_reliability_epoch_{str(epoch).zfill(6)}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                save_reliability_diagram(
-                    empirical_acc = empirical_acc_entropyError,     # now “observed error rate” per bin
-                    bin_centers   = bin_centers,      # the same 0.05, 0.15, … midpoints
-                    tot_counts    = entropyErrorReliability_global_tot,       # pixel counts per entropy‐bin
-                    output_path   = out_path,
-                    title='Reliability of Entropy as Error Predictor\n(dot area ∝ #pixels per Entropy bin - Sharpness)',
-                    xlabel='Normalized Entropy',
-                    ylabel='Observed Error Rate'
+                    empirical_acc=emp_acc,
+                    bin_centers=centers,
+                    tot_counts=mc_tot,
+                    output_path=os.path.join(out_dir, f"reliability_epoch_{epoch:06d}.png"),
+                    title='Reliability diagram\n(dot area ∝ #pixels per bin — sharpness)',
+                    xlabel='Predicted confidence (MC estimate)',
+                    ylabel='Empirical accuracy',
                 )
 
-            # IOU between error mask and predictive entropy
-            if self.cfg["logging_settings"]["metrics"].get("IouPlt", 0):
-                all_ious = np.stack(all_ious_errorAndEntropy, axis=0)              # [num_batches, T]
-                mean_ious = all_ious.mean(axis=0)                  # [T]
-                out_path = os.path.join(self.save_path, "eval", f"mean_iou_curve_epoch_{str(epoch).zfill(6)}.png")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            if do_entropy_iou and len(all_ious) > 0:
+                all_ious_np = np.stack(all_ious, axis=0)
+                mean_ious = all_ious_np.mean(axis=0)
                 plot_mIOU_errorEntropy(
-                    mean_ious, 
-                    thresholds, 
-                    output_path=out_path)
-            
-        #save_path = os.path.join(self.save_path, "eval", f"reliability_plot_epoch_{str(epoch).zfill(6)}.png")
-        #os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        #save_empirical_reliability_plot(total_emp_freq_np, bin_centers, total_bin_counts_np)
-            #save_empirical_reliability_plot(total_emp_freq_np, bin_centers, save_path)
+                    mean_ious,
+                    thresholds,
+                    output_path=os.path.join(out_dir, f"entropy_iou_epoch_{epoch:06d}.png"),
+                )
 
+            if do_entropy_rel and ent_err_tot.sum() > 0:
+                edges = np.linspace(0.0, 1.0, n_bins + 1)
+                centers = 0.5 * (edges[:-1] + edges[1:])
+                emp_err_rate = np.divide(ent_err_err, ent_err_tot, out=np.zeros_like(ent_err_err), where=ent_err_tot > 0)
+                save_reliability_diagram(
+                    empirical_acc=emp_err_rate,
+                    bin_centers=centers,
+                    tot_counts=ent_err_tot,
+                    output_path=os.path.join(out_dir, f"entropy_error_rel_epoch_{epoch:06d}.png"),
+                    title='Reliability of Entropy as Error Predictor\n(dot area ∝ #pixels per entropy bin — sharpness)',
+                    xlabel='Normalized entropy',
+                    ylabel='Observed error rate',
+                )
 
-        # Log to TensorBoard
-        if self.logging:
-            for cls in range(self.num_classes):
-                self.writer.add_scalar('IoU_{}'.format(self.class_names[cls]), result_dict[self.class_names[cls]]*100, epoch)
-            
-            self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
-            self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
-        
         return mIoU
-    
-    def __call__(self, dataloder_train, dataloder_test): #, num_epochs=50, test_every_nth_epoch=1, save_every_nth_epoch=-1):
-        self.num_epochs = self.cfg["train_params"]["num_epochs"]
-        self.test_every_nth_epoch = self.cfg["logging_settings"]["test_every_nth_epoch"]
-        self.save_every_nth_epoch = self.cfg["logging_settings"]["save_every_nth_epoch"]
+
+    # ------------------------------
+    # main loop
+    # ------------------------------
+    def __call__(self, train_loader, val_loader):
+        self.num_epochs = int(self.cfg["train_params"]["num_epochs"])
+        test_every = int(self.cfg["logging_settings"]["test_every_nth_epoch"])
+
+        # TS config (post-hoc, optional)
+        cal_cfg = self.cfg.get("calibration", {})
+        ts_enable = bool(cal_cfg.get("enable", False))
+        ts_run_each_eval = bool(cal_cfg.get("run_each_eval", False))
+        ts_cache_mode = cal_cfg.get("cache_mode", "default")  # "default" or "mc"
+        ts_optimizer = cal_cfg.get("optimizer", "lbfgs")      # "lbfgs" or "adam"
+        ts_lr = float(cal_cfg.get("lr", 0.05))
+        ts_epochs = int(cal_cfg.get("epochs", 2))
+        ts_chunk = int(cal_cfg.get("chunk_size", 1_000_000))
+        ts_max_iter = int(cal_cfg.get("max_iter", 100))
+        ts_save_json = cal_cfg.get("save_path", None)
+
+        best_mIoU = -1.0
+
         for epoch in range(self.num_epochs):
-            # train one epoch
-            self.train_one_epoch(dataloder_train, epoch)
-            # Update learning rate scheduler when ReduceLROnPlateau is NOT used
-            if (not isinstance(self.scheduler, type(None))) and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            # ----- train -----
+            if self.visualize: open_window()
+            self.train_one_epoch(train_loader, epoch)
+            if self.visualize: close_window()
+            
+            # step schedulers (if not ReduceLROnPlateau)
+            if self.scheduler and not isinstance(
+                self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+            ):
                 self.scheduler.step()
-            # test, also after 1 epoch for early impressions
-            if epoch % self.test_every_nth_epoch == 0:    # if epoch > 0 and epoch % self.test_every_nth_epoch == 0:
-                mIoU = self.test_one_epoch(dataloder_test, epoch)
-                # update scheduler based on rmse, and is ReduceLROnPlateau
-                if (not isinstance(self.scheduler, type(None))) and isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+
+            # ----- periodic eval -----
+            if epoch % max(1, test_every) == 0:
+                mIoU = self.test_one_epoch(val_loader, epoch)
+
+                # optional: update ReduceLROnPlateau with metric
+                if self.scheduler and isinstance(
+                    self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+                ):
                     self.scheduler.step(mIoU)
-            # save
-            if self.logging:
-                if self.save_every_nth_epoch >= 1 and epoch % self.save_every_nth_epoch==0:
-                    torch.save(self.model.state_dict(), os.path.join(self.save_path, f"model_{str(epoch).zfill(6)}.pt"))
-        
-        # run final test
-        self.test_one_epoch(dataloder_test, epoch)
-        # save last epoch
-        if self.logging:
+
+                # save best checkpoint (optional)
+                if self.logging and self.save_path and mIoU > best_mIoU:
+                    best_mIoU = mIoU
+                    ckpt_path = os.path.join(self.save_path, f"best_epoch_{epoch:06d}.pt")
+                    torch.save(self.model.state_dict(), ckpt_path)
+
+                # ----- optional post-hoc Temperature Scaling -----
+                if ts_enable and (self.T_value is None or ts_run_each_eval):
+                    logits_cpu, labels_cpu = cache_calib_logits(
+                        model=self.model,
+                        val_loader=val_loader,
+                        device=self.device,
+                        cfg=self.cfg,
+                        ignore_index=255,
+                        mode=ts_cache_mode,
+                        mc_samples=int(cal_cfg.get("mc_samples", 30)),
+                    )
+                    self.T_value = calibrate_temperature_from_cache(
+                        logits_cpu=logits_cpu,
+                        labels_cpu=labels_cpu,
+                        device=self.device,
+                        init_T="auto",
+                        optimizer_type=ts_optimizer,
+                        lr=ts_lr,
+                        epochs=ts_epochs,
+                        chunk_size=ts_chunk,
+                        max_iter_lbfgs=ts_max_iter,
+                        prev_T=self.T_value,
+                        save_path=ts_save_json,
+                    )
+                    print(f"[TS] calibrated T = {self.T_value:.4f}")
+
+                    # (optional) re-test with calibrated T for plots
+                    self.test_one_epoch(val_loader, epoch)
+
+        # final test
+        self.test_one_epoch(val_loader, self.num_epochs - 1)
+
+        # final save
+        if self.logging and self.save_path:
             torch.save(self.model.state_dict(), os.path.join(self.save_path, "model_final.pt"))
-            
-            
-
-# reliability calibration
-# if batch_idx % 10 == 0:
-#     n_samples = 64
-#     use_exp = False
-#     with_binning = True
-    
-#     plot_reliability_and_sharpness(alpha, semantic, n_samples)
-    
-#     decomp, factor = brier_mc_decomp(alpha, semantic, use_exp=use_exp, n_samples=n_samples, with_binning=with_binning)
-#     bs_metrics['bs_sum']   += decomp['brier']       * factor
-#     bs_metrics['rel_sum']  += decomp['reliability'] * factor
-#     bs_metrics['res_sum']  += decomp['resolution']  * factor
-#     bs_metrics['unc_sum']  += decomp['uncertainty'] * factor
-#     bs_metrics['n_events'] += factor
-        
-    
-#     #emp_freq, bin_centers = sample_accuracy_check(alpha, semantic, n_samples=150)
-#     confs, accs, ece = compute_ece_and_reliability(alpha, semantic, n_bins=10)
-#     confs_list.append(confs)
-#     accs_list.append(accs)
-#     ece_list.append(ece)
-    #coverages = np.arange(0, 11, dtype=float) * 0.1
-    #reliability_dict = reliability_dirichlet(alpha, semantic, coverages=coverages, n_samples=64, device="cuda")
-
-# reliability plot
-# if self.visualize and batch_idx % 10 == 0:
-#     # Plotting the reliability diagram
-#     with np.errstate(invalid='ignore'):
-#         confs_avg = np.nanmean(np.array(confs_list), axis=0)
-#         accs_avg = np.nanmean(np.array(accs_list), axis=0)
-#         ece_avg = np.nanmean(np.array(ece_list), axis=0)
-#     self.reliability_plot.set_data(confs_avg, accs_avg)
-#     #self.confs.set_data(bin_centers, emp_freq)
-#     # Update the ECE text:
-#     self.ece_text.set_text(f'ECE = {ece_avg:.4f}')
-#     self.fig.canvas.draw()
-#     self.fig.canvas.flush_events()
-
