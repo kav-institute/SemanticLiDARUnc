@@ -2,7 +2,6 @@ import glob
 import argparse
 import torch
 from torch.utils.data import DataLoader
-from dataset.dataloader_semantic_KITTI import SemanticKitti
 #from models.semanticFCN import SemanticNetworkWithFPN
 import torch.optim as optim
 
@@ -10,6 +9,7 @@ import os
 import sys
 
 from dataset.definitions import color_map, class_names
+from utils.weights import load_pretrained_safely
 
 from models.tester import Tester
 from models.trainer import Trainer
@@ -52,22 +52,41 @@ def main(args):
     # add additional configurations to config file
     cfg["extras"] = dict()
     cfg["extras"]["use_reflectivity"] = True
-    cfg["extras"]["num_classes"] = 20
+    cfg["extras"]["num_classes"] = 21 if cfg['dataset_name']=="SemanticSTF" and not cfg.get('remap_adverse_label', 0)  else 20
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
-    cfg["extras"]["loss_function"] = "Dirichlet"    # Tversky | Dirichlet
+    cfg["extras"]["loss_function"] = "Tversky"    # Tversky | Dirichlet
     # choose model architecture, type str
     baseline = cfg["model_settings"].get("baseline", "Reichert")
     cfg["model_settings"]["baseline"] = baseline    # ensure that the basline parameter is set if not pre-initialized in config
     #num_folder = count_folders(cfg["dataset_dir"])
 
-    data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
-    data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/08/velodyne/*.bin")]  # use sequence 8 as validation set
-
-    depth_dataset_train = SemanticKitti(data_path_train, rotate=cfg["model_settings"]["rotate"], flip=cfg["model_settings"]["flip"], projection=(64,512),resize=False)
+    match cfg['dataset_name']:
+        case "SemanticSTF":
+            data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/train/velodyne/*.bin")]
+            data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/val/velodyne/*.bin")]
+        case _: 
+            try:
+                data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+                data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/08/velodyne/*.bin")]  # use sequence 8 as validation set
+            except Exception as ex:
+                print(ex)
+    # Dataloader import for datasets derived from SemanticKitti
+    match cfg['dataset_name']:
+        case "SemanticKitti": from dataset.dataloader_semantic_KITTI import SemanticKitti as SemanticDataset
+        case "SemanticSTF": from dataset.dataloader_semantic_STF import SemanticSTF as SemanticDataset
+        case "SemanticTHAB": from dataset.dataloader_semantic_THAB import SemanticTHAB as SemanticDataset
+        case _: raise KeyError("in yaml config parameter dataset_name is invalid")
+    
+    depth_dataset_train = SemanticDataset(data_path_train, rotate=cfg["model_settings"]["rotate"], flip=cfg["model_settings"]["flip"], projection=(64,512),resize=False)
+    # Adjustment for SemanticSTF dataset: 
+        # SemanticKitti has a default of 20 classes, SemanticSTF adds one adverse weather/corruption class labeled as "20: 'invalid'"
+        # Choose in SemanticSTF config yaml whether to train on 21 classes or remap the adverse weather class to "0: 'unlabeled'"
+    if cfg['dataset_name']=="SemanticSTF" and cfg.get('remap_adverse_label', 0): depth_dataset_train.remap_adverse_label = True
+    
     dataloader_train = DataLoader(depth_dataset_train, batch_size=cfg["train_params"]["batch_size"], shuffle=True, num_workers=cfg["train_params"]["num_workers"])
     
-    depth_dataset_test = SemanticKitti(data_path_test[:1000], rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection
+    depth_dataset_test = SemanticDataset(data_path_test[:100], rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection, currently reduced
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=cfg["train_params"]["num_workers"])
     
     # defines model architecture and input dimensions
@@ -114,15 +133,17 @@ def main(args):
     print("num_params", num_params)
     cfg["extras"]["num_params"] = num_params
     
-    try:
-        if os.path.isfile(cfg["model_settings"]["pretrained"]):
-            try:
-                model.load_state_dict(torch.load(cfg["model_settings"]["pretrained"]))
-            except:
-                print("WARNING: No pretrained model found")
-    except TypeError as te:
-        print("No pretrained weights found! Training from scratch...")
-        time.sleep(3)
+    rep = load_pretrained_safely(
+        model,
+        cfg['model_settings']['pretrained'],
+        device="cuda",
+        ignore_keys_with=("logits.",),     # skip classification head (mismatch 20 vs 21)
+        copy_head_overlap=False,           # set True if you want partial row copy for heads
+        verbose=True,
+    )
+    if not rep.get("ok"):
+        print("No pretrained weights found or applied. Training from scratch...")
+        time.sleep(1)
     
     # Define optimizer
     optimizer = optim.AdamW(
@@ -158,9 +179,9 @@ def main(args):
     if args.with_logging:
         # Save Path
         if cfg["logging_settings"]["test_id"] != -1:
-            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/test_split_{str(cfg['logging_settings']['test_id']).zfill(4)}"
+            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_{str(cfg['logging_settings']['test_id']).zfill(4)}"
         else:
-            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/test_split_final"
+            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_final"
         
         save_path_p2 ='{}_{}{}{}{}{}'.format(cfg["model_settings"]["model_type"], "a" if cfg["model_settings"]["attention"] else "", "n" if cfg["model_settings"]["normals"] else "", "m" if cfg["model_settings"]["multi_scale_meta"] else "", "p" if cfg["model_settings"]["pretrained"] else "", cfg["extras"]["loss_function"])
         save_path = os.path.join(save_path_p1,save_path_p2)
@@ -204,7 +225,7 @@ def main(args):
             dataloader_test=dataloader_test,
             calib_loader=dataloader_test,   # or a dedicated calib loader
             do_calibration=do_calib,
-            ts_mode="default",              # or "mc" (averages logits with dropout)
+            ts_mode="mc" if cfg['model_settings']['use_dropout'] else "default",              # or "mc" (averages logits with dropout)
             mc_samples=30
         )
     
@@ -226,7 +247,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg_path', 
                         #action='store_true',
                         type=str, 
-                        default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
+                        default="/home/devuser/workspace/src/configs/SemanticSTF_default.yaml",
                         help='Path to the config file used for training')
     parser.add_argument('--mode', 
                         #action='store_true',
