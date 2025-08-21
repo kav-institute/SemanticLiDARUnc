@@ -1,6 +1,7 @@
 # path to SemanticTHAB dataset (sequences), no tailing path seperator!
-dataset_dir: "/home/devuser/workspace/data/SemanticKitti/dataset/sequences"
-dataset_name: "SemanticKitti"
+dataset_dir: "/home/devuser/workspace/data/SemanticSTF"
+dataset_name: "SemanticSTF"
+remap_adverse_label: True
 
 model_settings: {
   # Defines model backbone architecture
@@ -63,7 +64,8 @@ logging_settings: {
   ## Sets interval to save model weights every nth epoch. -1 for saving only last epoch
     save_every_nth_epoch: 2,
   ## path to log directory
-    log_dir: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti",
+    log_dir: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticSTF",
+  ## toggle metrics
     metrics: {
       McConfEmpAcc: false, # bool, MC Mean Confidence vs. Empirical Most-Likely Accuracy Reliability Plot
       EntErrRel: false, # bool, entropy error reliability diagram, plots at which entropy levels the model's uncertainty matches its true error frequency
