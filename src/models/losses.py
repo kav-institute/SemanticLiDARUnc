@@ -347,39 +347,129 @@ class DirichletCalibrationLoss(nn.Module):
         return loss
 
 
+### >>> Output-kind classifier (logits / probs / log_probs) <<< ###
+@torch.no_grad()
+def classify_output_kind(outputs: torch.Tensor, class_dim: int = 1, sample_fraction: float = 0.1):
+    """
+    Heuristic:
+      - probs:   values in [0,1] and sum over class_dim ≈ 1 per pixel
+      - log_probs: values <= 0 typically, and exp(outputs) behaves like probs
+      - else: logits
+    """
+    x = outputs
+
+    # ---- optional subsample over spatial positions ----
+    if sample_fraction and sample_fraction < 1.0 and x.ndim > 2:
+        # Move class dim to 1 so x is [B, C, ...spatial...]
+        x_perm = x.movedim(class_dim, 1).contiguous()  # [B, C, spatial...]
+        # Flatten spatial dims to S
+        x_flat = x_perm.flatten(start_dim=2)           # [B, C, S]
+
+        S = x_flat.size(-1)
+        k = max(1, int(S * sample_fraction))
+        idx = torch.randperm(S, device=x.device)[:k]   # indices in [0, S)
+
+        x = x_flat[..., idx]                           # [B, C, k]
+    else:
+        # Ensure class dim is at 1 for the checks below
+        x = x.movedim(class_dim, 1).contiguous()
+
+    # ---- decide kind: probs / log_probs / logits ----
+    # Probabilities? values in [0,1] and sums ≈ 1 per pixel
+    in_range = (x.min() >= -1e-6) and (x.max() <= 1 + 1e-6)
+    sums = x.sum(dim=1)  # [B, S or spatial product]
+    if in_range and torch.allclose(sums, torch.ones_like(sums), atol=1e-3, rtol=1e-3):
+        return 'probs'
+
+    # Log-probs? typically <= 0; exp() behaves like probs
+    if x.max() <= 1e-6:
+        ex = x.exp()
+        ex_sums = ex.sum(dim=1)
+        if torch.allclose(ex_sums, torch.ones_like(ex_sums), atol=1e-3, rtol=1e-3):
+            return 'log_probs'
+
+    return 'logits'
+
+
 class SemanticSegmentationLoss(nn.Module):
-    def __init__(self):
-        super(SemanticSegmentationLoss, self).__init__()
+    def __init__(self, ignore_index=255):
+        super().__init__()
+        self.ignore_index = ignore_index
 
-        # Assuming three classes
-        self.criterion = nn.CrossEntropyLoss()
+    def forward(self, outputs, labels, num_classes=20, model_act='logits'):
+        labels = labels.long()
+        C = outputs.shape[1]
 
-    def forward(self, predicted_logits, target, num_classes=20):
-        # Flatten the predictions and the target
-        predicted_logits_flat = predicted_logits.permute(0, 2, 3, 1).contiguous().view(-1, num_classes)
-        target_flat = target.view(-1)
+        # remap invalid labels to ignore_index
+        invalid = (labels < 0) | (labels >= C)
+        if invalid.any():
+            labels = torch.where(invalid, torch.full_like(labels, self.ignore_index), labels)
 
-        # Calculate the Cross-Entropy Loss
-        loss = self.criterion(predicted_logits_flat, target_flat)
+        # CrossEntropyLoss expects logits (no softmax). It internally does LogSoftmax+NLLLoss
+        if model_act == 'logits':
+            return nn.CrossEntropyLoss(ignore_index=self.ignore_index)(outputs, labels)
+        elif model_act == 'probs':
+            # CE expects logits; switch to NLL over log-probs instead
+            return nn.NLLLoss(ignore_index=self.ignore_index)(torch.log(outputs.clamp_min(1e-8)), labels)
+        elif model_act == 'log_probs':
+            return nn.NLLLoss(ignore_index=self.ignore_index)(outputs, labels)
+        else:
+            raise ValueError(f"Unknown model_act: {model_act}")
 
-        return loss
 
 class TverskyLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(TverskyLoss, self).__init__()
+    def __init__(self, alpha=0.9, beta=0.1, smooth=1.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.reduction = reduction
 
-    def forward(self, inputs, targets, smooth=1, alpha=0.9, beta=0.1, num_classes=20):
-        targets = torch.nn.functional.one_hot(targets, num_classes=num_classes).transpose(1, 4).squeeze(-1)   
-        inputs = F.softmax(inputs, dim=1)
-        
-        #True Positives, False Positives & False Negatives
-        TP = (inputs * targets).sum()    
-        FP = ((1-targets) * inputs).sum()
-        FN = (targets * (1-inputs)).sum()
-       
-        Tversky = (TP + smooth) / (TP + alpha*FP + beta*FN + smooth)  
-        
-        return 1 - Tversky
+    def forward(self, outputs, labels, num_classes=20, model_act='logits'):
+        # outputs -> probs
+        if model_act == 'logits':
+            probs = F.softmax(outputs, dim=1)
+        elif model_act == 'probs':
+            probs = outputs
+        elif model_act == 'log_probs':
+            probs = outputs.exp()
+        else:
+            raise ValueError(f"Unknown model_act: {model_act}")
+
+        labels = labels.long()
+
+        # build mask for valid pixels
+        valid = (labels >= 0) & (labels < num_classes)
+        if self.ignore_index is not None:
+            valid = valid & (labels != self.ignore_index)
+
+        if not valid.any():
+            # no valid pixels; return zero loss to avoid NaNs
+            return probs.new_tensor(0.0, requires_grad=True)
+
+        # set ignored positions to class 0 (temporary), then mask later
+        safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
+        one_hot = F.one_hot(safe_labels, num_classes=num_classes).permute(0,3,1,2).float()
+
+        # mask out invalid pixels by zeroing both probs and one_hot there
+        valid_mask = valid.unsqueeze(1).float()  # [B,1,H,W]
+        probs = probs * valid_mask
+        one_hot = one_hot * valid_mask
+
+        dims = (0, 2, 3)
+        TP = (probs * one_hot).sum(dims)
+        FP = ((1 - one_hot) * probs).sum(dims)
+        FN = (one_hot * (1 - probs)).sum(dims)
+
+        tversky = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
+        loss = 1 - tversky  # [C]
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 
 def lovasz_grad(gt_sorted):
