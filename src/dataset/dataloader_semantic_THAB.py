@@ -11,7 +11,7 @@ except:
 #     from definitions import id_map, custom_colormap
 
 
-class SemanticKitti(Dataset):
+class SemanticTHAB(Dataset):
     def __init__(self, data_path, rotate=False, flip=False, id_map=id_map):
         self.id_map = id_map
         self.data_path = data_path
