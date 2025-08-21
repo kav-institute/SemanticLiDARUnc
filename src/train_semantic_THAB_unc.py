@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 from dataset.dataloader_semantic_THAB import SemanticKitti
 from models.semanticFCN import SemanticNetworkWithFPN
+#from models.semantic_dirichletFCN import SemanticNetworkWithFPN
 from models.losses import TverskyLoss, SemanticSegmentationLoss
 import torch.optim as optim
 import tqdm
@@ -20,6 +21,48 @@ import sys
 
 from models.tester import Tester
 from models.trainer import Trainer
+
+def load_partial_state_dict(model: torch.nn.Module, checkpoint_path: str, device=None):
+    # 1. Load the checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    pretrained_dict = checkpoint.get('state_dict', checkpoint)
+
+    # 2. Get the model’s current parameters
+    model_dict = model.state_dict()
+
+    # 3. Filter out keys that don’t match in size or name
+    matched_dict = {}
+    missing_keys = []
+    unexpected_keys = []
+
+    for name, param in model_dict.items():
+        if name in pretrained_dict:
+            pretrained_param = pretrained_dict[name]
+            if pretrained_param.size() == param.size():
+                matched_dict[name] = pretrained_param
+            else:
+                # size mismatch → skip (will stay as randomized init)
+                missing_keys.append(name)
+        else:
+            # name not found → skip (random init)
+            missing_keys.append(name)
+
+    # collect any keys in the checkpoint that aren’t used
+    for name in pretrained_dict.keys():
+        if name not in model_dict:
+            unexpected_keys.append(name)
+
+    # 4. Load those matched weights
+    model_dict.update(matched_dict)
+    model.load_state_dict(model_dict)
+
+    # 5. Report
+    print(f"Loaded {len(matched_dict)} keys from checkpoint.")
+    if missing_keys:
+        print(f"Randomly initialized {len(missing_keys)} keys: {missing_keys}")
+    if unexpected_keys:
+        print(f"Ignored {len(unexpected_keys)} unexpected keys: {unexpected_keys}")
+
 
 def count_folders(directory):
     return len([name for name in os.listdir(directory) if os.path.isdir(os.path.join(directory, name))])
@@ -49,23 +92,21 @@ def load_config(path):
 def main(args):
     cfg = load_config(args.cfg_path)
 
-    # add additional configurations to config file
+    # add additional configurations to config file specific for model used
     cfg["extras"] = dict()
-    cfg["extras"]["use_reflectivity"] = True
     cfg["extras"]["num_classes"] = 20
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
-    cfg["extras"]["loss_function"] = "Dirichlet"
-    cfg["extras"]["with_calibration_loss"] = False  # only in combination with Dirichlet loss_function
+    cfg["extras"]["loss_function"] = "Dirichlet"    # Tversky   Dirichlet   Lovasz
     
     num_folder = count_folders(cfg["dataset_dir"])
 
-    if cfg["logging_settings"]["test_id"] == -1:
+    if cfg["train_params"]["test_id"] == -1:
         data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder)]  for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
         data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == 2] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
     else:
-        data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i != cfg["logging_settings"]["test_id"]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
-        data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == cfg["logging_settings"]["test_id"]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+        data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i != cfg["train_params"]["test_id"]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+        data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [str(i).zfill(4) for i in range(num_folder) if i == cfg["train_params"]["test_id"]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
     
     depth_dataset_train = SemanticKitti(data_path_train, rotate=cfg["model_settings"]["rotate"], flip=cfg["model_settings"]["flip"])
     dataloader_train = DataLoader(depth_dataset_train, batch_size=cfg["train_params"]["batch_size"], shuffle=True, num_workers=cfg["train_params"]["num_workers"])
@@ -74,17 +115,21 @@ def main(args):
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=cfg["train_params"]["num_workers"])
     
     # Depth Estimation Network
-    if cfg["extras"]["use_reflectivity"]:
-        input_channels = 2
-    else:
-        input_channels = 1
-        
+    input_channels = 1      # min. range image (=1ch)
+    meta_channel_dim = 3    # min. xyz image (=3ch)
+    if cfg["model_settings"].get("reflectivity", 0):
+        input_channels +=1  # reflectivity adds 1 extra channel to input_channels
+    if cfg["model_settings"].get("normals", 0):
+        meta_channel_dim +=3  # normals adds 3 extra channels to meta_channel_dim
+
     # Semantic Segmentation Network
     if cfg["model_settings"]["normals"]:
-        model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=6, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
+        model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=meta_channel_dim, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
     else:
-        model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=3, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
-
+        model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=meta_channel_dim, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
+    # remove activation function from last layer of decoder
+    # if cfg["extras"]["loss_function"] == "Dirichlet":
+    #     del model.decoder_semantic[-1]
     # count number of model parameters
     num_params = count_parameters(model)
     print("num_params", num_params)
@@ -95,7 +140,13 @@ def main(args):
             try:
                 model.load_state_dict(torch.load(cfg["model_settings"]["pretrained"]))
             except:
-                print("WARNING: No pretrained model found")
+                print("WARNING: Error with loading pretrained model. Trying to load partially...")
+                try: 
+                    load_partial_state_dict(model, cfg["model_settings"]["pretrained"])
+                except:
+                    print("WARNING: Model weights not compatible to your model! Training from scratch...")
+                    time.sleep(3)
+                
     except TypeError as te:
         print("No pretrained weights found! Training from scratch...")
         time.sleep(3)
@@ -110,16 +161,16 @@ def main(args):
     num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 3)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        start_factor=0.1,   # start at 10% of base LR
+        start_factor=0.3,   # start at 10% of base LR, or higher when using small batches (e.g., <16)
         end_factor=1.0,     # ramp to 100% of base LR
         total_iters=num_warmup_epochs
     )
     #Cosine annealing with restarts thereafter
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=10,           # first restart after T_0 epochs, e.g., 15
+        T_0=15,           # first restart after T_0 epochs, e.g., 15
         T_mult=1,         # no increase in cycle length
-        eta_min=1e-6      # floor LR
+        eta_min=1e-5      # floor LR
     )  
     #Chain them: warm-up then cosine restarts
     scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -133,8 +184,8 @@ def main(args):
     
     if args.with_logging:
         # Save Path
-        if cfg["logging_settings"]["test_id"] != -1:
-            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_{str(cfg['logging_settings']['test_id']).zfill(4)}"
+        if cfg["train_params"]["test_id"] != -1:
+            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/test_split_{str(cfg['train_params']['test_id']).zfill(4)}"
         else:
             save_path_p1 ="/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final"
         
@@ -195,7 +246,7 @@ if __name__ == '__main__':
     parser.add_argument('--with_logging', 
                         #action='store_true',
                         type=bool, 
-                        default=True,
+                        default=False,
                         help='Toggle logging (saving weights and tensorboard logs)')
     parser.add_argument('--cfg_path', 
                         #action='store_true',

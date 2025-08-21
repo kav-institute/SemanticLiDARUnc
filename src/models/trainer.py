@@ -200,32 +200,34 @@ class Trainer:
         
         for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
             tqdm.tqdm(loader, desc=f"train {epoch+1}")
-        ):
+        ):            
             range_img = range_img.to(self.device)
             reflectivity = reflectivity.to(self.device)
             xyz = xyz.to(self.device)
             normals = normals.to(self.device)
-            labels = labels.to(self.device)  # [B,1,H,W] or [B,H,W]
-
-            # if labels.ndim == 4:
-            #     labels = labels.squeeze(1).long()
-            # else:
-            #     labels = labels.long()
+            labels = labels.to(self.device) # [B,1,H,W] or [B,H,W]
+            if labels.ndim == 4 and labels.shape[1] == 1:
+                labels = labels.squeeze(1).long()
+            else:
+                labels = labels.long()
 
             inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
-
             self._start.record()
             outputs = self.model(*inputs)  # default: probabilities (for most baselines)
+            # >>> Output-kind classifier (logits / probs / log_probs) <<<
+            if not hasattr(self, "_model_act_kind"):
+                from models.losses import classify_output_kind
+                self._model_act_kind = classify_output_kind(outputs, class_dim=1)
             self._end.record()
             torch.cuda.synchronize()
 
             # ---- compute loss (by selected head) ----
             if self.loss_name == "Tversky":
-                loss_sem = self.criterion_sem(outputs, labels, num_classes=self.num_classes)
-                loss_t = self.criterion_tversky(outputs, labels, num_classes=self.num_classes)
+                loss_sem = self.criterion_sem(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
+                loss_t = self.criterion_tversky(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
                 loss = loss_sem + loss_t
             elif self.loss_name == "CE":
-                loss = self.criterion_sem(outputs, labels, num_classes=self.num_classes)
+                loss = self.criterion_sem(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
             elif self.loss_name == "Lovasz":
                 loss = self.criterion_lovasz(outputs, labels)
             elif self.loss_name == "Dirichlet":
@@ -299,6 +301,19 @@ class Trainer:
     # ------------------------------
     @torch.no_grad()
     def test_one_epoch(self, loader, epoch: int):
+        from models.losses import classify_output_kind  # use your canonical detector
+        import torch.nn.functional as F
+        EPS = 1e-12
+        def _to_logits(out: torch.Tensor, kind: str) -> torch.Tensor:
+            if kind == 'logits':
+                return out
+            elif kind == 'probs':
+                return out.clamp_min(EPS).log()
+            elif kind == 'log_probs':
+                return out
+            else:
+                raise ValueError(f"Unknown output kind: {kind}")
+
         self.model.eval()
         self.evaluator.reset()
 
@@ -306,6 +321,10 @@ class Trainer:
         use_dropout = bool(self.cfg["model_settings"].get("use_dropout", 0))
         want_dirichlet_metrics = (self.loss_name == "Dirichlet")
 
+        ts_cache_mode = "mc" if use_dropout else "default"
+                # MC sample count (re-use calibration setting if present)
+        mc_T = int(self.cfg.get("calibration", {}).get("mc_samples", 30))
+        
         # optional uncertainty plots config
         metrics_cfg = self.cfg.get("logging_settings", {}).get("metrics", {})
         do_mc_conf_acc = bool(metrics_cfg.get("McConfEmpAcc", 0))
@@ -334,83 +353,101 @@ class Trainer:
         for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
             tqdm.tqdm(loader, desc=f"eval {epoch+1}")
         ):
+            # --- inputs/labels prep (unchanged) ---
             range_img = range_img.to(self.device)
             reflectivity = reflectivity.to(self.device)
             xyz = xyz.to(self.device)
             normals = normals.to(self.device)
             labels = labels.to(self.device)
-
-            if labels.ndim == 4:
+            if labels.ndim == 4 and labels.shape[1] == 1:
                 labels = labels.squeeze(1).long()
             else:
                 labels = labels.long()
-
             inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
 
-            # ---- forward (+ TS) ----
-            if hasattr(self.model, "forward_logits"):
-                logits = self.model.forward_logits(*inputs)
-                T = max(1e-3, float(self.T_value)) if self.T_value is not None else 1.0
-                probs = torch.softmax(logits / T, dim=1)
-            else:
-                # model returns probabilities directly
-                probs = self.model(*inputs)
-                # optional TS approx: map probs -> logits -> apply T -> softmax
-                if self.T_value is not None:
-                    p = probs.clamp_min(1e-12)
-                    logits = torch.log(p) / max(1e-3, float(self.T_value))
-                    probs = torch.softmax(logits, dim=1)
+            # ---- If MC-dropout is enabled, do ONLY the MC path (single evaluator update) ----
+            if use_dropout:
+                # (Optional) cache model output kind once for telemetry/consistency
+                if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
+                    peek = self.model(*inputs)
+                    self._model_act_kind = classify_output_kind(peek, class_dim=1)
+                    del peek
 
-            preds = probs.argmax(dim=1)  # [B,H,W]
-            self.evaluator.update(preds, labels)
+                # >>> MC sanity checks after mc_dropout_probs(...) is called
+                    # - global std: mc_probs.std(dim=0).mean().item() ---> >~1e-6 
+                    # - fraction of pixels that changed class: (mc_probs.argmax(dim=2) != mc_probs.argmax(dim=2)[0:1]).any(dim=0).float().mean().item() ---> >0
+                
+                # Decide where to apply T based on how T was calibrated
+                if self.T_value is not None and ts_cache_mode == "default":
+                    # Per-sample scaling: softmax(logits_like/T) then average
+                    T_val = max(1e-3, float(self.T_value))
+                    mc_probs = mc_dropout_probs(self.model, inputs, T=mc_T, temperature=T_val)  # [T,B,C,H,W]
+                    probs = mc_probs.mean(dim=0)  # [B,C,H,W]
+                else:
+                    # No per-sample TS; average first. If T exists & was MC-calibrated, apply post-mean.
+                    mc_probs = mc_dropout_probs(self.model, inputs, T=mc_T, temperature=None)  # [T,B,C,H,W]
+                    mean_p = mc_probs.mean(dim=0).clamp_min(EPS)  # [B,C,H,W]
+                    if self.T_value is not None and ts_cache_mode == "mc":
+                        T_val = max(1e-3, float(self.T_value))
+                        probs = torch.softmax(torch.log(mean_p) / T_val, dim=1)
+                    else:
+                        probs = mean_p
 
-            # ---- optional uncertainty metrics ----
-            if want_dirichlet_metrics:
-                # Need logits to form alpha; if not available, skip gracefully
-                if hasattr(self.model, "forward_logits"):
-                    # reuse logits computed above if present, else rebuild
-                    if 'logits' not in locals():
-                        logits = self.model.forward_logits(*inputs)
-                    alpha = to_alpha_concentrations(logits)  # [B,C,H,W]
-                    pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
-                    pred_entropy_norm = pred_entropy / math.log(self.num_classes)
+                preds = probs.argmax(dim=1)
+                self.evaluator.update(preds, labels)
 
-                    if do_mc_conf_acc:
-                        hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
-                        mc_hits += hits
-                        mc_tot += tot
-
-                    if do_entropy_iou:
-                        err_mask = (preds != labels).to(torch.int32)
-                        ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
-                        all_ious.append(ious.cpu().numpy())
-
-                    if do_entropy_rel:
-                        err_mask = (preds != labels).to(torch.int32)
-                        tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
-                        ent_err_tot += tot
-                        ent_err_err += err
-
-            elif use_dropout:
-                # MC-dropout with TS (if available)
-                T = self.T_value
-                mc_probs = mc_dropout_probs(self.model, inputs, T=30, temperature=T)
-                probs_mc = mc_probs.mean(dim=0)  # [B,C,H,W]
-                preds_mc = probs_mc.argmax(dim=1)
-                self.evaluator.update(preds_mc, labels)  # keep evaluator consistent with MC decision
-
+                # --- optional uncertainty metrics (unchanged logic) ---
                 if (do_entropy_iou or do_entropy_rel) and self.logging:
                     ent_mc = predictive_entropy_mc(mc_probs, normalize=True)  # [B,H,W]
-                    err_mask = (preds_mc != labels).to(torch.int32)
-
+                    err_mask = (preds != labels).to(torch.int32)
                     if do_entropy_iou:
                         ious = compute_entropy_error_iou(ent_mc, err_mask, thresholds=thresholds)
                         all_ious.append(ious.cpu().numpy())
-
                     if do_entropy_rel:
                         tot, err, err_rate, ece = compute_entropy_reliability(ent_mc, err_mask, n_bins=n_bins)
                         ent_err_tot += tot
                         ent_err_err += err
+
+                continue  # done with MC batch
+
+            # ---- Non-MC path: your code (kept) ----
+            out = self.model(*inputs)  # logits/probs/log_probs
+            if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
+                self._model_act_kind = classify_output_kind(out, class_dim=1)
+
+            logits_raw = _to_logits(out, self._model_act_kind)  # un-tempered logits-like
+            logits = logits_raw
+            if self.T_value is not None:
+                logits = logits / max(1e-3, float(self.T_value))
+
+            probs = F.softmax(logits, dim=1)
+            assert probs.shape[1] == self.num_classes, \
+                f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
+
+            preds = probs.argmax(dim=1)
+            self.evaluator.update(preds, labels)
+
+            # ---- optional uncertainty metrics (Dirichlet branch uses UN-TEMPERED logits) ----
+            if want_dirichlet_metrics:
+                alpha = to_alpha_concentrations(logits_raw)  # use raw logits for alpha
+                pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
+                pred_entropy_norm = pred_entropy / math.log(self.num_classes)
+
+                if do_mc_conf_acc:
+                    hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
+                    mc_hits += hits
+                    mc_tot += tot
+
+                if do_entropy_iou:
+                    err_mask = (preds != labels).to(torch.int32)
+                    ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
+                    all_ious.append(ious.cpu().numpy())
+
+                if do_entropy_rel:
+                    err_mask = (preds != labels).to(torch.int32)
+                    tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
+                    ent_err_tot += tot
+                    ent_err_err += err
 
         mIoU, per_class = self.evaluator.compute_final_metrics(class_names=self.class_names)
         print(f"[eval] epoch {epoch+1}  mIoU={mIoU:.4f}")
@@ -459,6 +496,7 @@ class Trainer:
 
         return mIoU
 
+
     # ------------------------------
     # main loop
     # ------------------------------
@@ -470,7 +508,8 @@ class Trainer:
         cal_cfg = self.cfg.get("calibration", {})
         ts_enable = bool(cal_cfg.get("enable", False))
         ts_run_each_eval = bool(cal_cfg.get("run_each_eval", False))
-        ts_cache_mode = cal_cfg.get("cache_mode", "default")  # "default" or "mc"
+        #ts_cache_mode = cal_cfg.get("cache_mode", "default")  # "default" or "mc"
+        ts_cache_mode = "mc" if self.cfg['model_settings']['use_dropout'] else "default"
         ts_optimizer = cal_cfg.get("optimizer", "lbfgs")      # "lbfgs" or "adam"
         ts_lr = float(cal_cfg.get("lr", 0.05))
         ts_epochs = int(cal_cfg.get("epochs", 2))
