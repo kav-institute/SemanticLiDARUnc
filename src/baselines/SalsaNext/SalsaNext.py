@@ -192,7 +192,7 @@ class SalsaNext(nn.Module):
 
         self.logits = nn.Conv2d(32, nclasses, kernel_size=(1, 1))
 
-    def forward_logits(self, x):  # <-- NEW: returns raw logits
+    def forward(self, x):  # --> NEW: returns raw logits
         downCntx = self.downCntx(x)
         downCntx = self.downCntx2(downCntx)
         downCntx = self.downCntx3(downCntx)
@@ -209,39 +209,14 @@ class SalsaNext(nn.Module):
         up1e = self.upBlock4(up2e, down0b)
         logits = self.logits(up1e)
 
-        # NOTE: removed the following 2 lines from original SalsaNext implementation to yield both logits and softmax-logits
+        # NOTE: removed softmax activation from original SalsaNext implementation to be more flexible with loss functions -> post-hoc
         # logits = logits
         # logits = F.softmax(logits, dim=1)
         return logits
     
-    def forward(self, x):  # keep original SalsaNext behavior for training
-        logits = self.forward_logits(x)
-        return F.softmax(logits, dim=1)
-
-
-class TemperatureScaling(nn.Module):
-    def __init__(self, model, init_T=1.0):
-        super().__init__()
-        self.model = model           # base model (already trained)
-        self.log_T = nn.Parameter(torch.log(torch.tensor([init_T], dtype=torch.float32)))
-
-    def temperature(self):
-        # strictly positive T
-        return torch.exp(self.log_T)
-
-    @torch.no_grad()
-    def logits(self, *model_args, **model_kwargs):
-        # Detach base-model logits so we optimize ONLY T
-        logits = self.model.forward_logits(*model_args, **model_kwargs)
-        return logits.detach()
-
-    def forward(self, *model_args, return_probs=True, **model_kwargs):
-        logits = self.logits(*model_args, **model_kwargs)
-        T = self.temperature().clamp_min(1e-3)
-        scaled = logits / T
-        if return_probs:
-            return F.softmax(scaled, dim=1)
-        return scaled
+    # def forward(self, x):  # keep original SalsaNext behavior for training
+    #     logits = self.forward_logits(x)
+    #     return F.softmax(logits, dim=1)
 
 
 if __name__ == "__main__":
