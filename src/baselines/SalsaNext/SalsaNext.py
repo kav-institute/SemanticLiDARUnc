@@ -191,6 +191,8 @@ class SalsaNext(nn.Module):
         self.upBlock4 = UpBlock(2 * 32, 32, 0.2, drop_out=False)
 
         self.logits = nn.Conv2d(32, nclasses, kernel_size=(1, 1))
+        
+        self.tail_act = nn.Softmax(dim=1)
 
     def forward(self, x):  # --> NEW: returns raw logits
         downCntx = self.downCntx(x)
@@ -209,9 +211,7 @@ class SalsaNext(nn.Module):
         up1e = self.upBlock4(up2e, down0b)
         logits = self.logits(up1e)
 
-        # NOTE: removed softmax activation from original SalsaNext implementation to be more flexible with loss functions -> post-hoc
-        # logits = logits
-        # logits = F.softmax(logits, dim=1)
+        #logits = F.softmax(logits, dim=1)  # TODO-NOTE: Removed last activation function
         return logits
     
     # def forward(self, x):  # keep original SalsaNext behavior for training
