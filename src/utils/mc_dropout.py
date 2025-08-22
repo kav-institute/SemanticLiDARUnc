@@ -78,7 +78,11 @@ def mc_dropout_probs(
         output_kind: str | None = None  # detect once to avoid overhead
         for _ in range(T):
             out = model(*inputs)
-
+            assert not (isinstance(out, tuple) and len(out) >2), "Model returned/generated unexpectedly too many outputs"
+            if isinstance(out, tuple) and len(out) == 2:
+                logits_mean, logits_var = out
+                out = logits_mean
+            
             if output_kind is None:
                 output_kind = classify_output_kind(out, class_dim=1)
 

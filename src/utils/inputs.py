@@ -15,7 +15,7 @@ def set_model_inputs(range_img, reflectivity, xyz, normals, cfg):
     if cfg["model_settings"].get("reflectivity", 0):
         main_channels.append(reflectivity)
 
-    if baseline == "salsanext":
+    if baseline in {"salsanext", "salsanextadf"}:
         main_channels.append(xyz)
         if cfg["model_settings"].get("normals", 0):
             main_channels.append(normals)
