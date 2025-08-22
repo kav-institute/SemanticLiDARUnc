@@ -55,7 +55,7 @@ def main(args):
     cfg["extras"]["num_classes"] = 21 if cfg['dataset_name']=="SemanticSTF" and not cfg.get('remap_adverse_label', 0)  else 20
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
-    cfg["extras"]["loss_function"] = "Tversky"    # Tversky | Dirichlet
+    #cfg["extras"]["loss_function"] = "Tversky"    # Tversky | Dirichlet
     # choose model architecture, type str
     baseline = cfg["model_settings"].get("baseline", "Reichert")
     cfg["model_settings"]["baseline"] = baseline    # ensure that the basline parameter is set if not pre-initialized in config
@@ -86,45 +86,47 @@ def main(args):
     
     dataloader_train = DataLoader(depth_dataset_train, batch_size=cfg["train_params"]["batch_size"], shuffle=True, num_workers=cfg["train_params"]["num_workers"])
     
-    depth_dataset_test = SemanticDataset(data_path_test[:100], rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection, currently reduced
+    depth_dataset_test = SemanticDataset(data_path_test, rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection, currently reduced
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=cfg["train_params"]["num_workers"])
     
     # defines model architecture and input dimensions
     # generally: input channels minimium of range image (1ch) and xyz image (3ch)
     if cfg["model_settings"]["baseline"]=="Reichert":
         # import model
-        from models.semantic_dirichletFCN import SemanticNetworkWithFPN
-        
+        #from models.semantic_dirichletFCN import SemanticNetworkWithFPN
+        from baselines.Reichert.semanticFCN_opt import SemanticNetworkWithFPN
         # here: input channels are split into two paths "input_channels" and "meta_channel_dim"
         input_channels = 1      # min. range image (=1ch)
         meta_channel_dim = 3    # min. xyz image (=3ch)
-        if cfg["model_settings"].get("reflectivity", 0):
-            input_channels +=1  # reflectivity adds 1 extra channel to input_channels
-        if cfg["model_settings"].get("normals", 0):
-            meta_channel_dim +=3  # normals adds 3 extra channels to meta_channel_dim
+        # reflectivity adds 1 extra channel to input_channels
+        if cfg["model_settings"].get("reflectivity", 0):    input_channels +=1
+        # normals adds 3 extra channels to meta_channel_dim
+        if cfg["model_settings"].get("normals", 0):         meta_channel_dim +=3  
 
         # Model definition for "Reichert"
-        if cfg["model_settings"]["normals"]:
-            model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=meta_channel_dim, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
-        else:
-            model = SemanticNetworkWithFPN(backbone=cfg["model_settings"]["model_type"], input_channels=input_channels, meta_channel_dim=meta_channel_dim, num_classes=cfg["extras"]["num_classes"] , attention=cfg["model_settings"]["attention"], multi_scale_meta=cfg["model_settings"]["multi_scale_meta"])
-    elif cfg["model_settings"]["baseline"]=="SalsaNext":
-        # import model
-        from baselines.SalsaNext.SalsaNext import SalsaNext
+        model = SemanticNetworkWithFPN(
+            backbone=cfg["model_settings"]["model_type"],
+            input_channels=input_channels,
+            meta_channel_dim=meta_channel_dim,
+            num_classes=cfg["extras"]["num_classes"],
+            attention=cfg["model_settings"]["attention"],
+            multi_scale_meta=cfg["model_settings"]["multi_scale_meta"]
+        )
+    elif cfg["model_settings"]["baseline"] in {"SalsaNext", "SalsaNextAdf"}:
+        # import base SalsaNext or uncertainty yielding model SalsaNextAdf
+        if cfg["model_settings"]["baseline"]=="SalsaNext":      from baselines.SalsaNext.SalsaNext import SalsaNext
+        elif cfg["model_settings"]["baseline"]=="SalsaNextAdf": from baselines.SalsaNext.SalsaNextAdf import SalsaNextUncertainty as SalsaNext
         
         # minimum channels=4: range image (1ch) and xyz image (3ch)
         nchannels = 4
-        if cfg["model_settings"].get("normals", 0):
-            nchannels +=3  # normals adds 3 extra channels
-        if cfg["model_settings"].get("reflectivity", 0):
-            nchannels +=1  # reflectivity adds 1 extra channel
-
-        # Model definition for "SalsaNext"
-        if cfg["model_settings"]["baseline"] == "SalsaNext":   # if statement only if SalsaNextUncertainty is used, NOTE: code from authors of SalsaNext paper not working! Returns NoneType
-            model = SalsaNext(nclasses=cfg["extras"]["num_classes"], nchannels=nchannels)
-        # elif cfg["extras"]["model"] == "SalsaNextUncertainty":
-        #     model = SalsaNextUncertainty(nclasses=cfg["extras"]["num_classes"])
+        # normals adds 3 extra channels
+        if cfg["model_settings"].get("normals", 0):         nchannels +=3
+        # reflectivity adds 1 extra channel
+        if cfg["model_settings"].get("reflectivity", 0):    nchannels +=1  
         
+        # Model definition
+        model = SalsaNext(nclasses=cfg["extras"]["num_classes"], nchannels=nchannels)
+    
     # remove activation function from last layer of decoder
     # if cfg["extras"]["loss_function"] == "Dirichlet":
     #     del model.decoder_semantic[-1]
@@ -183,7 +185,7 @@ def main(args):
         else:
             save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_final"
         
-        save_path_p2 ='{}_{}{}{}{}{}'.format(cfg["model_settings"]["model_type"], "a" if cfg["model_settings"]["attention"] else "", "n" if cfg["model_settings"]["normals"] else "", "m" if cfg["model_settings"]["multi_scale_meta"] else "", "p" if cfg["model_settings"]["pretrained"] else "", cfg["extras"]["loss_function"])
+        save_path_p2 ='{}_{}{}{}{}{}'.format(cfg["model_settings"]["model_type"], "a" if cfg["model_settings"]["attention"] else "", "n" if cfg["model_settings"]["normals"] else "", "m" if cfg["model_settings"]["multi_scale_meta"] else "", "p" if cfg["model_settings"]["pretrained"] else "", cfg["model_settings"]["loss_function"])
         save_path = os.path.join(save_path_p1,save_path_p2)
         
         # add time information
@@ -242,12 +244,12 @@ if __name__ == '__main__':
     parser.add_argument('--with_logging', 
                         #action='store_true',
                         type=bool, 
-                        default=False,
+                        default=True,
                         help='Toggle logging (saving weights and tensorboard logs)')
     parser.add_argument('--cfg_path', 
                         #action='store_true',
                         type=str, 
-                        default="/home/devuser/workspace/src/configs/SemanticSTF_default.yaml",
+                        default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
                         help='Path to the config file used for training')
     parser.add_argument('--mode', 
                         #action='store_true',

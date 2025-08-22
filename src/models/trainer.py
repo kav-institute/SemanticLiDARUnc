@@ -139,7 +139,10 @@ class Trainer:
         self.class_colors = cfg["extras"]["class_colors"]
 
         # loss selection
-        self.loss_name = cfg["extras"]["loss_function"]
+        self.loss_name = cfg["model_settings"]["loss_function"]
+        
+        # get baseline name
+        self.baseline = cfg["model_settings"]["baseline"]
 
         # evaluator
         self.evaluator = SemanticSegmentationEvaluator(self.num_classes, test_mask=test_mask)
@@ -167,22 +170,27 @@ class Trainer:
     def _init_losses(self):
         from models.losses import (
             TverskyLoss,
-            SemanticSegmentationLoss,
+            CrossEntropyLoss,
             LovaszSoftmax,
+            LovaszSoftmaxStable,
             DirichletNLLLoss,
-            DirichletBetaMomentLoss,
+            #DirichletBetaMomentLoss,
         )
 
         if self.loss_name == "Tversky":
-            self.criterion_sem = SemanticSegmentationLoss()
+            self.criterion_ce = CrossEntropyLoss()
             self.criterion_tversky = TverskyLoss()
         elif self.loss_name == "CE":
-            self.criterion_sem = SemanticSegmentationLoss()
+            self.criterion_ce = CrossEntropyLoss()
         elif self.loss_name == "Lovasz":
-            self.criterion_lovasz = LovaszSoftmax()
+            self.criterion_lovasz = LovaszSoftmaxStable()
         elif self.loss_name == "Dirichlet":
             self.criterion_dir_nll = DirichletNLLLoss()
-            self.criterion_dir_bm = DirichletBetaMomentLoss(p=2)  # optional second term
+            self.criterion_lovasz = LovaszSoftmaxStable()
+            #self.criterion_dir_bm = DirichletBetaMomentLoss(p=2)  # optional second term
+        elif self.loss_name == "SalsaNextAdf":
+            self.criterion_ce = CrossEntropyLoss()
+            self.criterion_lovasz = LovaszSoftmaxStable()
         else:
             raise NotImplementedError(f"Unknown loss function: {self.loss_name}")
 
@@ -213,7 +221,11 @@ class Trainer:
 
             inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
             self._start.record()
-            outputs = self.model(*inputs)  # default: probabilities (for most baselines)
+            outputs = self.model(*inputs)
+            if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                logits_mean, logits_var = outputs
+                outputs = logits_mean
+            assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
             # >>> Output-kind classifier (logits / probs / log_probs) <<<
             if not hasattr(self, "_model_act_kind"):
                 from models.losses import classify_output_kind
@@ -223,18 +235,23 @@ class Trainer:
 
             # ---- compute loss (by selected head) ----
             if self.loss_name == "Tversky":
-                loss_sem = self.criterion_sem(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
+                loss_sem = self.criterion_ce(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
                 loss_t = self.criterion_tversky(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
                 loss = loss_sem + loss_t
             elif self.loss_name == "CE":
-                loss = self.criterion_sem(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
+                loss = self.criterion_ce(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
             elif self.loss_name == "Lovasz":
-                loss = self.criterion_lovasz(outputs, labels)
+                loss = self.criterion_lovasz(outputs, labels, model_act=self._model_act_kind)
+            elif self.loss_name == "SalsaNextAdf":
+                loss_ce = self.criterion_ce(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
+                loss_ls = self.criterion_lovasz(outputs, labels, model_act=self._model_act_kind)
+                loss = loss_ce + loss_ls
             elif self.loss_name == "Dirichlet":
                 # If your model returns raw logits for Dirichlet, point outputs there.
                 loss_nll = self.criterion_dir_nll(outputs, labels)
+                loss_ls = self.criterion_lovasz(outputs, labels, model_act=self._model_act_kind)
                 # loss_bm = self.criterion_dir_bm(outputs, labels)  # optional term
-                loss = loss_nll
+                loss = loss_nll + loss_ls
                 
                 # >>> additional initializations
                 alpha = None
@@ -369,9 +386,15 @@ class Trainer:
             if use_dropout:
                 # (Optional) cache model output kind once for telemetry/consistency
                 if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
-                    peek = self.model(*inputs)
-                    self._model_act_kind = classify_output_kind(peek, class_dim=1)
-                    del peek
+                    outputs = self.model(*inputs)
+                    
+                    assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
+                    if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                        logits_mean, logits_var = outputs
+                        outputs = logits_mean
+                    
+                    self._model_act_kind = classify_output_kind(outputs, class_dim=1)
+                    del outputs
 
                 # >>> MC sanity checks after mc_dropout_probs(...) is called
                     # - global std: mc_probs.std(dim=0).mean().item() ---> >~1e-6 
@@ -411,11 +434,16 @@ class Trainer:
                 continue  # done with MC batch
 
             # ---- Non-MC path: your code (kept) ----
-            out = self.model(*inputs)  # logits/probs/log_probs
+            outputs = self.model(*inputs)  # logits/probs/log_probs
+            assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
+            if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                logits_mean, logits_var = outputs
+                outputs = logits_mean
+                    
             if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
-                self._model_act_kind = classify_output_kind(out, class_dim=1)
+                self._model_act_kind = classify_output_kind(outputs, class_dim=1)
 
-            logits_raw = _to_logits(out, self._model_act_kind)  # un-tempered logits-like
+            logits_raw = _to_logits(outputs, self._model_act_kind)  # un-tempered logits-like
             logits = logits_raw
             if self.T_value is not None:
                 logits = logits / max(1e-3, float(self.T_value))
