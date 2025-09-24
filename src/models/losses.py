@@ -290,6 +290,21 @@ class SalsaNextLoss(nn.Module):
 
         return loss_ce + loss_ls    #, {"ce": loss_ce.detach(), "lovasz": loss_ls.detach()}
 
+from baselines.SalsaNext import adf
+class SoftmaxHeteroscedasticLoss(torch.nn.Module):
+    # L = 0.5 * ((y - mu)**2 / (var + eps)) + 0.5 * log(var + eps)
+    def __init__(self, num_classes):
+        super(SoftmaxHeteroscedasticLoss, self).__init__()
+        self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
+
+    def forward(self, outputs, targets, eps=1e-5):
+        mean, var = self.adf_softmax(*outputs)
+        targets = torch.nn.functional.one_hot(targets.squeeze(1), num_classes=20).permute(0,3,1,2).float()
+
+        precision = 1 / (var + eps)
+        return torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
+
+
 ### >>> Dirichlet <<< ###
 from models.probability_helper import (
     to_alpha_concentrations, 

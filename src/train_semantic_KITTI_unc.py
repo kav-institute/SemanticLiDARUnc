@@ -222,7 +222,7 @@ def main(args):
             checkpoint=cfg["model_settings"].get("pretrained")  # or a separate path
         )
 
-        do_calib = cfg["logging_settings"].get("do_temp_scaling", True)
+        do_calib = cfg["calibration"].get("enable", False)
         tester.run(
             dataloader_test=dataloader_test,
             calib_loader=dataloader_test,   # or a dedicated calib loader
@@ -236,7 +236,7 @@ def main(args):
 if __name__ == '__main__':
     # general
     parser = argparse.ArgumentParser(description = 'Train script for SemanticTHAB')
-    parser.add_argument('--visualization', 
+    parser.add_argument('--visualization',
                         #action='store_true',
                         type=bool, 
                         default=True,

@@ -8,6 +8,7 @@ import json
 import numpy as np
 import tqdm
 import torch
+import cv2
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
@@ -31,7 +32,8 @@ from utils.vis_cv2 import (
     visualize_semantic_segmentation_cv2,
     open_window,
     close_window,
-    show_stack
+    show_stack,
+    add_horizontal_uncertainty_colorbar
 )
 
 # optional / uncertainty helpers (unchanged file)
@@ -174,6 +176,7 @@ class Trainer:
             LovaszSoftmax,
             LovaszSoftmaxStable,
             DirichletNLLLoss,
+            SoftmaxHeteroscedasticLoss
             #DirichletBetaMomentLoss,
         )
 
@@ -188,9 +191,13 @@ class Trainer:
             self.criterion_dir_nll = DirichletNLLLoss()
             self.criterion_lovasz = LovaszSoftmaxStable()
             #self.criterion_dir_bm = DirichletBetaMomentLoss(p=2)  # optional second term
+        elif self.loss_name == "SalsaNext":
+            self.criterion_ce = CrossEntropyLoss()
+            self.criterion_lovasz = LovaszSoftmaxStable()
         elif self.loss_name == "SalsaNextAdf":
             self.criterion_ce = CrossEntropyLoss()
             self.criterion_lovasz = LovaszSoftmaxStable()
+            self.het = SoftmaxHeteroscedasticLoss(num_classes=self.num_classes)
         else:
             raise NotImplementedError(f"Unknown loss function: {self.loss_name}")
 
@@ -242,10 +249,28 @@ class Trainer:
                 loss = self.criterion_ce(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
             elif self.loss_name == "Lovasz":
                 loss = self.criterion_lovasz(outputs, labels, model_act=self._model_act_kind)
-            elif self.loss_name == "SalsaNextAdf":
+            elif self.loss_name == "SalsaNext":
                 loss_ce = self.criterion_ce(outputs, labels, num_classes=self.num_classes, model_act=self._model_act_kind)
                 loss_ls = self.criterion_lovasz(outputs, labels, model_act=self._model_act_kind)
                 loss = loss_ce + loss_ls
+            elif self.loss_name == "SalsaNextAdf":
+                # outputs = (logits_mean,  from model
+
+                # 1) CE on mean logits
+                loss_ce = self.criterion_ce(logits_mean, labels,
+                                            num_classes=self.num_classes,
+                                            model_act="logits")
+
+                # 2) Lovasz on mean probs
+                mean_probs = torch.softmax(logits_mean, dim=1)
+                loss_ls = self.criterion_lovasz(mean_probs, labels,
+                                                model_act="probs")
+                
+                # 3) Heteroscedastic (uses mean & var through ADF softmax)
+                loss_het = self.het([logits_mean, logits_var], labels)
+
+                # Final combined loss
+                loss = loss_ce + loss_ls + loss_het
             elif self.loss_name == "Dirichlet":
                 # If your model returns raw logits for Dirichlet, point outputs there.
                 loss_nll = self.criterion_dir_nll(outputs, labels)
@@ -277,7 +302,22 @@ class Trainer:
                 # alternative usage: 
                     # unc_tot = get_predictive_entropy_norm(alpha)
                     # get_predictive_entropy_norm.add(unc_tot)
-                    
+            elif self.loss_name=="SalsaNextAdf":
+                # Extract variance of predicted class
+                logits_var = logits_var.detach().cpu()
+                pred_var = logits_var.gather(1, labels.unsqueeze(1)).squeeze(1)  # [B, H, W]
+
+                # Option: convert variance -> std
+                pred_std = torch.sqrt(pred_var + 1e-8)
+                # Normalize per image (0..255 for heatmap)
+                unc_map = pred_std[0].cpu().numpy()
+                unc_map = (unc_map - unc_map.min()) / (unc_map.max() - unc_map.min() + 1e-8)
+                unc_map = (unc_map * 255).astype(np.uint8)
+
+                # Apply colormap (e.g. JET or TURBO)
+                unc_colormap = cv2.applyColorMap(unc_map, cv2.COLORMAP_TURBO)
+                #unc_colormap = add_horizontal_uncertainty_colorbar(unc_colormap, num_classes=self.num_classes, height=10, colormap=cv2.COLORMAP_TURBO)
+                
             # logging
             if self.logging and self.writer and step % 10 == 0:
                 global_step = epoch * len(loader) + step
@@ -302,14 +342,17 @@ class Trainer:
                     unc_tot_img, unc_a_img, unc_e_img = get_dirichlet_uncertainty_imgs(alpha)
                     create_ia_plots(args_cv2=(reflectivity_img, normal_img, prev_sem_pred, prev_sem_gt, error_img, unc_tot_img, unc_a_img, unc_e_img), 
                                     args_o3d=(xyz_img, prev_sem_pred))
+                elif self.loss_name=="SalsaNextAdf":
+                    create_ia_plots(args_cv2=(reflectivity_img, normal_img, prev_sem_pred, prev_sem_gt, error_img, unc_colormap), 
+                                    args_o3d=(xyz_img, prev_sem_pred))
                 else:
                     create_ia_plots(args_cv2=(reflectivity_img, normal_img, prev_sem_pred, prev_sem_gt, error_img), 
                                     args_o3d=(xyz_img, prev_sem_pred))
 
-        avg = total_loss / max(1, len(loader))
-        print(f"[train] epoch {epoch+1}  loss={avg:.4f}")
+        avg_loss = total_loss / max(1, len(loader))
+        print(f"[train] epoch {epoch+1}/{self.num_epochs}, loss={avg_loss:.4f}")
         if self.logging and self.writer:
-            self.writer.add_scalar("train/loss/epoch", avg, epoch)
+            self.writer.add_scalar("train/loss/epoch", avg_loss, epoch)
             if self.loss_name=="Dirichlet":
                 self.writer.add_scalar('train/unc_tot/epoch', get_predictive_entropy_norm.mean(reset=True), global_step)
 
@@ -331,6 +374,7 @@ class Trainer:
             else:
                 raise ValueError(f"Unknown output kind: {kind}")
 
+        inference_times = []
         self.model.eval()
         self.evaluator.reset()
 
@@ -381,7 +425,10 @@ class Trainer:
             else:
                 labels = labels.long()
             inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
-
+            
+            # statistics inference time start
+            self._start.record()
+            
             # ---- If MC-dropout is enabled, do ONLY the MC path (single evaluator update) ----
             if use_dropout:
                 # (Optional) cache model output kind once for telemetry/consistency
@@ -418,6 +465,13 @@ class Trainer:
 
                 preds = probs.argmax(dim=1)
                 self.evaluator.update(preds, labels)
+                
+                # statistics inference time end
+                self._end.record()
+                # Waits for everything to finish running
+                torch.cuda.synchronize()
+                # log inference times
+                inference_times.append(self._start.elapsed_time(self._end))
 
                 # --- optional uncertainty metrics (unchanged logic) ---
                 if (do_entropy_iou or do_entropy_rel) and self.logging:
@@ -430,61 +484,77 @@ class Trainer:
                         tot, err, err_rate, ece = compute_entropy_reliability(ent_mc, err_mask, n_bins=n_bins)
                         ent_err_tot += tot
                         ent_err_err += err
+            ###############################################
+            ### ---- Non-MC path ---- ###
+            ###############################################
+            else:
+                outputs = self.model(*inputs)  # logits/probs/log_probs
+                assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
+                if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                    logits_mean, logits_var = outputs
+                    outputs = logits_mean
+                        
+                if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
+                    self._model_act_kind = classify_output_kind(outputs, class_dim=1)
 
-                continue  # done with MC batch
+                logits_raw = _to_logits(outputs, self._model_act_kind)  # un-tempered logits-like
+                logits = logits_raw
+                if self.T_value is not None:
+                    logits = logits / max(1e-3, float(self.T_value))
 
-            # ---- Non-MC path: your code (kept) ----
-            outputs = self.model(*inputs)  # logits/probs/log_probs
-            assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
-            if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
-                logits_mean, logits_var = outputs
-                outputs = logits_mean
-                    
-            if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
-                self._model_act_kind = classify_output_kind(outputs, class_dim=1)
+                probs = F.softmax(logits, dim=1)
+                assert probs.shape[1] == self.num_classes, \
+                    f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
 
-            logits_raw = _to_logits(outputs, self._model_act_kind)  # un-tempered logits-like
-            logits = logits_raw
-            if self.T_value is not None:
-                logits = logits / max(1e-3, float(self.T_value))
+                preds = probs.argmax(dim=1)
+                self.evaluator.update(preds, labels)
+                
+                # statistics inference time end
+                self._end.record()
+                # Waits for everything to finish running
+                torch.cuda.synchronize()
+                # log inference times
+                inference_times.append(self._start.elapsed_time(self._end))
+                
+                # ---- optional uncertainty metrics (Dirichlet branch uses UN-TEMPERED logits) ----
+                if want_dirichlet_metrics:
+                    alpha = to_alpha_concentrations(logits_raw)  # use raw logits for alpha
+                    pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
+                    pred_entropy_norm = pred_entropy / math.log(self.num_classes)
 
-            probs = F.softmax(logits, dim=1)
-            assert probs.shape[1] == self.num_classes, \
-                f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
+                    if do_mc_conf_acc:
+                        hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
+                        mc_hits += hits
+                        mc_tot += tot
 
-            preds = probs.argmax(dim=1)
-            self.evaluator.update(preds, labels)
+                    if do_entropy_iou:
+                        err_mask = (preds != labels).to(torch.int32)
+                        ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
+                        all_ious.append(ious.cpu().numpy())
 
-            # ---- optional uncertainty metrics (Dirichlet branch uses UN-TEMPERED logits) ----
-            if want_dirichlet_metrics:
-                alpha = to_alpha_concentrations(logits_raw)  # use raw logits for alpha
-                pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
-                pred_entropy_norm = pred_entropy / math.log(self.num_classes)
-
-                if do_mc_conf_acc:
-                    hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
-                    mc_hits += hits
-                    mc_tot += tot
-
-                if do_entropy_iou:
-                    err_mask = (preds != labels).to(torch.int32)
-                    ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
-                    all_ious.append(ious.cpu().numpy())
-
-                if do_entropy_rel:
-                    err_mask = (preds != labels).to(torch.int32)
-                    tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
-                    ent_err_tot += tot
-                    ent_err_err += err
-
-        mIoU, per_class = self.evaluator.compute_final_metrics(class_names=self.class_names)
-        print(f"[eval] epoch {epoch+1}  mIoU={mIoU:.4f}")
+                    if do_entropy_rel:
+                        err_mask = (preds != labels).to(torch.int32)
+                        tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
+                        ent_err_tot += tot
+                        ent_err_err += err
+        
+        # per class mIoU and overall mIoU
+        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
+        print(f"[eval] epoch {epoch + 1}/{self.num_epochs},  mIoU={mIoU:.4f}")
 
         # --- plots / logs ---
         if self.logging and self.save_path:
             out_dir = os.path.join(self.save_path, "eval")
             os.makedirs(out_dir, exist_ok=True)
 
+            # log IoU to tensorboard
+            for cls in range(self.num_classes):
+                self.writer.add_scalar('IoU_{}'.format(self.class_names[cls]), result_dict[self.class_names[cls]]*100, epoch)
+            
+            self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
+            self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
+            
+            
             if do_mc_conf_acc and mc_tot.sum() > 0:
                 emp_acc = np.divide(mc_hits, mc_tot, out=np.zeros_like(mc_hits), where=mc_tot > 0)
                 edges = np.linspace(0.0, 1.0, n_bins + 1)
@@ -568,7 +638,7 @@ class Trainer:
                     self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
                 ):
                     self.scheduler.step(mIoU)
-
+                
                 # save best checkpoint (optional)
                 if self.logging and self.save_path and mIoU > best_mIoU:
                     best_mIoU = mIoU
