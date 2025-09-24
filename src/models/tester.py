@@ -12,7 +12,13 @@ from models.temp_scaling import cache_calib_logits, calibrate_temperature_from_c
 from utils.reliability import reliability_diagram_from_probs
 from utils.mc_dropout import predictive_entropy_mc
 
-from models.evaluator import SemanticSegmentationEvaluator
+# aggregator classes for evaluation
+from models.evaluator import (
+    SemanticSegmentationEvaluator,
+    UncertaintyPerClassAggregator,
+    plot_iou_sorted_by_uncertainty
+)
+
 from models.probability_helper import (
     to_alpha_concentrations, get_predictive_entropy,
     compute_mc_reliability_bins, save_reliability_diagram,
@@ -23,6 +29,11 @@ from models.probability_helper import (
 # >>> use the shared classifier you already defined in models/losses.py
 from models.losses import classify_output_kind
 
+from utils.mc_dropout import (
+    mc_dropout_probs
+)
+
+from dataset.definitions import class_names, color_map
 
 class Tester:
     """
@@ -50,10 +61,22 @@ class Tester:
         self.num_classes = int(cfg["extras"]["num_classes"])
         self.class_names = cfg["extras"]["class_names"]
         self.class_colors = cfg["extras"]["class_colors"]
-        self.loss_function = cfg["extras"]["loss_function"]
+        
+        # loss selection
+        self.loss_name = cfg["model_settings"]["loss_function"]
+        
+        # get baseline name
+        self.baseline = cfg["model_settings"]["baseline"]
+        
+        # timers
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._end = torch.cuda.Event(enable_timing=True)
+        
         self.save_path = cfg["extras"].get("save_path", "")
 
         self.evaluator = SemanticSegmentationEvaluator(self.num_classes)
+        self.unc_agg = UncertaintyPerClassAggregator(num_classes=self.num_classes, max_per_class=100_000_000)  # cap is optional
+
 
         # Load checkpoint if provided
         if checkpoint:
@@ -160,176 +183,262 @@ class Tester:
 
     # ---------- Testing ----------
 
+
     @torch.no_grad()
-    def test_epoch(self, dataloader, epoch: int = 0):
+    def test_epoch(self, loader, epoch: int = 0):
+        from models.losses import classify_output_kind  # use your canonical detector
+        import torch.nn.functional as F
+        EPS = 1e-12
+        def _to_logits(out: torch.Tensor, kind: str) -> torch.Tensor:
+            if kind == 'logits':
+                return out
+            elif kind == 'probs':
+                return out.clamp_min(EPS).log()
+            elif kind == 'log_probs':
+                return out
+            else:
+                raise ValueError(f"Unknown output kind: {kind}")
+
+        inference_times = []
         self.model.eval()
         self.evaluator.reset()
 
+        # toggles
         use_dropout = bool(self.cfg["model_settings"].get("use_dropout", 0))
-        out_dir = os.path.join(self.save_path, "eval") if self.save_path else None
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+        want_dirichlet_metrics = (self.loss_name == "Dirichlet")
 
-        # Optional metric toggles (consistent with Trainer)
-        metrics_cfg = self.cfg.get("logging_settings", {}).get("metrics", {}) if self.logging else {}
-        want_iou_curve   = bool(metrics_cfg.get("IouPlt", 0))
-        want_entropy_rel = bool(metrics_cfg.get("EntErrRel", 0))
-        want_mc_conf_rel = bool(metrics_cfg.get("McConfEmpAcc", 0))
+        ts_cache_mode = "mc" if use_dropout else "default"
+                # MC sample count (re-use calibration setting if present)
+        mc_T = int(self.cfg.get("calibration", {}).get("mc_samples", 30))
+        
+        # optional uncertainty plots config
+        metrics_cfg = self.cfg.get("logging_settings", {}).get("metrics", {})
+        do_mc_conf_acc = bool(metrics_cfg.get("McConfEmpAcc", 0))
+        do_entropy_iou = bool(metrics_cfg.get("IouPlt", 0))
+        do_entropy_rel = bool(metrics_cfg.get("EntErrRel", 0))
 
+        if (do_mc_conf_acc or do_entropy_iou or do_entropy_rel) and not want_dirichlet_metrics and not use_dropout:
+            # nothing to compute; silently skip
+            do_mc_conf_acc = do_entropy_iou = do_entropy_rel = False
+
+        # prepare aggregators
         n_bins = 10
         thresholds = np.linspace(0.0, 1.0, n_bins, endpoint=False)
 
-        if want_mc_conf_rel:
-            mc_hits = np.zeros(n_bins)
-            mc_tot  = np.zeros(n_bins)
+        if do_mc_conf_acc:
+            mc_hits = np.zeros(n_bins, dtype=np.float64)
+            mc_tot = np.zeros(n_bins, dtype=np.float64)
 
-        if want_iou_curve:
+        if do_entropy_iou:
             all_ious = []
 
-        if want_entropy_rel:
-            ent_err_tot = np.zeros(n_bins)
-            ent_err_err = np.zeros(n_bins)
+        if do_entropy_rel:
+            ent_err_tot = np.zeros(n_bins, dtype=np.float64)
+            ent_err_err = np.zeros(n_bins, dtype=np.float64)
 
-        # MC sample count (reuse calibration setting if present)
-        mc_T = int(self.cfg.get("calibration", {}).get("mc_samples", 30))
-
-        for batch in tqdm.tqdm(dataloader, desc=f"Testing (epoch {epoch})"):
-            range_img, reflectivity, xyz, normals, labels = batch
-            range_img, reflectivity = range_img.to(self.device), reflectivity.to(self.device)
-            xyz, normals = xyz.to(self.device), normals.to(self.device)
+        for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
+            tqdm.tqdm(loader, desc=f"eval {epoch+1}")
+        ):
+            # --- inputs/labels prep (unchanged) ---
+            range_img = range_img.to(self.device)
+            reflectivity = reflectivity.to(self.device)
+            xyz = xyz.to(self.device)
+            normals = normals.to(self.device)
             labels = labels.to(self.device)
             if labels.ndim == 4 and labels.shape[1] == 1:
                 labels = labels.squeeze(1).long()
             else:
                 labels = labels.long()
-
             inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
-
-            # ---- forward (+ TS), with robust MC if requested ----
+            
+            # statistics inference time start
+            self._start.record()
+            
+            # ---- If MC-dropout is enabled, do ONLY the MC path (single evaluator update) ----
             if use_dropout:
-                self._enable_dropout_only()
-                probs_list = []
-                T_val = max(1e-3, float(self.T_value)) if self.T_value is not None else None
-                for _ in range(mc_T):
-                    out_t = self.model(*inputs)  # unknown kind
-                    if self._model_act_kind is None:
-                        self._model_act_kind = classify_output_kind(out_t, class_dim=1)
-                    logits_t = self._to_logits(out_t, self._model_act_kind)
-                    if T_val is not None:
-                        logits_t = logits_t / T_val
-                    probs_list.append(torch.softmax(logits_t, dim=1).unsqueeze(0))
-                self.model.eval()  # restore eval after enabling dropout modules
-                probs_MC = torch.cat(probs_list, dim=0)             # [T,B,C,H,W]
-                probs    = probs_MC.mean(dim=0)                      # [B,C,H,W]
-                ent_mc   = predictive_entropy_mc(probs_MC)           # [B,H,W] normalized
-            else:
-                probs = self._forward_probs(inputs)                  # [B,C,H,W]
-                ent_mc = None
+                # (Optional) cache model output kind once for telemetry/consistency
+                if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
+                    outputs = self.model(*inputs)
+                    
+                    assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
+                    if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                        logits_mean, logits_var = outputs
+                        outputs = logits_mean
+                    
+                    self._model_act_kind = classify_output_kind(outputs, class_dim=1)
+                    del outputs
 
-            # basic assertion helps catch class-count mismatches
-            assert probs.shape[1] == self.num_classes, \
-                f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
-
-            preds = probs.argmax(dim=1)                              # [B,H,W]
-            self.evaluator.update(preds, labels)
-
-            if not self.logging:
-                continue
-
-            # ---- optional uncertainty diagnostics (Dirichlet branch or MC) ----
-            if self.loss_function == "Dirichlet":
-                # If your helper expects logits, reconstruct from probs:
-                logits_for_alpha = probs.clamp_min(self.EPS).log()
-                alpha = to_alpha_concentrations(logits_for_alpha)
-                pred_entropy = get_predictive_entropy(alpha)             # [B,H,W]
-                pred_entropy_norm = pred_entropy / math.log(self.num_classes)
-
-                error_mask = (preds != labels).int()
-
-                if want_mc_conf_rel:
-                    hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
-                    mc_hits += hits
-                    mc_tot  += tot
-
-                if want_iou_curve:
-                    ious = compute_entropy_error_iou(pred_entropy_norm, error_mask, thresholds=thresholds)
-                    all_ious.append(ious.cpu().numpy())
-
-                if want_entropy_rel:
-                    tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, error_mask)
-                    ent_err_tot += tot
-                    ent_err_err += err
-
-            elif use_dropout and ent_mc is not None:
-                error_mask = (preds != labels).int()
-                if want_iou_curve:
-                    ious = compute_entropy_error_iou(ent_mc, error_mask, thresholds=thresholds)
-                    all_ious.append(ious.cpu().numpy())
-
-        # --- results ---
-        mIoU, cls_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
-        print(f"[Tester] mIoU: {mIoU:.6f}")
-
-        # --- save ECE plot over whole test set ---
-        if self.logging and out_dir:
-            ece_img_path = os.path.join(out_dir, f"ece_epoch_{epoch:06d}.png")
-            # Collect probs/labels (no MC; just calibrated probs if available)
-            all_probs, all_labels = [], []
-            for batch in dataloader:
-                range_img, reflectivity, xyz, normals, labels = batch
-                range_img, reflectivity = range_img.to(self.device), reflectivity.to(self.device)
-                xyz, normals = xyz.to(self.device), normals.to(self.device)
-                labels = labels.to(self.device)
-                if labels.ndim == 4 and labels.shape[1] == 1:
-                    labels = labels.squeeze(1).long()
+                # >>> MC sanity checks after mc_dropout_probs(...) is called
+                    # - global std: mc_probs.std(dim=0).mean().item() ---> >~1e-6 
+                    # - fraction of pixels that changed class: (mc_probs.argmax(dim=2) != mc_probs.argmax(dim=2)[0:1]).any(dim=0).float().mean().item() ---> >0
+                
+                # Decide where to apply T based on how T was calibrated
+                if self.T_value is not None and ts_cache_mode == "default":
+                    # Per-sample scaling: softmax(logits_like/T) then average
+                    T_val = max(1e-3, float(self.T_value))
+                    mc_probs = mc_dropout_probs(self.model, inputs, T=mc_T, temperature=T_val)  # [T,B,C,H,W]
+                    probs = mc_probs.mean(dim=0)  # [B,C,H,W]
                 else:
-                    labels = labels.long()
+                    # No per-sample TS; average first. If T exists & was MC-calibrated, apply post-mean.
+                    mc_probs = mc_dropout_probs(self.model, inputs, T=mc_T, temperature=None)  # [T,B,C,H,W]
+                    mean_p = mc_probs.mean(dim=0).clamp_min(EPS)  # [B,C,H,W]
+                    if self.T_value is not None and ts_cache_mode == "mc":
+                        T_val = max(1e-3, float(self.T_value))
+                        probs = torch.softmax(torch.log(mean_p) / T_val, dim=1)
+                    else:
+                        probs = mean_p
 
-                inputs = set_model_inputs(range_img, reflectivity, xyz, normals, self.cfg)
-                p = self._forward_probs(inputs)
-                all_probs.append(p.detach())
-                all_labels.append(labels.detach())
-            probs_full = torch.cat(all_probs, dim=0)
-            labels_full = torch.cat(all_labels, dim=0)
-            ece = reliability_diagram_from_probs(
-                probs_full, labels_full,
-                ignore_index=255, n_bins=15,
-                title="Reliability Diagram (test)",
-                save_path=ece_img_path, show=False
-            )
-            print(f"[Tester] ECE (test): {ece:.4f}")
+                preds = probs.argmax(dim=1)
+                self.evaluator.update(preds, labels)
+                
+                # statistics inference time end
+                self._end.record()
+                # Waits for everything to finish running
+                torch.cuda.synchronize()
+                # log inference times
+                inference_times.append(self._start.elapsed_time(self._end))
 
-        # --- optional uncertainty plots ---
-        if self.logging and out_dir:
-            if want_mc_conf_rel:
+                # --- optional uncertainty metrics (unchanged logic) ---
+                if (do_entropy_iou or do_entropy_rel) and self.logging:
+                    ent_mc = predictive_entropy_mc(mc_probs, normalize=True)  # [B,H,W]
+                    err_mask = (preds != labels).to(torch.int32)
+                    if do_entropy_iou:
+                        ious = compute_entropy_error_iou(ent_mc, err_mask, thresholds=thresholds)
+                        all_ious.append(ious.cpu().numpy())
+                    if do_entropy_rel:
+                        tot, err, err_rate, ece = compute_entropy_reliability(ent_mc, err_mask, n_bins=n_bins)
+                        ent_err_tot += tot
+                        ent_err_err += err
+            ###############################################
+            ### ---- Non-MC path ---- ###
+            ###############################################
+            else:
+                outputs = self.model(*inputs)  # logits/probs/log_probs
+                assert not (isinstance(outputs, tuple) and len(outputs) >2), "Model returned/generated unexpectedly too many outputs"
+                if isinstance(outputs, tuple) and len(outputs) == 2 and self.baseline=="SalsaNextAdf":
+                    logits_mean, logits_var = outputs
+                    outputs = logits_mean
+                        
+                if not hasattr(self, "_model_act_kind") or self._model_act_kind is None:
+                    self._model_act_kind = classify_output_kind(outputs, class_dim=1)
+
+                logits_raw = _to_logits(outputs, self._model_act_kind)  # un-tempered logits-like
+                logits = logits_raw
+                if self.T_value is not None:
+                    logits = logits / max(1e-3, float(self.T_value))
+
+                probs = F.softmax(logits, dim=1)
+                assert probs.shape[1] == self.num_classes, \
+                    f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
+
+                preds = probs.argmax(dim=1)
+                self.evaluator.update(preds, labels)
+                
+                # statistics inference time end
+                self._end.record()
+                # Waits for everything to finish running
+                torch.cuda.synchronize()
+                # log inference times
+                inference_times.append(self._start.elapsed_time(self._end))
+                
+                # ---- optional uncertainty metrics (Dirichlet branch uses UN-TEMPERED logits) ----
+                if want_dirichlet_metrics:
+                    alpha = to_alpha_concentrations(logits_raw)  # use raw logits for alpha
+                    pred_entropy = get_predictive_entropy(alpha)  # [B,H,W]
+                    pred_entropy_norm = pred_entropy / math.log(self.num_classes)
+
+                    self.unc_agg.update(labels=labels, uncertainty=pred_entropy_norm)
+
+
+                    if do_mc_conf_acc:
+                        hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
+                        mc_hits += hits
+                        mc_tot += tot
+
+                    if do_entropy_iou:
+                        err_mask = (preds != labels).to(torch.int32)
+                        ious = compute_entropy_error_iou(pred_entropy_norm, err_mask, thresholds=thresholds)
+                        all_ious.append(ious.cpu().numpy())
+
+                    if do_entropy_rel:
+                        err_mask = (preds != labels).to(torch.int32)
+                        tot, err, err_rate, ece = compute_entropy_reliability(pred_entropy_norm, err_mask, n_bins=n_bins)
+                        ent_err_tot += tot
+                        ent_err_err += err
+        
+        # per class mIoU and overall mIoU
+        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
+        print(f"[eval] epoch {epoch + 1},  mIoU={mIoU:.4f}")
+
+        # After the loop: make the boxplot (ignore 'unlabeled' if desired)
+        self.unc_agg.plot_boxplot(
+            class_names=list(class_names.values()),
+            color_map=color_map,
+            ignore_ids=(0,),  # ignore unlabeled
+            title="Normalized Uncertainty per Class (Boxplot)",
+            save_path="uncertainty_boxplot.png"
+        )
+
+        plot_iou_sorted_by_uncertainty(
+            self.unc_agg,
+            result_dict=result_dict,
+            class_names=list(class_names.values()),
+            color_map=color_map,
+            ignore_ids=(0,),  # ignore 'unlabeled'
+            save_path="iou_sorted_by_uncertainty.png"
+        )
+        
+        # --- plots / logs ---
+        if self.logging and self.save_path:
+            out_dir = os.path.join(self.save_path, "eval")
+            os.makedirs(out_dir, exist_ok=True)
+
+            # log IoU to tensorboard
+            for cls in range(self.num_classes):
+                self.writer.add_scalar('IoU_{}'.format(self.class_names[cls]), result_dict[self.class_names[cls]]*100, epoch)
+            
+            self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
+            self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
+            
+            
+            if do_mc_conf_acc and mc_tot.sum() > 0:
                 emp_acc = np.divide(mc_hits, mc_tot, out=np.zeros_like(mc_hits), where=mc_tot > 0)
-                edges = np.linspace(0.0, 1.0, n_bins+1)
+                edges = np.linspace(0.0, 1.0, n_bins + 1)
                 centers = 0.5 * (edges[:-1] + edges[1:])
-                path = os.path.join(out_dir, f"reliability_mc_epoch_{epoch:06d}.png")
-                save_reliability_diagram(emp_acc, centers, mc_tot, output_path=path)
-
-            if want_entropy_rel:
-                emp_err = np.divide(ent_err_err, ent_err_tot, out=np.zeros_like(ent_err_err), where=ent_err_tot>0)
-                edges = np.linspace(0.0, 1.0, n_bins+1)
-                centers = 0.5 * (edges[:-1] + edges[1:])
-                path = os.path.join(out_dir, f"entropy_error_reliability_epoch_{epoch:06d}.png")
                 save_reliability_diagram(
-                    empirical_acc = emp_err,
-                    bin_centers   = centers,
-                    tot_counts    = ent_err_tot,
-                    output_path   = path,
-                    title='Reliability of Entropy as Error Predictor\n(dot area ∝ #pixels per entropy bin)',
-                    xlabel='Normalized Entropy',
-                    ylabel='Observed Error Rate'
+                    empirical_acc=emp_acc,
+                    bin_centers=centers,
+                    tot_counts=mc_tot,
+                    output_path=os.path.join(out_dir, f"reliability_epoch_{epoch:06d}.png"),
+                    title='Reliability diagram\n(dot area ∝ #pixels per bin — sharpness)',
+                    xlabel='Predicted confidence (MC estimate)',
+                    ylabel='Empirical accuracy',
                 )
 
-            if want_iou_curve and len(all_ious) > 0:
-                all_ious = np.stack(all_ious, axis=0)
-                mean_ious = all_ious.mean(axis=0)
-                path = os.path.join(out_dir, f"mean_iou_curve_epoch_{epoch:06d}.png")
-                plot_mIOU_errorEntropy(mean_ious, thresholds, output_path=path)
+            if do_entropy_iou and len(all_ious) > 0:
+                all_ious_np = np.stack(all_ious, axis=0)
+                mean_ious = all_ious_np.mean(axis=0)
+                plot_mIOU_errorEntropy(
+                    mean_ious,
+                    thresholds,
+                    output_path=os.path.join(out_dir, f"entropy_iou_epoch_{epoch:06d}.png"),
+                )
 
-        return mIoU, cls_dict
+            if do_entropy_rel and ent_err_tot.sum() > 0:
+                edges = np.linspace(0.0, 1.0, n_bins + 1)
+                centers = 0.5 * (edges[:-1] + edges[1:])
+                emp_err_rate = np.divide(ent_err_err, ent_err_tot, out=np.zeros_like(ent_err_err), where=ent_err_tot > 0)
+                save_reliability_diagram(
+                    empirical_acc=emp_err_rate,
+                    bin_centers=centers,
+                    tot_counts=ent_err_tot,
+                    output_path=os.path.join(out_dir, f"entropy_error_rel_epoch_{epoch:06d}.png"),
+                    title='Reliability of Entropy as Error Predictor\n(dot area ∝ #pixels per entropy bin — sharpness)',
+                    xlabel='Normalized entropy',
+                    ylabel='Observed error rate',
+                )
+
+        return mIoU, result_dict
 
     # convenience wrapper
     def run(self, dataloader_test, calib_loader=None, do_calibration: bool = False,
