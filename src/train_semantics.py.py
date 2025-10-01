@@ -11,8 +11,6 @@ import sys
 from dataset.definitions import color_map, class_names
 from utils.weights import load_pretrained_safely
 
-from models.tester import Tester
-from models.trainer import Trainer
 import json
 import yaml
 
@@ -52,7 +50,8 @@ def main(args):
     # add additional configurations to config file
     cfg["extras"] = dict()
     cfg["extras"]["use_reflectivity"] = True
-    cfg["extras"]["num_classes"] = 21 if cfg['dataset_name']=="SemanticSTF" and not cfg.get('remap_adverse_label', 0)  else 20
+    cfg["extras"]["num_classes"] = 21 if (cfg['dataset_name']=="SemanticSTF" or cfg['dataset_name']=="SemanticWADS") \
+                                    and not cfg.get('remap_adverse_label', 0)  else 20
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
     #cfg["extras"]["loss_function"] = "Tversky"    # Tversky | Dirichlet
@@ -65,6 +64,16 @@ def main(args):
         case "SemanticSTF":
             data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/train/velodyne/*.bin")]
             data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/val/velodyne/*.bin")]
+        case "Panoptic-CUDAL":
+            data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in [30, 31, 32, 36, 40, 41]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+            data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/34/velodyne/*.bin")]  # use sequence 8 as validation set
+        case "SemanticTHAB":
+            data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:04}" for i in range(9) if i != 6] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+            data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/0006/velodyne/*.bin")] 
+        case "SemanticWADS":    
+            data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in [11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 23, 24, 26, 28, 34, 35, 36, 37, 76]] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
+            data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"{cfg['dataset_dir']}/30/velodyne/*.bin")] 
+        
         case _: 
             try:
                 data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"{cfg['dataset_dir']}/{folder}/velodyne/*.bin")]
@@ -76,17 +85,38 @@ def main(args):
         case "SemanticKitti": from dataset.dataloader_semantic_KITTI import SemanticKitti as SemanticDataset
         case "SemanticSTF": from dataset.dataloader_semantic_STF import SemanticSTF as SemanticDataset
         case "SemanticTHAB": from dataset.dataloader_semantic_THAB import SemanticTHAB as SemanticDataset
+        case "Panoptic-CUDAL": from dataset.dataloader_semantic_CUDAL import SemanticCUDAL as SemanticDataset
+        case "SemanticWADS": from dataset.dataloader_semantic_WADS import SemanticWADS as SemanticDataset
         case _: raise KeyError("in yaml config parameter dataset_name is invalid")
     
-    depth_dataset_train = SemanticDataset(data_path_train, rotate=cfg["model_settings"]["rotate"], flip=cfg["model_settings"]["flip"], projection=(64,512),resize=False)
+    depth_dataset_train = SemanticDataset(
+                            data_path=data_path_train, 
+                            rotate=cfg["model_settings"]["rotate"],
+                            flip=cfg["model_settings"]["flip"],
+                            projection=cfg['model_settings'].get('projection', [64,512]),
+                            resize=cfg['model_settings'].get('resize', False))
     # Adjustment for SemanticSTF dataset: 
         # SemanticKitti has a default of 20 classes, SemanticSTF adds one adverse weather/corruption class labeled as "20: 'invalid'"
         # Choose in SemanticSTF config yaml whether to train on 21 classes or remap the adverse weather class to "0: 'unlabeled'"
-    if cfg['dataset_name']=="SemanticSTF" and cfg.get('remap_adverse_label', 0): depth_dataset_train.remap_adverse_label = True
+    if (cfg['dataset_name']=="SemanticSTF" or cfg['dataset_name']=="SemanticWADS") \
+        and cfg.get('remap_adverse_label', 0): depth_dataset_train.remap_adverse_label = True
     
-    dataloader_train = DataLoader(depth_dataset_train, batch_size=cfg["train_params"]["batch_size"], shuffle=True, num_workers=cfg["train_params"]["num_workers"])
+    dataloader_train = DataLoader(
+                            dataset=depth_dataset_train,
+                            batch_size=cfg["train_params"]["batch_size"],
+                            shuffle=True,
+                            num_workers=cfg["train_params"]["num_workers"],
+                            pin_memory=True,                                     # required for non_blocking H2D
+                            persistent_workers=True,
+                            prefetch_factor=4
+                        )
     
-    depth_dataset_test = SemanticDataset(data_path_test, rotate=False, flip=False, projection=(64,512),resize=False)   # TODO: Change selection, currently reduced
+    depth_dataset_test = SemanticDataset(
+                            data_path=data_path_test,
+                            rotate=False,
+                            flip=False,
+                            projection=cfg['model_settings'].get('projection', [64,512]),
+                            resize=cfg['model_settings'].get('resize', False))   # TODO: Change selection, currently reduced
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=cfg["train_params"]["num_workers"])
     
     # defines model architecture and input dimensions
@@ -135,6 +165,8 @@ def main(args):
     print("num_params", num_params)
     cfg["extras"]["num_params"] = num_params
     
+    ###--- Safe-load model weights ---###
+    #####################################
     rep = load_pretrained_safely(
         model,
         cfg['model_settings']['pretrained'],
@@ -146,6 +178,7 @@ def main(args):
     if not rep.get("ok"):
         print("No pretrained weights found or applied. Training from scratch...")
         time.sleep(1)
+    #####################################
     
     # Define optimizer
     optimizer = optim.AdamW(
@@ -154,10 +187,10 @@ def main(args):
         weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
     )
     # Linear warm-up over first N epochs
-    num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 3)
+    num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        start_factor=0.3,   # start at 10% of base LR, or higher when using small batches (e.g., <16)
+        start_factor=0.3,   # start at 30% of base LR, or higher when using small batches (e.g., <16)
         end_factor=1.0,     # ramp to 100% of base LR
         total_iters=num_warmup_epochs
     )
@@ -166,7 +199,7 @@ def main(args):
         optimizer,
         T_0=15,           # first restart after T_0 epochs, e.g., 15
         T_mult=1,         # no increase in cycle length
-        eta_min=1e-5      # floor LR
+        eta_min=5e-6      # floor LR
     )  
     #Chain them: warm-up then cosine restarts
     scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -211,9 +244,11 @@ def main(args):
 
     # train model
     if args.mode=="train":
+        from models.trainer import Trainer
         trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
         trainer(dataloader_train, dataloader_test)
     elif args.mode=="test":
+        from models.tester import Tester
         tester = Tester(
             model=model,
             cfg=cfg,
@@ -238,7 +273,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Train script for SemanticTHAB')
     parser.add_argument('--visualization',
                         #action='store_true',
-                        type=bool, 
+                        type=bool,
                         default=True,
                         help='Toggle visualization during training (default: False)')
     parser.add_argument('--with_logging', 
@@ -258,113 +293,3 @@ if __name__ == '__main__':
                         help="Training option whether to 'train' or 'test' the model")
     args = parser.parse_args()
     main(args)
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-# OLD
-#     config = {}
-#     config["BACKBONE"] = args.model_type
-#     config["USE_REFLECTIVITY"] = False
-#     config["USE_ATTENTION"] = args.attention
-#     config["USE_NORMALS"] = args.normals
-#     config["USE_MULTI_SCALE"] = args.multi_scale_meta
-#     config["NUM_CLASSES"] = 20
-#     config["CLASS_NAMES"] = class_names
-#     config["CLASS_COLORS"] = color_map
-#     config["NUM_EPOCHS"] = args.num_epochs
-#     config["BATCH_SIZE"] = args.batch_size
-#     config["LOSS_FUNCTION"] = "Tversky"
-    
-#     data_path_train = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for folder in [f"{i:02}" for i in range(11) if i != 8] for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/{folder}/velodyne/*.bin")]
-#     data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in glob.glob(f"/home/appuser/data/SemanticKitti/dataset/sequences/08/velodyne/*.bin")]
-
-#     depth_dataset_train = SemanticKitti(data_path_train, rotate=args.rotate, flip=args.flip, projection=(64,512),resize=False)
-#     dataloader_train = DataLoader(depth_dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    
-#     depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False, projection=(64,512),resize=False)
-#     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False, num_workers=8)
-    
-
-#     if config["USE_REFLECTIVITY"]:
-#         input_channels = 2
-#     else:
-#         input_channels = 1
-
-#     # Semantic Segmentation Network
-#     if args.normals:
-#         model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=6, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
-#     else:
-#         model = SemanticNetworkWithFPN(backbone=args.model_type, input_channels=input_channels, meta_channel_dim=3, num_classes=config["NUM_CLASSES"], attention=args.attention, multi_scale_meta=args.multi_scale_meta)
-
-#     num_params = count_parameters(model)
-#     config["NUM_PARAMS"] = num_params
-#     print("num_params", count_parameters(model))
-    
-#     # Define optimizer
-#     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-#     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
-
-#     # Save Path
-#     save_path ='/home/appuser/data/train_semantic_kitti_unc/{}_{}{}{}/'.format(args.model_type, "a" if args.attention else "", "n" if args.normals else "", "m" if args.multi_scale_meta else "")
-    
-#     os.makedirs(save_path, exist_ok=True)
-
-#     config["SAVE_PATH"] = save_path
-
-#     save_path = os.path.dirname(config["SAVE_PATH"])
-#     # write config file
-#     with open(os.path.join(save_path, "config.json"), 'w') as fp:
-#         json.dump(config, fp)
-
-#     # train model
-#     trainer = Trainer(model, optimizer, save_path, config, scheduler = scheduler, visualize = True)
-#     trainer(dataloader_train, dataloader_test, args.num_epochs, test_every_nth_epoch=args.test_every_nth_epoch)
-
-#     # test final model
-#     # tester = Tester(model, save_path=os.path.join(save_path, "model_final.pth"), config=config, load=False)
-#     # tester(dataloader_test)
-
-# if __name__ == '__main__':
-#     parser = argparse.ArgumentParser(description = 'Train script for SemanticKitti')
-#     parser.add_argument('--model_type', type=str, default='resnet50',
-#                         help='Type of the model to be used (default: resnet34)')
-#     parser.add_argument('--learning_rate', type=float, default=0.001,
-#                         help='Learning rate for the model (default: 0.001)')
-#     parser.add_argument('--num_epochs', type=int, default=50,
-#                         help='Number of epochs for training (default: 50)')
-#     parser.add_argument('--test_every_nth_epoch', type=int, default=10,
-#                         help='Test every nth epoch (default: 10)')
-#     parser.add_argument('--batch_size', type=int, default=4,
-#                         help='Batch size for training (default: 1)')
-#     parser.add_argument('--num_workers', type=int, default=8,
-#                         help='Number of data loading workers (default: 1)')
-#     parser.add_argument('--rotate', action='store_true',
-#                         help='Whether to apply rotation augmentation (default: False)')
-#     parser.add_argument('--attention', action='store_true',
-#                         help='Whether to use attention (default: False)')
-#     parser.add_argument('--normals', action='store_true',
-#                         help='Whether to normals as input (default: False)')
-#     parser.add_argument('--multi_scale_meta', action='store_true',
-#                         help='Whether to to inject meta data at multiple scales (default: False)')
-#     parser.add_argument('--flip', action='store_true',
-#                         help='Whether to apply flip augmentation (default: False)')
-#     parser.add_argument('--visualization', action='store_true',
-#                         help='Toggle visualization during training (default: False)')
-#     args = parser.parse_args()
-
-#     main(args)
