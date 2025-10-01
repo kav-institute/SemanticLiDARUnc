@@ -26,7 +26,7 @@ class_names = {
 
 class SemanticSegmentationEvaluator:
 
-    def __init__(self, num_classes, test_mask=[0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]):
+    def __init__(self, num_classes, test_mask=[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
         self.use_th = False
         if all(x == 1 for x in test_mask):
             self.use_th = True
@@ -247,6 +247,213 @@ class UncertaintyPerClassAggregator:
             print(f"Boxplot saved to {save_path}")
         plt.show()
 
+    def plot_ridgeline(
+        self,
+        class_names: list,
+        color_map: dict,
+        ignore_ids=(),
+        figsize=(14, 9),
+        title="Normalized Uncertainty per Class (Ridgeline)",
+        x_label="Normalized uncertainty",
+        bw_adjust: float = 0.9,     # tweak smoothness (smaller = wigglier, larger = smoother)
+        fill_alpha: float = 0.9,
+        line_width: float = 1.0,
+        save_path: str | None = None,
+        dpi: int = 200,
+    ):
+        """
+        Ridgeline density plot of per-class uncertainty.
+        Requires seaborn >= 0.11 for kdeplot(fill=...).
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+
+        df = self.as_dataframe(class_names, ignore_ids=ignore_ids)
+        if df.empty:
+            print("No data to plot.")
+            return
+
+        # Order classes as provided (excluding ignored) and that actually exist in df
+        valid = set(df["class_id"].unique().tolist())
+        order_ids = [c for c in range(self.num_classes) if c not in set(ignore_ids) and c in valid]
+        order_labels = [class_names[c] for c in order_ids]
+        palette = [np.array(color_map[c]) / 255.0 for c in order_ids]
+
+        # Build one small axes per class (stacked), shared x, tight vertical spacing
+        n = len(order_ids)
+        height_ratios = [1] * n
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(nrows=n, ncols=1, height_ratios=height_ratios, hspace=0.05)
+
+        x_min, x_max = 0.0, 1.0  # uncertainties are normalized
+        for i, (cid, cname, color) in enumerate(zip(order_ids, order_labels, palette)):
+            ax = fig.add_subplot(gs[i, 0], sharex=fig.axes[0] if i > 0 else None)
+
+            vals = df.loc[df["class_id"] == cid, "uncertainty"].to_numpy()
+            if vals.size < 2:
+                # Not enough data for KDE; fall back to a thin histogram bar
+                ax.hist(vals, bins=10, range=(x_min, x_max), density=True, alpha=fill_alpha, color=color)
+            else:
+                sns.kdeplot(
+                    vals,
+                    ax=ax,
+                    bw_adjust=bw_adjust,
+                    fill=True,
+                    clip=(x_min, x_max),
+                    linewidth=line_width,
+                    color=color,
+                )
+
+            # Aesthetics: ridgeline look
+            ax.set_ylabel(cname, rotation=0, ha="right", va="center", labelpad=25, fontsize=11)
+            ax.set_yticks([])
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_visible(False)
+            # thin baseline
+            ax.axhline(0, lw=0.6, color="black", alpha=0.3)
+
+            if i < n - 1:
+                ax.set_xlabel("")
+                ax.set_xticklabels([])
+            else:
+                ax.set_xlabel(x_label, fontsize=12)
+
+        fig.suptitle(title, fontsize=18, weight="bold", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"Ridgeline plot saved to {save_path}")
+
+        plt.show()
+    
+    def plot_ridgeline_fast(
+        self,
+        class_names: list,
+        color_map: dict,
+        ignore_ids=(),
+        figsize=(14, 9),
+        title="Normalized Uncertainty per Class (Ridgeline)",
+        x_label="Normalized uncertainty",
+        bins: int = 2048,              # resolution of the density grid (increase for smoother)
+        bandwidth: str | float = "silverman",  # "silverman" | "scott" | float (in x-units)
+        fill_alpha: float = 0.9,
+        line_width: float = 1.0,
+        save_path: str | None = None,
+        dpi: int = 200,
+    ):
+        """
+        Fast ridgeline using histogram + Gaussian convolution (uses ALL samples).
+        Boundary bias handled via reflection at [0,1].
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        ignore = set(ignore_ids)
+        order_ids = [c for c in range(self.num_classes) if c not in ignore and self._values[c].numel() > 0]
+        if not order_ids:
+            print("No data to plot."); return
+        order_labels = [class_names[c] for c in order_ids]
+        palette = [np.array(color_map[c]) / 255.0 for c in order_ids]
+
+        x0, x1 = 0.0, 1.0
+        dx = (x1 - x0) / bins
+        x_centers = np.linspace(x0 + 0.5*dx, x1 - 0.5*dx, bins)
+
+        def _bandwidth(vals: np.ndarray) -> float:
+            n = vals.size
+            if isinstance(bandwidth, (int, float)):
+                return float(bandwidth)
+            s = float(vals.std(ddof=1)) if n > 1 else 1e-3
+            iqr = float(np.subtract(*np.percentile(vals, [75, 25]))) if n > 1 else 0.0
+            sigma = max(min(s, iqr/1.34) if iqr > 0 else s, 1e-6)
+            if bandwidth == "silverman":
+                return 0.9 * sigma * n ** (-1/5)
+            elif bandwidth == "scott":
+                return 1.06 * sigma * n ** (-1/5)
+            else:
+                raise ValueError("bandwidth must be 'silverman', 'scott', or a float.")
+
+        def _gauss_kernel_sigma_bins(h: float) -> np.ndarray:
+            # convert bandwidth in x-units to std in bin units
+            sigma_bins = max(h / dx, 1e-6)
+            half = int(np.ceil(3 * sigma_bins))
+            kx = np.arange(-half, half + 1, dtype=np.float32)
+            k = np.exp(-0.5 * (kx / sigma_bins) ** 2)
+            k /= k.sum()
+            return k
+
+        # layout
+        n = len(order_ids)
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(nrows=n, ncols=1, height_ratios=[1]*n, hspace=0.05)
+
+        for i, (cid, cname, color) in enumerate(zip(order_ids, order_labels, palette)):
+            ax = fig.add_subplot(gs[i, 0], sharex=fig.axes[0] if i > 0 else None)
+
+            vals = self._values[cid].numpy()
+            n_pts = vals.size
+            if n_pts < 2:
+                # draw a tiny spike or skip gracefully
+                counts, _ = np.histogram(vals, bins=bins, range=(x0, x1), density=False)
+                density = counts / max(n_pts * dx, 1.0)
+            else:
+                # histogram of all samples (exact mass)
+                counts, _ = np.histogram(vals, bins=bins, range=(x0, x1), density=False)
+
+                # Gaussian kernel based on data-driven bandwidth
+                h = _bandwidth(vals)
+                k = _gauss_kernel_sigma_bins(h)
+
+                # reflection padding to reduce boundary bias
+                half = (len(k) - 1) // 2
+                if half > 0:
+                    left_pad = counts[1:half+1][::-1] if half <= len(counts)-1 else counts[::-1][:half]
+                    right_pad = counts[-half-1:-1][::-1] if half <= len(counts)-1 else counts[::-1][:half]
+                    pad = np.concatenate([left_pad, counts, right_pad])
+                    smooth = np.convolve(pad, k, mode="same")[len(left_pad):-len(right_pad) if half>0 else None]
+                else:
+                    smooth = counts
+
+                density = smooth / (n_pts * dx)  # convert to pdf (area ≈ 1)
+
+            # draw filled ridgeline
+            ax.fill_between(x_centers, 0.0, density, color=color, alpha=fill_alpha, linewidth=0)
+            ax.plot(x_centers, density, color=color, linewidth=line_width)
+
+            # aesthetics
+            ax.set_ylabel(cname, rotation=0, ha="right", va="center", labelpad=25, fontsize=11)
+            ax.set_yticks([])
+            for sp in ("top", "right", "left"):
+                ax.spines[sp].set_visible(False)
+            ax.axhline(0, lw=0.6, color="black", alpha=0.3)
+            # if i < n - 1:
+            #     ax.set_xlabel(""); ax.set_xticklabels([])
+            # else:
+            #     ax.set_xlabel(x_label, fontsize=12)
+            import matplotlib.ticker as mticker
+
+            ax.set_xlim(0.0, 1.0)  # uncertainties are normalized
+            if i < n - 1:
+                # hide only the visibility of bottom labels on this axes
+                ax.tick_params(axis='x', which='both', labelbottom=False)
+                ax.set_xlabel("")
+            else:
+                ax.set_xlabel(x_label, fontsize=12)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=11))
+                ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:.1f}"))
+                ax.tick_params(axis='x', labelsize=11)
+
+        fig.suptitle(title, fontsize=18, weight="bold", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"Ridgeline plot saved to {save_path}")
+        plt.show()
+
+
 ##########################################################
 ### --- Bar chart for uncertainty vs iou per class --- ###
 ##########################################################
@@ -336,3 +543,221 @@ def plot_iou_sorted_by_uncertainty(
         plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
         print(f"Saved bar chart to {save_path}")
     plt.show()
+
+
+# ------------------------------------------------------------
+# Accuracy vs (normalized) predictive-uncertainty aggregator
+# ------------------------------------------------------------
+import torch, numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt
+
+class UncertaintyAccuracyAggregator:
+    """
+    Aggregates (uncertainty, correctness) pairs across batches for plots like:
+      - Accuracy per uncertainty bin (bar chart)
+      - Selective accuracy vs threshold (line curve; optional)
+    """
+    def __init__(self, max_samples: int | None = None, seed: int = 0):
+        self.max_samples = max_samples
+        self.rng = np.random.default_rng(seed)
+        self._uncert = torch.empty(0, dtype=torch.float32)   # values in [0,1] (normalized)
+        self._correct = torch.empty(0, dtype=torch.uint8)    # 1 = correct, 0 = incorrect
+        self._seen = 0
+
+    def reset(self):
+        self._uncert = torch.empty(0, dtype=torch.float32)
+        self._correct = torch.empty(0, dtype=torch.uint8)
+        self._seen = 0
+
+    @torch.no_grad()
+    def update(
+        self,
+        labels: torch.Tensor,       # (B,H,W) int
+        preds: torch.Tensor,        # (B,H,W) int (argmax over logits/alpha)
+        uncertainty: torch.Tensor,  # (B,H,W) float, normalized to [0,1]
+        ignore_ids=(),
+    ):
+        assert labels.shape == preds.shape == uncertainty.shape, "shapes must match"
+        lab = labels.detach().to(torch.int64).cpu().reshape(-1)
+        prd = preds.detach().to(torch.int64).cpu().reshape(-1)
+        unc = uncertainty.detach().to(torch.float32).cpu().reshape(-1).clamp_(0, 1)
+
+        if ignore_ids:
+            mask = ~torch.isin(lab, torch.tensor(list(ignore_ids), dtype=torch.int64))
+            if not mask.any():  # all ignored
+                return
+            lab, prd, unc = lab[mask], prd[mask], unc[mask]
+
+        corr = (lab == prd).to(torch.uint8)
+
+        if self.max_samples is None:
+            self._uncert = torch.cat([self._uncert, unc], dim=0)
+            self._correct = torch.cat([self._correct, corr], dim=0)
+            self._seen += unc.numel()
+            return
+
+        # Reservoir-like cap
+        n_new = unc.numel()
+        self._seen += n_new
+        if self._uncert.numel() < self.max_samples:
+            take = min(self.max_samples - self._uncert.numel(), n_new)
+            if take < n_new:
+                idx = torch.from_numpy(self.rng.choice(n_new, size=take, replace=False))
+                unc, corr = unc[idx], corr[idx]
+            self._uncert = torch.cat([self._uncert, unc], dim=0)
+            self._correct = torch.cat([self._correct, corr], dim=0)
+        else:
+            # keep each incoming with prob p ~ max/seen (approx)
+            p = min(1.0, float(self.max_samples) / float(self._seen + 1e-9))
+            keep = torch.from_numpy(self.rng.random(n_new) < p)
+            if keep.any():
+                unc, corr = unc[keep], corr[keep]
+                replace_idx = torch.from_numpy(
+                    self.rng.choice(self.max_samples, size=unc.numel(), replace=False)
+                )
+                self._uncert[replace_idx] = unc
+                self._correct[replace_idx] = corr
+
+    def as_dataframe(self) -> pd.DataFrame:
+        if self._uncert.numel() == 0:
+            return pd.DataFrame(columns=["uncertainty", "correct"])
+        return pd.DataFrame({
+            "uncertainty": self._uncert.numpy(),
+            "correct": self._correct.numpy().astype(np.int32),
+        })
+
+    # --------- computations & plots ---------
+    def binned_accuracy(self, num_bins: int = 10, bin_edges: np.ndarray | None = None) -> pd.DataFrame:
+        """
+        Returns a DataFrame with columns: bin, low, high, n, accuracy, unc_mean.
+        Keeps EMPTY bins so labels are stable (e.g., always shows [0.00,0.10)).
+        """
+        df = self.as_dataframe()
+        if df.empty:
+            return df
+
+        if bin_edges is None:
+            bin_edges = np.linspace(0.0, 1.0, num_bins + 1, dtype=np.float32)
+        else:
+            bin_edges = np.asarray(bin_edges, dtype=np.float32)
+            assert (bin_edges[0] <= 0) and (bin_edges[-1] >= 1) and np.all(np.diff(bin_edges) > 0)
+
+        # assign bin indices [0..K-1]
+        K = len(bin_edges) - 1
+        bins = np.digitize(df["uncertainty"].to_numpy(), bin_edges[1:-1], right=False)
+        # make it categorical with ALL bins so empty ones don't disappear
+        df["bin"] = pd.Categorical(bins, categories=np.arange(K), ordered=True)
+
+        grouped = (
+            df.groupby("bin", observed=False)
+            .agg(n=("correct", "size"),
+                accuracy=("correct", "mean"),
+                unc_mean=("uncertainty", "mean"))
+            .reset_index()
+        )
+
+        lows, highs = bin_edges[:-1], bin_edges[1:]
+        grouped["low"]  = grouped["bin"].astype(int).map({i: lows[i]  for i in range(K)})
+        grouped["high"] = grouped["bin"].astype(int).map({i: highs[i] for i in range(K)})
+        grouped["label"] = grouped.apply(lambda r: f"[{r.low:.2f}, {r.high:.2f})", axis=1)
+
+        # empty bins: keep n=0 and show accuracy as NaN
+        grouped.loc[grouped["n"] == 0, ["accuracy", "unc_mean"]] = np.nan
+
+        return grouped.sort_values("low").reset_index(drop=True)
+
+
+    def plot_accuracy_vs_uncertainty_bins(
+        self,
+        num_bins: int = 10,
+        bin_edges: np.ndarray | None = None,
+        figsize=(14, 5),
+        title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
+        x_label="Normalized predictive-entropy bin",
+        y_label="Accuracy",
+        annotate_counts: bool = True,
+        counts_at: str = "bottom",  # "bottom" or "top"
+        save_path: str | None = None,
+        dpi: int = 200,
+    ):
+        stats = self.binned_accuracy(num_bins=num_bins, bin_edges=bin_edges)
+        if stats.empty or stats["n"].sum() == 0:
+            print("No data to plot."); return
+
+        sns.set_style("whitegrid")
+        plt.figure(figsize=figsize)
+        ax = sns.barplot(data=stats, x="label", y="accuracy")
+        ax.set_ylim(0.0, 1.0)
+        ax.set_title(title, fontsize=18, weight="bold", pad=12)
+        ax.set_xlabel(x_label, fontsize=12)
+        ax.set_ylabel(y_label, fontsize=12)
+        ax.tick_params(axis="x", rotation=0)
+
+        # overall accuracy line
+        overall = float(self._correct.float().mean()) if self._correct.numel() else np.nan
+        if np.isfinite(overall):
+            ax.axhline(overall, ls="--", lw=2, color="black", alpha=0.8)
+            ax.text(len(stats) - 0.5, overall + 0.01, f"overall = {overall:.3f}",
+                    ha="right", va="bottom", fontsize=12, fontweight="bold")
+
+        # counts with underscores, positioned to avoid overlap
+        if annotate_counts:
+            y0, y1 = ax.get_ylim()
+            base = y0 + 0.02 * (y1 - y0)  # a bit above axis baseline
+            for p, n in zip(ax.patches, stats["n"].to_list()):
+                x = p.get_x() + p.get_width() / 2.0
+                if counts_at == "bottom":
+                    y = base; va = "bottom"
+                else:
+                    y = p.get_height(); va = "bottom"
+                ax.text(
+                    x, y, f"n={int(n):_}",
+                    ha="center", va=va, fontsize=9, color="black", clip_on=False
+                )
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"Saved binned accuracy plot to {save_path}")
+        else:
+            plt.show()
+
+
+    # (Optional) selective-accuracy curve: accuracy over samples with uncertainty <= τ
+    def plot_selective_accuracy(
+        self,
+        thresholds: np.ndarray | None = None,
+        figsize=(7, 5),
+        title="Selective Accuracy vs Uncertainty Threshold",
+        x_label="Threshold τ on normalized predictive entropy (accept ≤ τ)",
+        y_label="Accuracy on accepted",
+        save_path: str | None = None,
+        dpi: int = 200,
+    ):
+        df = self.as_dataframe()
+        if df.empty:
+            print("No data to plot.")
+            return
+        if thresholds is None:
+            thresholds = np.linspace(0, 1, 21)
+
+        covs, accs = [], []
+        u = df["uncertainty"].to_numpy()
+        c = df["correct"].to_numpy().astype(np.float32)
+        for t in thresholds:
+            m = u <= t
+            cov = float(m.mean())
+            covs.append(cov)
+            accs.append(float(c[m].mean()) if m.any() else np.nan)
+
+        sns.set_style("whitegrid")
+        plt.figure(figsize=figsize)
+        plt.plot(thresholds, accs, marker="o")
+        plt.ylim(0, 1)
+        plt.title(title, fontsize=15, weight="bold")
+        plt.xlabel(x_label)
+        plt.ylabel(y_label)
+        plt.grid(True, alpha=0.3)
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print(f"Saved selective-accuracy curve to {save_path}")
+        plt.show()
