@@ -134,7 +134,7 @@ color_map = {
   17: [80, 240, 150],
   18: [150, 240, 255],
   19: [250, 10, 250],
-  20: [255, 255, 255]
+  20: [255, 255, 2] # TODO: potentially for SemanticSTF [255, 255, 255]
 }
 
 color_map_reduced = {
@@ -174,6 +174,7 @@ class_names = {
   17: "terrain",
   18: "pole",
   19: "traffic-sign",
+  20: "snow"
 }
 
 # color_map = {

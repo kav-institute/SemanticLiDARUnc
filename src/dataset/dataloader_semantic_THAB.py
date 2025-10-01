@@ -12,11 +12,12 @@ except:
 
 
 class SemanticTHAB(Dataset):
-    def __init__(self, data_path, rotate=False, flip=False, id_map=id_map):
+    def __init__(self, data_path, rotate=False, flip=False, id_map=id_map, projection=None, resize=False):
         self.id_map = id_map
         self.data_path = data_path
         self.rotate = rotate
         self.flip = flip
+        self.projection=projection
         self.transforms = transforms.Compose([
             transforms.ToTensor(),
             # Add more transformations if needed
@@ -88,7 +89,7 @@ def main():
     import glob
     import cv2 
     data_path_test = [(bin_path, bin_path.replace("velodyne", "labels").replace("bin", "label")) for bin_path in sorted(glob.glob(f"/home/appuser/data/SemanticTHAB/sequences/0008/velodyne/*.bin"))]
-    depth_dataset_test = SemanticKitti(data_path_test, rotate=False, flip=False)
+    depth_dataset_test = SemanticTHAB(data_path_test, rotate=False, flip=False)
     dataloader_test = DataLoader(depth_dataset_test, batch_size=1, shuffle=False)#, num_workers=8)
 
     for batch_idx, (range_img, reflectivity, xyz, normals, semantic)  in enumerate(dataloader_test):
