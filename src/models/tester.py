@@ -16,6 +16,7 @@ from utils.mc_dropout import predictive_entropy_mc
 from models.evaluator import (
     SemanticSegmentationEvaluator,
     UncertaintyPerClassAggregator,
+    UncertaintyAccuracyAggregator,
     plot_iou_sorted_by_uncertainty
 )
 
@@ -73,9 +74,10 @@ class Tester:
         self._end = torch.cuda.Event(enable_timing=True)
         
         self.save_path = cfg["extras"].get("save_path", "")
-
+        # SemanticKitti test dataset has 95_937_758 valid lidar points not including class unlabeled
         self.evaluator = SemanticSegmentationEvaluator(self.num_classes)
         self.unc_agg = UncertaintyPerClassAggregator(num_classes=self.num_classes, max_per_class=100_000_000)  # cap is optional
+        self.ua_agg = UncertaintyAccuracyAggregator(max_samples=100_000_000)  # cap optional
 
 
         # Load checkpoint if provided
@@ -348,7 +350,12 @@ class Tester:
                     pred_entropy_norm = pred_entropy / math.log(self.num_classes)
 
                     self.unc_agg.update(labels=labels, uncertainty=pred_entropy_norm)
-
+                    self.ua_agg.update(
+                        labels=labels,
+                        preds=preds,
+                        uncertainty=pred_entropy_norm,
+                        ignore_ids=(0,),                       # ignore unlabeled if you use 0
+                    )
 
                     if do_mc_conf_acc:
                         hits, tot = compute_mc_reliability_bins(alpha, labels, n_bins=n_bins, n_samples=120)
@@ -370,13 +377,37 @@ class Tester:
         mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
         print(f"[eval] epoch {epoch + 1},  mIoU={mIoU:.4f}")
 
-        # After the loop: make the boxplot (ignore 'unlabeled' if desired)
-        self.unc_agg.plot_boxplot(
+        #--> IoU vs thresholded predictive uncertainty
+        # self.unc_agg.plot_boxplot(
+        #     class_names=list(class_names.values()),
+        #     color_map=color_map,
+        #     ignore_ids=(0,),  # ignore unlabeled
+        #     title="Normalized Uncertainty per Class (Boxplot)",
+        #     save_path="uncertainty_boxplot.png"
+        # )
+        
+        # 1: car, 6: person, 9: road, 11: sidewalk, 13: building, 15: vegetation, 17: terrain, 18: pole
+        # self.unc_agg.plot_ridgeline(
+        #     class_names=list(class_names.values()),
+        #     color_map=color_map,
+        #     ignore_ids=(0,2,3,4,5,7,8,10,12,14,16,19),  # ignore unlabeled
+        #     title="Normalized Uncertainty per Class (Ridged Plot)",
+        #     save_path="uncertainty_ridgedplot.png"
+        # )
+        self.unc_agg.plot_ridgeline_fast(
             class_names=list(class_names.values()),
             color_map=color_map,
-            ignore_ids=(0,),  # ignore unlabeled
-            title="Normalized Uncertainty per Class (Boxplot)",
-            save_path="uncertainty_boxplot.png"
+            ignore_ids=(0,2,3,4,5,7,8,10,12,14,16,19),
+            bins=100_000,                 # try 4096 if you like
+            bandwidth="scott",     # or "scott" or a float (e.g., 0.02)
+            title="Normalized Uncertainty per Class (Ridged Plot)",
+            save_path="uncertainty_ridgedplot.png",
+        )
+        
+        self.ua_agg.plot_accuracy_vs_uncertainty_bins(
+            bin_edges=np.linspace(0.0, 1.0, 11),  # 10 bins
+            title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
+            save_path="acc_vs_unc_bins.png",
         )
 
         plot_iou_sorted_by_uncertainty(
