@@ -1,14 +1,16 @@
 # path to SemanticTHAB dataset (sequences), no tailing path seperator!
 dataset_dir: "/home/devuser/workspace/data/SemanticSTF"
 dataset_name: "SemanticSTF"
-remap_adverse_label: True
+remap_adverse_label: True # when True remaps to unlabeld, if not handles it as own seperate class
 
 model_settings: {
   # Defines model backbone architecture
-  # Baseline model. type: str. options: SalsaNext | Reichert
-    baseline: "SalsaNext", 
+  # Baseline model. type: str. options: SalsaNext | Reichert | SalsaNextAdf
+    baseline: "Reichert", 
   # Backbone architecture
     model_type: "efficientnet_v2_l",
+  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf
+    loss_function: "Dirichlet",
   # Model Layer settings
   ## toggle attention block. type: bool
     attention: true,
@@ -34,7 +36,8 @@ model_settings: {
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
+    pretrained: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/Reichert/test_split_0008/efficientnet_v2_l_anmDirichlet/25-08-22_13-59-48/best_epoch_000094.pt"
+    #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
     # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
     # Reichert Dirchlet: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
     # Reichert pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
