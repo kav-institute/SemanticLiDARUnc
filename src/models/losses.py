@@ -67,7 +67,7 @@ class CrossEntropyLoss(nn.Module):
             return nn.CrossEntropyLoss(ignore_index=self.ignore_index)(outputs, labels)
         elif model_act == 'probs':
             # CE expects logits; switch to NLL over log-probs instead
-            return nn.NLLLoss(ignore_index=self.ignore_index)(torch.log(outputs.clamp_min(1e-8)), labels)
+            return nn.NLLLoss(ignore_index=self.ignore_index)(torch.log(outputs+1e-8), labels)
         elif model_act == 'log_probs':
             return nn.NLLLoss(ignore_index=self.ignore_index)(outputs, labels)
         else:
@@ -189,59 +189,10 @@ class LovaszSoftmax(nn.Module):
         return losses
 
 ####
-def flatten_probas(probas, labels, ignore=None):
-    """flattens per-pixel class probabilities and labels, removing ignore pixels"""
-    if probas.dim() == 4:  # [B,C,H,W]
-        B, C, H, W = probas.size()
-        probas = probas.permute(0, 2, 3, 1).contiguous().view(-1, C)
-    elif probas.dim() == 5:  # [B,C,D,H,W]
-        B, C, D, H, W = probas.size()
-        probas = probas.permute(0, 2, 3, 4, 1).contiguous().view(-1, C)
-    else:
-        raise ValueError("probas dim must be 4 or 5")
-    labels = labels.view(-1)
-    if ignore is None:
-        return probas, labels
-    valid = labels != ignore
-    return probas[valid], labels[valid]
 
-def lovasz_softmax_flat(probas, labels, classes='present', reduction="mean"):
-    """
-    probas: [P, C] class probabilities at each prediction (sum(row)=1)
-    labels: [P] ground truth labels {0,..,C-1}
-    """
-    if probas.numel() == 0:
-        # only void pixels
-        return probas.new_tensor(0.)
-    C = probas.size(1)
-    losses = []
-    class_to_sum = range(C) if classes in ['all', 'present'] else classes
-    for c in class_to_sum:
-        fg = (labels == c).float()  # foreground for class c
-        if classes == 'present' and fg.sum() == 0:
-            continue
-        # class c probability
-        pc = probas[:, c]
-        # errors: margin for the Lovasz extension (1 for fg, 0 for bg)
-        errors = (fg - pc).abs()
-        errors_sorted, perm = torch.sort(errors, descending=True)
-        fg_sorted = fg[perm]
-        grad = lovasz_grad(fg_sorted)
-        losses.append(torch.dot(errors_sorted, grad))
-    if not losses:  # no present classes
-        return probas.new_tensor(0.)
-    
-    losses = torch.stack(losses)
-    if reduction == 'none':
-        loss = losses
-    elif reduction == 'sum':
-        loss = losses.sum()
-    else:
-        loss = losses.mean()
-    return loss
 
 class LovaszSoftmaxStable(nn.Module):
-    def __init__(self, ignore_index=255, classes='present'):
+    def __init__(self, ignore_index=None, classes='present'):
         super().__init__()
         self.ignore_index = ignore_index
         self.classes = classes
@@ -256,8 +207,73 @@ class LovaszSoftmaxStable(nn.Module):
         else:
             raise ValueError(f"Unknown model_act: {model_act}")
         #probs = torch.softmax(outputs, dim=1)
-        probs_flat, labels_flat = flatten_probas(probs, labels.long(), ignore=self.ignore_index)
-        return lovasz_softmax_flat(probs_flat, labels_flat, classes=self.classes)
+        probs_flat, labels_flat = self.flatten_probas(probs, labels.long(), ignore=self.ignore_index)
+        return self.lovasz_softmax_flat(probs_flat, labels_flat, classes=self.classes)
+    
+    def lovasz_grad(self, gt_sorted):
+        """
+        Computes gradient of the Lovasz extension w.r.t sorted errors
+        See Alg. 1 in paper
+        """
+        p = len(gt_sorted)
+        gts = gt_sorted.sum()
+        intersection = gts - gt_sorted.float().cumsum(0)
+        union = gts + (1 - gt_sorted).float().cumsum(0)
+        jaccard = 1. - intersection / union
+        if p > 1:  # cover 1-pixel case
+            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+        return jaccard
+
+    def flatten_probas(self, probas, labels, ignore=None):
+        """flattens per-pixel class probabilities and labels, removing ignore pixels"""
+        if probas.dim() == 4:  # [B,C,H,W]
+            B, C, H, W = probas.size()
+            probas = probas.permute(0, 2, 3, 1).contiguous().view(-1, C)
+        elif probas.dim() == 5:  # [B,C,D,H,W]
+            B, C, D, H, W = probas.size()
+            probas = probas.permute(0, 2, 3, 4, 1).contiguous().view(-1, C)
+        else:
+            raise ValueError("probas dim must be 4 or 5")
+        labels = labels.view(-1)
+        if ignore is None:
+            return probas, labels
+        valid = labels != ignore
+        return probas[valid], labels[valid]
+
+    def lovasz_softmax_flat(self, probas, labels, classes='present', reduction="mean"):
+        """
+        probas: [P, C] class probabilities at each prediction (sum(row)=1)
+        labels: [P] ground truth labels {0,..,C-1}
+        """
+        if probas.numel() == 0:
+            # only void pixels
+            return probas.new_tensor(0.)
+        C = probas.size(1)
+        losses = []
+        class_to_sum = range(C) if classes in ['all', 'present'] else classes
+        for c in class_to_sum:
+            fg = (labels == c).float()  # foreground for class c
+            if classes == 'present' and fg.sum() == 0:
+                continue
+            # class c probability
+            pc = probas[:, c]
+            # errors: margin for the Lovasz extension (1 for fg, 0 for bg)
+            errors = (fg - pc).abs()
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            fg_sorted = fg[perm]
+            grad = self.lovasz_grad(fg_sorted)
+            losses.append(torch.dot(errors_sorted, grad))
+        if not losses:  # no present classes
+            return probas.new_tensor(0.)
+        
+        losses = torch.stack(losses)
+        if reduction == 'none':
+            loss = losses
+        elif reduction == 'sum':
+            loss = losses.sum()
+        else:
+            loss = losses.mean()
+        return loss
 
 # -------- Combined SalsaNext objective --------
 class SalsaNextLoss(nn.Module):
@@ -297,12 +313,13 @@ class SoftmaxHeteroscedasticLoss(torch.nn.Module):
         super(SoftmaxHeteroscedasticLoss, self).__init__()
         self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
 
-    def forward(self, outputs, targets, eps=1e-5):
+    def forward(self, outputs, targets, eps=1e-8):
         mean, var = self.adf_softmax(*outputs)
         targets = torch.nn.functional.one_hot(targets.squeeze(1), num_classes=20).permute(0,3,1,2).float()
 
         precision = 1 / (var + eps)
-        return torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
+        nll = torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
+        return nll
 
 
 ### >>> Dirichlet <<< ###
@@ -311,8 +328,221 @@ from models.probability_helper import (
     alphas_to_Dirichlet, 
     smooth_one_hot
 )
+import torch
+import torch.nn as nn
+from torch.special import digamma, gammaln as lgamma
+from models.probability_helper import get_eps_value
+
+def _beta_moment(a: torch.Tensor, b: torch.Tensor, q: float) -> torch.Tensor:
+    """
+    E[p^q] for Beta(a,b), computed in log-space:
+    E[p^q] = B(a+q, b) / B(a, b) = exp( lgamma(a+q)-lgamma(a) + lgamma(a+b)-lgamma(a+b+q) )
+    """
+    return torch.exp(lgamma(a + q) - lgamma(a) + lgamma(a + b) - lgamma(a + b + q))
+
+class DirichletLoss(nn.Module):
+    """Data-term objectives with optional separate KL prior regularizer.
+        objective: "nll" | "dce" | "imax"
+        kl_prior_mode: "evidence" | "symmetric"
+    
+    'Information Aware Max-Norm Dirichlet Networks for Predictive Uncertainty Estimation (Tsiligkaridis)'
+    https://doi.org/10.48550/arXiv.1910.04819
+        - nll: negative log-marginal likelihood
+            Dirichlet over a smoothed one-hot: fits the entire Dirichlet to match a target pseudo-distribution. 
+            It can encourage very peaky Dirichlets (high alpha_0) unless regularized carefully; 
+            when labels are noisy, the NLL can over-trust the target.
+        - dce: dirichlet cross entropy/ Bayes risk of the cross-entropy loss
+            DCE[E[-log p_y] = digamma(alpha_0) - digamma(alpha_y)
+            targets only the expected negative log-prob of the correct class; it doesn't micromanage off-class structure
+        - imax: Info-Aware Max-Norm loss, From paper
+            Let p ~ Dir(alpha), alpha0 = sum_j alpha_j, correct class = c.
+            We want the Bayes risk of ||y - p||_∞. Using Jensen + Lp relaxation:
+            R_p  =  E[ ||y - p||_∞ ]   <=   { E[ (1 - p_c)^p ] + sum_{j≠c} E[ p_j^p ] }^(1/p)
+
+            For a Dirichlet, each marginal p_j ~ Beta(a=alpha_j, b=alpha0 - alpha_j).
+
+            Beta q-th moment:
+            E[ p_j^q ] = B(a + q, b) / B(a, b) = exp( lgamma(a+q) - lgamma(a) + lgamma(a+b) - lgamma(a+b+q) )
+
+            By symmetry:
+            E[ (1 - p_c)^p ] = B(b_c + p, a_c) / B(b_c, a_c)   with a_c=alpha_c, b_c=alpha0 - alpha_c.
+
+            So the per-pixel "imax" objective is:
+
+            F = { E[(1 - p_c)^p] + sum_{j≠c} E[p_j^p] }^(1/p)
+
+            We minimize the masked mean of F over pixels.
+            Penalizes the largest competing mass instead. imax deliberately does not push the correct class to 1.0 as aggressively as NLL.
+    """
+    def __init__(self,
+                num_classes: int = 20,
+                objective: str = "nll",
+                smoothing: float = 0.25,
+                temperature: float = 1.0,
+                prior_concentration: float = 3.0,
+                # keep kl_weight here only for reference; apply it in the trainer
+                kl_weight: float = 0.0,
+                eps: float | None = None,
+                kl_prior_mode: str = "evidence",
+                ignore_index: int | None = 0,
+                p_moment: float = 4.0):
+        super().__init__()
+        assert objective in ("nll", "dce", "imax")
+        assert kl_prior_mode in ("evidence", "symmetric")
+        self.num_classes = num_classes
+        self.objective = objective
+        self.smoothing = smoothing
+        self.temperature = temperature
+        self.prior_concentration = prior_concentration
+        self.kl_weight = kl_weight    # not used internally anymore; just stored
+        self.eps = eps
+        self.kl_prior_mode = kl_prior_mode
+        self.ignore_index = ignore_index
+        self.p_moment = float(p_moment)
+
+    # ----- internals -----
+    @staticmethod
+    def _kl_map(alpha: torch.Tensor, alpha_prior: torch.Tensor) -> torch.Tensor:
+        a0  = alpha.sum(dim=1, keepdim=True)
+        a0p = alpha_prior.sum(dim=1, keepdim=True)
+        t1 = lgamma(a0) - lgamma(a0p)
+        t2 = (lgamma(alpha_prior) - lgamma(alpha)).sum(dim=1, keepdim=True)
+        t3 = ((alpha - alpha_prior) * (digamma(alpha) - digamma(a0))).sum(dim=1, keepdim=True)
+        return t1 + t2 + t3  # [B,1,H,W]
+
+    @staticmethod
+    def _dce_perpix(alpha: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        a0 = alpha.sum(dim=1)
+        ay = alpha.gather(1, y.unsqueeze(1)).squeeze(1)
+        return (digamma(a0) - digamma(ay))  # [B,H,W]
+
+    def _imax_perpix(self, alpha: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        p   = self.p_moment
+        a0  = alpha.sum(dim=1, keepdim=False)             # [B,H,W]
+        a_c = alpha.gather(1, y.unsqueeze(1)).squeeze(1)  # [B,H,W]
+        b_c = a0 - a_c                                    # [B,H,W]
+        # E[(1 - p_c)^p]
+        term_c = _beta_moment(b_c, a_c, p)
+        # sum_j E[p_j^p] - E[p_c^p]
+        a_all  = alpha                                    # [B,C,H,W]
+        b_all  = a0.unsqueeze(1) - a_all                  # [B,C,H,W]
+        ep_all = _beta_moment(a_all, b_all, p)            # [B,C,H,W]
+        ep_sum = ep_all.sum(dim=1)                        # [B,H,W]
+        ep_c   = _beta_moment(a_c, b_c, p)                # [B,H,W]
+        F = (term_c + (ep_sum - ep_c) + 1e-12).pow(1.0 / p)
+        return F
+
+    # ----- public split API -----
+    @torch.no_grad()
+    def _valid_mask(self, target: torch.Tensor) -> torch.Tensor:
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        if self.ignore_index is None:
+            return torch.ones_like(target, dtype=torch.bool)
+        return (target != self.ignore_index)
+
+    def data_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute data term only.
+        Returns a scalar (mean over valid pixels).
+        """
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        valid = self._valid_mask(target)
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
+
+        if self.objective == "dce":
+            per_pix = self._dce_perpix(alpha, target)                 # [B,H,W]
+            return (per_pix * valid.float()).sum() / valid.sum()
+
+        if self.objective == "nll":
+            dist   = alphas_to_Dirichlet(alpha)
+            tgt_sm = smooth_one_hot(torch.where(valid, target, 0),
+                                    num_classes=self.num_classes,
+                                    smoothing=self.smoothing)         # [B,C,H,W]
+            logp   = dist.log_prob(tgt_sm.permute(0, 2, 3, 1))        # [B,H,W]
+            return (-(logp) * valid.float()).sum() / valid.sum()
+
+        # "imax"
+        per_pix = self._imax_perpix(alpha, target)                    # [B,H,W]
+        return (per_pix * valid.float()).sum() / valid.sum()
+
+    def kl_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute KL prior term only.
+        Returns a scalar (mean over valid pixels).
+        """
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        valid = self._valid_mask(target)
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
+
+        if self.kl_prior_mode == "symmetric":
+            # Symmetric prior:
+            #   alpha_prior = c * 1   (each class has the same concentration = prior_concentration)
+            #   => p_hat_prior = 1/C
+            #
+            # Effect:
+            #   KL(Dir(alpha) || Dir(c*1)) penalizes BOTH:
+            #     (i) mean shift: pushes predicted mean p_hat_j = alpha_j / alpha0 towards uniform 1/C
+            #    (ii) evidence magnitude: discourages alpha0 = sum_j alpha_j from growing too large
+            #
+            # Good for: strong regularization, stabilizing training if predictions collapse.
+            # Risk: can hurt IoU on rare classes, since it pulls means toward uniform.
+            alpha_prior = torch.full_like(alpha, self.prior_concentration)
+        else:  # "evidence", tries to make the sum match self.prior_concentration while keeping the same mean, confidence regularizer
+            # Evidence prior:
+            #   alpha_prior = s * p_hat,   with p_hat = alpha / alpha0
+            #   => p_hat_prior = p_hat   (same mean as the prediction, only "strength" = s)
+            #
+            # Effect:
+            #   KL(Dir(alpha) || Dir(s * p_hat)) approx penalizes |alpha0 - s|,
+            #   i.e. how far the total evidence diverges from the target prior_concentration,
+            #   while leaving the MEAN p_hat intact.
+            #
+            # Good for: controlling overconfident alpha0 growth (calibration) without
+            # interfering with class proportions learned by the data term.
+            # This plays nicely with iMAX (mean-shaping) + Lovasz (IoU).
+            with torch.no_grad():
+                a0    = alpha.sum(dim=1, keepdim=True) + self.eps
+                p_hat = alpha / a0
+                alpha_prior = self.prior_concentration * p_hat
+
+        kl_map = self._kl_map(alpha, alpha_prior).squeeze(1)          # [B,H,W]
+        return (kl_map * valid.float()).sum() / valid.sum()
+
+    # ----- convenience wrappers (alpha or logits) -----
+    def data_from_logits(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
+        return self.data_from_alpha(alpha, target)
+
+    def kl_from_logits(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
+        return self.kl_from_alpha(alpha, target)
+
+    # ----- legacy wrappers (keep if other code still calls them) -----
+    def forward_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        data = self.data_from_alpha(alpha, target)
+        kl   = self.kl_from_alpha(alpha, target)
+        return data, kl
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
+        return self.forward_from_alpha(alpha, target)
+    
+
 class DirichletNLLLoss(nn.Module):
-    def __init__(self, smooth=0.1, eps=0.01):
+    """Probabilistic loss for semantic segmentation with Dirichlet outputs.
+    Supports two objectives:
+      - "nll":  NLL of a smoothed one-hot target under Dir(alpha).
+      - "dce":  Dirichlet cross-entropy E[-log p_y] = psi(alpha0) - psi(alpha_y).  (Recommended)
+
+    Adds a KL regularizer KL[ Dir(alpha) || Dir(prior) ] with a symmetric prior to
+    control evidence magnitude (alpha0) and prevent overconfidence.
+    """
+    def __init__(self, smooth=0.05, eps=1e-8):
 
         self.smooth = smooth
         self.eps = eps
