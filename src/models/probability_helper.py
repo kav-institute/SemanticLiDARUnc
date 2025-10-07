@@ -10,9 +10,11 @@ from scipy import special as scispecial
 from utils.agg import mean_aggregator
 
 # --------- Global parameter definitions ----------
-_NORM_MODE = "max"  # default "max" | "ref"
+_NORM_MODE = "max"          # "max" | "ref"
 _EPS: float = 1e-8          # default eps to avoid zero division
-_T: float = 1.0             # default alpha concnetration temperature scaling
+_T: float = 1.0
+# default alpha concnetration temperature scaling
+#_ALPHA_ACT: str = "exp"        # default activation function to shape logits to alpha >=1. "softplus" | "exp"
 
 def set_norm_mode(mode: str):
     global _NORM_MODE
@@ -34,6 +36,14 @@ def set_alpha_temperature(T: float):
 def get_alpha_temperature() -> float:
     return _T
 
+# def set_alpha_activation(alpha_act: str) -> None:
+#     """Set default activation used to map logits -> alpha."""
+#     global _ALPHA_ACT
+#     _ALPHA_ACT = str(alpha_act).lower()
+# def get_alpha_activation() -> str:
+#     """Get default activation used to map logits -> alpha."""
+#     return _ALPHA_ACT
+
 # --------- pyplot loader (safe, no GUI) ---------
 
 def _get_pyplot(backend: str = "Agg"):
@@ -44,10 +54,28 @@ def _get_pyplot(backend: str = "Agg"):
     return plt
 
 # ---------------- Label smoothing & Dirichlet utilities ----------------
-def smoothing_schedule(epoch, E, s0=0.20, s_min=0.05, frac=0.4):
-    import math
-    t = min(epoch/(frac*E), 1.0)
-    return s_min + (s0 - s_min) * 0.5 * (1 + math.cos(math.pi * t))
+# def smoothing_schedule(epoch, E, s0=0.25, s_min=0.05, start=0.4):
+#     import math
+#     t = min(epoch/(start*E), 1.0)
+#     return s_min + (s0 - s_min) * 0.5 * (1 + math.cos(math.pi * t))
+
+def smoothing_schedule(epoch, E, *,
+                        s0=0.25, s_min=0.15,
+                        start_frac=0.4,    # start decay at 25% of training
+                        end_frac=0.8,      # finish decay by 80% of training
+                        warmup_epochs=2):  # ignore Dirichlet during pure Lovasz warm-up
+    # convert to integer epoch boundaries and respect warm-up
+    start_ep = max(warmup_epochs, int(round(start_frac * E)))
+    end_ep   = max(start_ep + 1, int(round(end_frac * E)))
+
+    if epoch <= start_ep:
+        return s0
+    if epoch >= end_ep:
+        return s_min
+
+    # linear decay in (start_ep, end_ep)
+    t = (epoch - start_ep) / max(1, (end_ep - start_ep))
+    return s_min + (s0 - s_min) * (1.0 - t)
 
 def smooth_one_hot(targets: torch.Tensor, num_classes: int, smoothing: float = 0.25) -> torch.Tensor:
     confidence = 1.0 - smoothing
@@ -58,6 +86,45 @@ def smooth_one_hot(targets: torch.Tensor, num_classes: int, smoothing: float = 0
     return one_hot
 
 # ---------------- Logits -> Dirichlet ----------------
+# def to_alpha_concentrations(
+#     predicted_logits: torch.Tensor,
+#     T: float | None = None,
+#     eps: float | None = None,
+#     alpha_act: str | None = None,
+# ) -> torch.Tensor:
+#     # -------------------------------------------------------------
+#     # predicted_logits : [B,C,H,W]
+#     # T                : temperature (smaller -> sharper, larger -> flatter)
+#     # eps              : tiny positive to avoid exact 1.0 and log(0)
+#     # alpha_act        : 'softplus' or 'exp' (default comes from get_alpha_activation())
+#     #
+#     # Map logits -> Dirichlet concentrations alpha_j >= 1.
+#     #   - 'exp':   alpha / alpha0 ≈ softmax(z/T) with a uniform +1 pseudo-count
+#     #   - 'softplus': smoother growth of evidence (alpha_j ~ log(1+e^{z/T}) + 1)
+#     # For 'exp', subtract per-pixel max for numerical stability before exp.
+#     # -------------------------------------------------------------
+#     if alpha_act is None:
+#         alpha_act = get_alpha_activation()
+#     alpha_act = str(alpha_act).lower()
+
+#     if T is None:
+#         T = get_alpha_temperature()
+#     if eps is None:
+#         eps = get_eps_value()
+#     assert T > 0.0, "Temperature T must be > 0."
+
+#     z = predicted_logits / T
+
+#     if alpha_act == "exp":
+#         z = z - z.amax(dim=1, keepdim=True)         # stability for exp
+#         alpha = torch.exp(z) + 1.0 + eps            # alpha_j >= 1
+#     elif alpha_act == "softplus":
+#         alpha = torch.nn.functional.softplus(z) + 1.0 + eps
+#     else:
+#         raise ValueError(f"Unknown alpha_act={alpha_act!r}; use 'softplus' or 'exp'.")
+
+#     return alpha
+
 def to_alpha_concentrations(predicted_logits: torch.Tensor, T: float | None = None, eps: float | None = None) -> torch.Tensor:
     """Convert logits [B,C,H,W] -> alpha > 0 via softplus + 1; temperature T damps evidence."""
     if T is None:
@@ -115,33 +182,65 @@ def get_predictive_entropy_norm(alpha: torch.Tensor, eps: float | None = None):
     return get_predictive_entropy(alpha, eps) / math.log(C)
 
     # Aleatoric Uncertainty NORM
-def get_aleatoric_uncertainty_norm(alpha: torch.Tensor, eps: float | None = None, mode: str | None = None):
+def get_aleatoric_uncertainty_norm(alpha: torch.Tensor,
+                                eps: float | None = None,
+                                mode: str | None = None):
+    """
+    AU normalization:
+        - mode="max": AU / log(C) in [0,1]
+        - mode="ref": linear remap of AU_ref_raw to [0,1] using exact theoretical bounds:
+            AU_ref_raw = (AU - au_ref) / eu_span
+            L = -au_ref / eu_span  (value at AU=0)
+            U = 1.0                (value at AU=log C)
+            AU_ref_vis = (AU_ref_raw - L) / (U - L) in [0,1]
+    """
     if eps is None:
         eps = get_eps_value()
     C = alpha.shape[1]
     AU = get_aleatoric_uncertainty(alpha, eps)
     m = get_norm_mode() if mode is None else mode
+
     if m == "max":
         return (AU / math.log(C)).clamp(0.0, 1.0)
+
     elif m == "ref":
-        au_ref = _au_ref(C, alpha.device)
-        eu_span = _eu_span_ref(C, alpha.device).clamp_min(eps)
-        return ((AU - au_ref) / eu_span).clamp(0.0, 1.0)
+        # raw signed "ref" scale
+        au_ref = _au_ref(C, alpha.device)                     # psi(C+1) - psi(2) = H_C - 1
+        eu_span = _eu_span_ref(C, alpha.device).clamp_min(eps) # log(C) - au_ref
+        au_ref_raw = (AU - au_ref) / eu_span                  # can be negative
+
+        # exact linear map to [0,1] using the theoretical min/max
+        L = -au_ref / eu_span                                 # value at AU = 0
+        U = 1.0                                               # value at AU = log(C)
+        return ((au_ref_raw - L) / (U - L)).clamp(0.0, 1.0)
+
     else:
         raise ValueError(f"Unknown mode: {m}")
 
     # Epistemic Uncertainty NORM
-def get_epistemic_uncertainty_norm(alpha: torch.Tensor, eps: float | None = None, mode: str | None = None):
+def get_epistemic_uncertainty_norm(alpha: torch.Tensor,
+                                eps: float | None = None,
+                                mode: str | None = None):
+    """
+    EU normalization:
+        - mode="max": EU / log(C) in [0,1]
+        - mode="ref": define as the complement to AU_ref_vis so that AU_ref_vis + EU_ref_vis = 1.
+                    This shares the same scale and keeps visual comparability.
+    """
     if eps is None:
         eps = get_eps_value()
     C = alpha.shape[1]
-    EU = get_epistemic_uncertainty(alpha, eps)
     m = get_norm_mode() if mode is None else mode
+
     if m == "max":
+        EU = get_epistemic_uncertainty(alpha, eps)
         return (EU / math.log(C)).clamp(0.0, 1.0)
+
     elif m == "ref":
-        eu_span = _eu_span_ref(C, alpha.device).clamp_min(eps)
-        return (EU / eu_span).clamp(0.0, 1.0)
+        # Reuse the exact AU_ref mapping and take complement.
+        AU_vis = get_aleatoric_uncertainty_norm(alpha, eps=eps, mode="ref")
+        return (1.0 - AU_vis).clamp(0.0, 1.0)
+
     else:
         raise ValueError(f"Unknown mode: {m}")
 
@@ -178,8 +277,14 @@ def get_eu_minus_au_fraction(alpha: torch.Tensor, eps: float | None = None, min_
 
 # --------------- Visualization helpers ---------------
 
-def _to_img_from_map_any(m: torch.Tensor, idx: int, clip=(0.02, 0.98), cmap=cv2.COLORMAP_TURBO):
-    x = m[idx].detach().cpu().float().numpy()
+def _to_img_from_map_any(m: torch.Tensor, idx: int, clip=(0.02, 0.98), cmap=cv2.COLORMAP_TURBO, mask: np.ndarray | None = None):
+    if m.dim()==3:
+        x = m[idx].detach().cpu().float().numpy()
+    elif m.dim()==2:
+        x = m.detach().cpu().float().numpy()
+    else:
+        raise ValueError(f"map must be [H,W], or [B,H,W] got {m.shape}")
+    
     if x.ndim == 3 and x.shape[0] == 1:
         x = x[0]
     if x.ndim != 2:
@@ -188,21 +293,34 @@ def _to_img_from_map_any(m: torch.Tensor, idx: int, clip=(0.02, 0.98), cmap=cv2.
     if hi <= lo:
         lo, hi = x.min(), x.max() + 1e-6
     x = np.clip((x - lo) / (hi - lo + 1e-12), 0, 1)
-    return cv2.applyColorMap((x * 255).astype(np.uint8), cmap)
+    
+    img = cv2.applyColorMap((x * 255).astype(np.uint8), cmap)
+    if mask is not None:
+        img[mask[:, 0], mask[:, 1]] = [0,0,0]
+    return img
 
+def _to_img_signed_any(m: torch.Tensor, idx: int, clip=(-1.0, 1.0), cmap=cv2.COLORMAP_TURBO, mask: np.ndarray | None = None):
+    if m.dim()==3:
+        x = m[idx].detach().cpu().float().numpy()
+    elif m.dim()==2:
+        x = m.detach().cpu().float().numpy()
+    else:
+        raise ValueError(f"map must be [H,W], or [B,H,W] got {m.shape}")
 
-def _to_img_signed_any(m: torch.Tensor, idx: int, clip=(-1.0, 1.0), cmap=cv2.COLORMAP_TURBO):
-    x = m[idx].detach().cpu().float().numpy()
     if x.ndim == 3 and x.shape[0] == 1:
         x = x[0]
     if x.ndim != 2:
         raise ValueError(f"signed map must be [H,W], got {x.shape}")
     lo, hi = clip
     x = np.clip((x - lo) / (hi - lo + 1e-12), 0, 1)
-    return cv2.applyColorMap((x * 255).astype(np.uint8), cmap)
+    
+    img = cv2.applyColorMap((x * 255).astype(np.uint8), cmap)
+    if mask is not None:
+        img[mask[:, 0], mask[:, 1]] = [0,0,0]
+    return img
 
 
-def build_uncertainty_layers(alpha: torch.Tensor, names: list, idx: int = 0, h_mask_thresh: float = 0.0, eps: float | None = None) -> dict:
+def build_uncertainty_layers(alpha: torch.Tensor, names: list, idx: int = 0, h_mask_thresh: float = 0.0, eps: float | None = None, mask: np.ndarray | None = None) -> dict:
     if eps is None:
         eps = get_eps_value()
     out = {}
@@ -215,34 +333,34 @@ def build_uncertainty_layers(alpha: torch.Tensor, names: list, idx: int = 0, h_m
     need_diff = "EU_minus_AU_frac" in names
 
     Hn = AUn = EUn = None
-    if need_Hn: Hn = get_predictive_entropy_norm(alpha, eps)
-    if need_AUn: AUn = get_aleatoric_uncertainty_norm(alpha, eps)
-    if need_EUn: EUn = get_epistemic_uncertainty_norm(alpha, eps)
+    if need_Hn: Hn = get_predictive_entropy_norm(alpha[idx][None, ...], eps)
+    if need_AUn: AUn = get_aleatoric_uncertainty_norm(alpha[idx][None, ...], eps)
+    if need_EUn: EUn = get_epistemic_uncertainty_norm(alpha[idx][None, ...], eps)
 
     if need_a0:
-        a0 = alpha.sum(dim=1, keepdim=True) + eps
-        out["alpha0"] = _to_img_from_map_any(a0, idx)
+        a0 = alpha.sum(dim=1, keepdim=True)[idx] + eps
+        out["alpha0"] = _to_img_from_map_any(a0, idx, mask=mask)
 
     if need_AUf or need_EUf or need_diff:
-        H = get_predictive_entropy(alpha, eps)
-        AU = get_aleatoric_uncertainty(alpha, eps)
+        H = get_predictive_entropy(alpha[idx][None, ...], eps)
+        AU = get_aleatoric_uncertainty(alpha[idx][None, ...], eps)
         EU = H - AU
         denom = torch.clamp(H, min=1e-6)
         if need_AUf:
             AU_frac = (AU / denom).clamp(0.0, 1.0)
-            out["AU_frac"] = _to_img_from_map_any(AU_frac, idx)
+            out["AU_frac"] = _to_img_from_map_any(AU_frac, idx, mask=mask)
         if need_EUf:
             EU_frac = (EU / denom).clamp(0.0, 1.0)
-            out["EU_frac"] = _to_img_from_map_any(EU_frac, idx)
+            out["EU_frac"] = _to_img_from_map_any(EU_frac, idx, mask=mask)
         if need_diff:
             EU_frac = (EU / denom).clamp(0.0, 1.0)
             AU_frac = (AU / denom).clamp(0.0, 1.0)
             diff = (EU_frac - AU_frac).clamp(-1.0, 1.0)
-            out["EU_minus_AU_frac"] = _to_img_signed_any(diff, idx, clip=(-1.0, 1.0))
+            out["EU_minus_AU_frac"] = _to_img_signed_any(diff, idx, clip=(-1.0, 1.0), mask=mask)
 
-    if need_Hn: out["H_norm"] = _to_img_from_map_any(Hn, idx)
-    if need_AUn: out["AU_norm"] = _to_img_from_map_any(AUn, idx)
-    if need_EUn: out["EU_norm"] = _to_img_from_map_any(EUn, idx)
+    if need_Hn: out["H_norm"] = _to_img_from_map_any(Hn, idx, mask=mask)
+    if need_AUn: out["AU_norm"] = _to_img_from_map_any(AUn, idx, mask=mask)
+    if need_EUn: out["EU_norm"] = _to_img_from_map_any(EUn, idx, mask=mask)
     return out
 
 # ---------------- Reliability & calibration helpers ----------------
@@ -359,3 +477,37 @@ def compute_entropy_reliability(entropy_norm: torch.Tensor, error_mask: torch.Te
         err_rate.detach().cpu().numpy(),
         float(ece),
     )
+
+# Shannon Entropy from logits and variance (used for SalsaNextAdf)
+@torch.no_grad()
+def predictive_entropy_from_logistic_normal(
+    logits_mean: torch.Tensor,      # [B,C,H,W]
+    logits_var: torch.Tensor,       # [B,C,H,W]
+    K: int = 16,
+    T: float = 1.0,
+    eps: float = 1e-8,
+):
+    B, C, H, W = logits_mean.shape
+    assert logits_var.shape == logits_mean.shape, f"var shape {logits_var.shape} != mean shape {logits_mean.shape}"
+
+    std = (logits_var.clamp_min(0.0) + eps).sqrt()
+
+    # [K,B,C,H,W]
+    noise = torch.randn((K, B, C, H, W), device=logits_mean.device, dtype=logits_mean.dtype)
+    logits_samples = (logits_mean.unsqueeze(0) + noise * std.unsqueeze(0)) / max(T, eps)
+    assert logits_samples.shape == (K, B, C, H, W)
+
+    # softmax over class dim (C is dim=2 in [K,B,C,H,W])
+    probs = torch.softmax(logits_samples, dim=2)
+    assert probs.shape == (K, B, C, H, W)
+
+    # average over samples K only
+    p_bar = probs.mean(dim=0)                 # [B,C,H,W]
+    assert p_bar.shape == (B, C, H, W)
+
+    # entropy over classes (dim=1)
+    H_pred = -(p_bar.clamp_min(eps).log() * p_bar).sum(dim=1)  # [B,H,W]
+    assert H_pred.shape == (B, H, W)
+
+    H_norm = H_pred / math.log(C)             # [B,H,W]
+    return H_pred, H_norm
