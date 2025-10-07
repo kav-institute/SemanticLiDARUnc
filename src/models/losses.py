@@ -306,271 +306,609 @@ class SalsaNextLoss(nn.Module):
 
         return loss_ce + loss_ls    #, {"ce": loss_ce.detach(), "lovasz": loss_ls.detach()}
 
+# from baselines.SalsaNext import adf
+# class SoftmaxHeteroscedasticLoss(torch.nn.Module):
+#     """Source from SalsaNext github repo: 
+#         https://github.com/TiagoCortinhal/SalsaNext/blob/7548c124b48f0259cdc40e98dfc3aeeadca6070c/train/tasks/semantic/modules/trainer.py#L37
+
+#         Added ignore index funtionality
+#     """
+#     def __init__(self, num_classes: int = 20, ignore_index: int | None = None):
+#         super().__init__()
+#         self.num_classes = num_classes
+#         self.ignore_index = ignore_index
+#         self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=lambda x: x+1e-3)
+
+#     def forward(self, outputs, targets, eps: float = 1e-5):
+#         """
+#         Original objective:
+#             L = mean( 0.5*((y - mu)^2 / (var + eps)) + 0.5*log(var + eps) )
+#         but exclude all pixels where targets == ignore_index.
+
+#         outputs: tuple(mean_logits, var_logits) -> passed through adf softmax
+#         targets: [B,H,W] or [B,1,H,W] with integer labels
+#         """
+#         mean, var = self.adf_softmax(*outputs)     # [B,C,H,W]
+
+#         # targets -> [B,H,W]
+#         if targets.ndim == 4 and targets.size(1) == 1:
+#             tgt = targets.squeeze(1)
+#         else:
+#             tgt = targets
+
+#         # mask valid pixels
+#         valid_mask = (tgt != self.ignore_index)    # [B,H,W]
+#         if not valid_mask.any():
+#             # no valid pixels — return 0 with grad
+#             return torch.tensor(0.0, device=targets.device, dtype=mean.dtype, requires_grad=True)
+
+#         # one-hot, with dummy label for ignored pixels (they'll be masked out)
+#         safe_tgt = tgt.clone()
+#         safe_tgt[~valid_mask] = 0
+#         one_hot = F.one_hot(safe_tgt, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+
+#         # per-element loss (same as original)
+#         precision = 1.0 / (var + eps)
+#         per_elem = 0.5 * precision * (one_hot - mean) ** 2 + 0.5 * torch.log(var + eps)  # [B,C,H,W]
+
+#         # exclude all class channels at ignored pixels (exactly remove those elements from the global mean)
+#         mask_bc = valid_mask.unsqueeze(1).expand_as(per_elem)  # [B,C,H,W]
+#         loss = per_elem[mask_bc].mean()
+
+#         return loss
+
 from baselines.SalsaNext import adf
+import torch
+import torch.nn.functional as F
+
 class SoftmaxHeteroscedasticLoss(torch.nn.Module):
-    # L = 0.5 * ((y - mu)**2 / (var + eps)) + 0.5 * log(var + eps)
-    def __init__(self, num_classes):
-        super(SoftmaxHeteroscedasticLoss, self).__init__()
-        self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
+    def __init__(self, num_classes: int = 20, ignore_index: int | None = None):
+        super().__init__()
+        self.num_classes  = num_classes
+        self.ignore_index = ignore_index
+        # USE GLOBAL KEEPER (softplus + cap) — not lambda x: x+const
+        self.adf_softmax  = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
 
-    def forward(self, outputs, targets, eps=1e-8):
-        mean, var = self.adf_softmax(*outputs)
-        targets = torch.nn.functional.one_hot(targets.squeeze(1), num_classes=20).permute(0,3,1,2).float()
+    def forward(self, outputs, targets, eps: float = 1e-6):
+        # outputs: (mean_logits, var_logits)
+        mean, var = self.adf_softmax(*outputs)        # [B,C,H,W]
 
-        precision = 1 / (var + eps)
-        nll = torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
-        return nll
+        # harden numerics
+        mean = mean.clamp(min=1e-7, max=1 - 1e-7)
+        var  = torch.clamp(var, min=1e-6, max=10.0)   # keep in the same range as the model
+
+        # targets -> [B,H,W]
+        if targets.ndim == 4 and targets.size(1) == 1:
+            tgt = targets.squeeze(1)
+        else:
+            tgt = targets
+
+        valid_mask = tgt != self.ignore_index if self.ignore_index is not None else torch.ones_like(tgt, dtype=torch.bool)
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=targets.device, dtype=mean.dtype, requires_grad=True)
+
+        safe_tgt = tgt.clone()
+        safe_tgt[~valid_mask] = 0
+        one_hot = F.one_hot(safe_tgt, num_classes=self.num_classes).permute(0,3,1,2).to(mean.dtype)
+
+        # NLL-style heteroscedastic term (per class, masked)
+        precision = torch.reciprocal(var)             # safe because of clamp above
+        per_elem  = 0.5 * precision * (one_hot - mean) ** 2 + 0.5 * torch.log(var)
+
+        mask_bc = valid_mask.unsqueeze(1).expand_as(per_elem)
+        return per_elem[mask_bc].mean()
+
+# Source from SalsaNext github repo: 
+# https://github.com/TiagoCortinhal/SalsaNext/blob/7548c124b48f0259cdc40e98dfc3aeeadca6070c/train/tasks/semantic/modules/trainer.py#L37
+
+# class SoftmaxHeteroscedasticLoss(torch.nn.Module):
+#     # L = 0.5 * ((y - mu)**2 / (var + eps)) + 0.5 * log(var + eps)
+#     def __init__(self, num_classes):
+#         super(SoftmaxHeteroscedasticLoss, self).__init__()
+#         self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
+
+#     def forward(self, outputs, targets, eps=1e-8):
+#         mean, var = self.adf_softmax(*outputs)
+#         targets = torch.nn.functional.one_hot(targets.squeeze(1), num_classes=20).permute(0,3,1,2).float()
+
+#         precision = 1 / (var + eps)
+#         nll = torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
+#         return nll
 
 
 ### >>> Dirichlet <<< ###
-from models.probability_helper import (
-    to_alpha_concentrations, 
-    alphas_to_Dirichlet, 
-    smooth_one_hot
-)
+import math
 import torch
 import torch.nn as nn
-from torch.special import digamma, gammaln as lgamma
-from models.probability_helper import get_eps_value
+from typing import Iterable, Union
+from torch.special import digamma, gammaln as lgamma, polygamma
+
+# ----------------- helpers -----------------
+
+def _valid_mask(target: torch.Tensor, ignore_index: int | None) -> torch.Tensor:
+    """
+    Build a boolean mask of valid pixels.
+    target: [B,H,W] or [B,1,H,W]
+    """
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    if ignore_index is None:
+        return torch.ones_like(target, dtype=torch.bool)
+    return (target != ignore_index)
 
 def _beta_moment(a: torch.Tensor, b: torch.Tensor, q: float) -> torch.Tensor:
     """
-    E[p^q] for Beta(a,b), computed in log-space:
-    E[p^q] = B(a+q, b) / B(a, b) = exp( lgamma(a+q)-lgamma(a) + lgamma(a+b)-lgamma(a+b+q) )
+    E[p^q] for Beta(a,b) = B(a+q,b) / B(a,b) computed in log-space:
+    exp(lgamma(a+q) - lgamma(a) + lgamma(a+b) - lgamma(a+b+q))
     """
     return torch.exp(lgamma(a + q) - lgamma(a) + lgamma(a + b) - lgamma(a + b + q))
 
-class DirichletLoss(nn.Module):
-    """Data-term objectives with optional separate KL prior regularizer.
-        objective: "nll" | "dce" | "imax"
-        kl_prior_mode: "evidence" | "symmetric"
-    
-    'Information Aware Max-Norm Dirichlet Networks for Predictive Uncertainty Estimation (Tsiligkaridis)'
-    https://doi.org/10.48550/arXiv.1910.04819
-        - nll: negative log-marginal likelihood
-            Dirichlet over a smoothed one-hot: fits the entire Dirichlet to match a target pseudo-distribution. 
-            It can encourage very peaky Dirichlets (high alpha_0) unless regularized carefully; 
-            when labels are noisy, the NLL can over-trust the target.
-        - dce: dirichlet cross entropy/ Bayes risk of the cross-entropy loss
-            DCE[E[-log p_y] = digamma(alpha_0) - digamma(alpha_y)
-            targets only the expected negative log-prob of the correct class; it doesn't micromanage off-class structure
-        - imax: Info-Aware Max-Norm loss, From paper
-            Let p ~ Dir(alpha), alpha0 = sum_j alpha_j, correct class = c.
-            We want the Bayes risk of ||y - p||_∞. Using Jensen + Lp relaxation:
-            R_p  =  E[ ||y - p||_∞ ]   <=   { E[ (1 - p_c)^p ] + sum_{j≠c} E[ p_j^p ] }^(1/p)
-
-            For a Dirichlet, each marginal p_j ~ Beta(a=alpha_j, b=alpha0 - alpha_j).
-
-            Beta q-th moment:
-            E[ p_j^q ] = B(a + q, b) / B(a, b) = exp( lgamma(a+q) - lgamma(a) + lgamma(a+b) - lgamma(a+b+q) )
-
-            By symmetry:
-            E[ (1 - p_c)^p ] = B(b_c + p, a_c) / B(b_c, a_c)   with a_c=alpha_c, b_c=alpha0 - alpha_c.
-
-            So the per-pixel "imax" objective is:
-
-            F = { E[(1 - p_c)^p] + sum_{j≠c} E[p_j^p] }^(1/p)
-
-            We minimize the masked mean of F over pixels.
-            Penalizes the largest competing mass instead. imax deliberately does not push the correct class to 1.0 as aggressively as NLL.
+def _kl_map(alpha: torch.Tensor, alpha_prior: torch.Tensor) -> torch.Tensor:
     """
-    def __init__(self,
-                num_classes: int = 20,
-                objective: str = "nll",
-                smoothing: float = 0.25,
-                temperature: float = 1.0,
-                prior_concentration: float = 3.0,
-                # keep kl_weight here only for reference; apply it in the trainer
-                kl_weight: float = 0.0,
-                eps: float | None = None,
-                kl_prior_mode: str = "evidence",
-                ignore_index: int | None = 0,
-                p_moment: float = 4.0):
+    KL(Dir(alpha) || Dir(alpha_prior)) per-pixel map.
+    Shapes:
+      alpha, alpha_prior: [B,C,H,W]
+    Returns:
+      [B,H,W]
+    Formula:
+      KL = logGamma(a0) - sum_i logGamma(ai)
+           - (logGamma(a0p) - sum_i logGamma(aip))
+           + sum_i (ai - aip) * (digamma(ai) - digamma(a0))
+    where a0 = sum_i ai, a0p = sum_i aip.
+    """
+    a0  = alpha.sum(dim=1, keepdim=True)
+    a0p = alpha_prior.sum(dim=1, keepdim=True)
+    t1 = lgamma(a0) - lgamma(a0p)
+    t2 = (lgamma(alpha_prior) - lgamma(alpha)).sum(dim=1, keepdim=True)
+    t3 = ((alpha - alpha_prior) * (digamma(alpha) - digamma(a0))).sum(dim=1, keepdim=True)
+    return (t1 + t2 + t3).squeeze(1)  # [B,H,W]
+
+# ----------------- objectives (alpha-only) -----------------
+
+def dce_from_alpha(alpha: torch.Tensor, target: torch.Tensor,
+                   ignore_index: int | None = 0) -> torch.Tensor:
+    """
+    Dirichlet expected cross-entropy:
+      E[-log p_y] = digamma(alpha0) - digamma(alpha_y)
+    Returns masked mean scalar.
+    """
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+    a0 = alpha.sum(dim=1)                                # [B,H,W]
+    ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1) # [B,H,W]
+    per_pix = (digamma(a0) - digamma(ay))
+    return (per_pix * valid.float()).sum() / valid.sum()
+
+def nll_from_alpha(alpha: torch.Tensor, target: torch.Tensor,
+                   num_classes: int, smoothing: float = 0.25,
+                   ignore_index: int | None = 0, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Dirichlet negative log-likelihood (density) at a point x on the simplex:
+      -log Dir(x; alpha) = -( logGamma(a0) - sum_i logGamma(ai) + sum_i (ai - 1) * log(xi) )
+    Here x is a smoothed one-hot target.
+    Returns masked mean scalar.
+    """
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]  # [B,H,W]
+
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+
+    # Build smoothed one-hot x (strictly positive). Confidence on target index is (1 - smoothing).
+    conf = 1.0 - smoothing
+    low  = smoothing / (num_classes - 1)
+    B, C, H, W = alpha.shape
+    x = torch.full((B, C, H, W), low, device=alpha.device, dtype=alpha.dtype)
+    x.scatter_(1, target.unsqueeze(1), conf)
+    log_x = torch.log(x.clamp_min(eps))  # safe log
+
+    # log Dir(alpha) at x
+    a0   = alpha.sum(dim=1)                           # [B,H,W]
+    logZ = lgamma(a0) - lgamma(alpha).sum(dim=1)      # [B,H,W]
+    logp = logZ + ((alpha - 1.0) * log_x).sum(dim=1)  # [B,H,W]
+
+    # masked mean of -logp
+    return (-(logp) * valid.float()).sum() / valid.sum()
+
+def nll_dirichlet_categorical(alpha: torch.Tensor, target: torch.Tensor,
+                            ignore_index: int | None = 0, eps: float = 1e-12) -> torch.Tensor:
+    # Dirichlet-categorical marginal likelihood for a one-hot label
+    # -log E[p_y] = -log(alpha_y / alpha0)
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+    a0 = alpha.sum(dim=1)                                # [B,H,W]
+    ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1) # [B,H,W]
+    per_pix = -(torch.log(ay + eps) - torch.log(a0 + eps))
+    return (per_pix * valid.float()).sum() / valid.sum()
+
+# class_weights: tensor[C], e.g. w_c = 1 / sqrt(freq_c + eps), then normalize to mean 1
+def nll_dirichlet_categorical_weighted(alpha, target, class_weights, ignore_index: int | None = 0, eps=1e-12):
+    if target.dim()==4 and target.size(1)==1: target = target[:,0]
+    valid = (target != ignore_index) if ignore_index is not None else torch.ones_like(target, dtype=torch.bool)
+    a0 = alpha.sum(dim=1)
+    ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1)
+    per = -(torch.log(ay+eps) - torch.log(a0+eps))
+    w = class_weights.to(alpha.device)[target].clamp_min(1e-3)
+    num = (per * w * valid).sum()
+    den = (w * valid).sum().clamp_min(1.0)
+    return num / den
+
+def imax_from_alpha(alpha: torch.Tensor, target: torch.Tensor,
+                    p_moment: float = 2.0,
+                    ignore_index: int | None = 0) -> torch.Tensor:
+    """
+    iMAX upper bound objective on ||y - p||_inf using Beta moments.
+    For p ~ Dir(alpha), p_j ~ Beta(alpha_j, alpha0 - alpha_j).
+      E[p_j^q] = B(alpha_j + q, alpha0 - alpha_j) / B(alpha_j, alpha0 - alpha_j)
+      E[(1 - p_c)^q] = B((alpha0 - alpha_c) + q, alpha_c) / B(alpha0 - alpha_c, alpha_c)
+    We compute:
+      F = { E[(1 - p_c)^p] + sum_j E[p_j^p] - E[p_c^p] }^(1/p)
+    Return masked mean scalar.
+    """
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+
+    p   = float(p_moment)
+    a0  = alpha.sum(dim=1)                                # [B,H,W]
+    ac  = alpha.gather(1, target.unsqueeze(1)).squeeze(1) # [B,H,W]
+    bc  = a0 - ac
+    # E[(1 - p_c)^p]
+    term_c = _beta_moment(bc, ac, p)
+    # sum_j E[p_j^p] - E[p_c^p]
+    a_all  = alpha
+    b_all  = a0.unsqueeze(1) - a_all
+    ep_all = _beta_moment(a_all, b_all, p)       # [B,C,H,W]
+    ep_sum = ep_all.sum(dim=1)                   # [B,H,W]
+    ep_c   = _beta_moment(ac, bc, p)             # [B,H,W]
+    per_pix = (term_c + (ep_sum - ep_c) + 1e-12).pow(1.0 / p)
+    return (per_pix * valid.float()).sum() / valid.sum()
+
+# ----------------- regularizers (alpha-only) -----------------
+
+def kl_evidence_from_alpha(alpha: torch.Tensor, s: float,
+                           mask: torch.Tensor | None = None,
+                           eps: float = 1e-8) -> torch.Tensor:
+    """
+    Evidence prior: KL( Dir(alpha) || Dir(alpha_prior) ) with alpha_prior = s * p_hat,
+    where p_hat = alpha / alpha0. This penalizes the total evidence alpha0 toward s
+    while keeping the mean p_hat unchanged. KL only penalizes the magnitude and does not backprop through the prior.
+    It prevents the KL from trying to reshape the mean and keeps it focused on the total evidence alpha0.
+    If mask is provided (bool [B,H,W]), return masked mean; else global mean.
+    """
+    a0    = alpha.sum(dim=1, keepdim=True) + eps
+    with torch.no_grad():
+        p_hat = alpha / a0
+        alpha_prior = s * p_hat
+    kl_map = _kl_map(alpha, alpha_prior)  # [B,H,W]
+    if mask is None:
+        return kl_map.mean()
+    return (kl_map * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+def kl_sym_from_alpha(alpha: torch.Tensor, c: float,
+                      mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Symmetric prior: KL( Dir(alpha) || Dir(c * 1) ).
+    Penalizes both mean shift (toward uniform) and evidence magnitude.
+    If mask is provided (bool [B,H,W]), return masked mean; else global mean.
+    """
+    alpha_prior = torch.full_like(alpha, c)
+    kl_map = _kl_map(alpha, alpha_prior)
+    if mask is None:
+        return kl_map.mean()
+    return (kl_map * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+def info_reg_from_alpha(alpha: torch.Tensor, target: torch.Tensor,
+                        ignore_index: int | None = 0) -> torch.Tensor:
+    """
+    Information regularizer (Tsiligkaridis):
+      R = 0.5 * sum_{j != c} (alpha_j - 1)^2 * [ trigamma(alpha_j) - trigamma(tilde_alpha0) ]
+    where tilde_alpha0 = 1 + sum_{k != c} alpha_k.
+    Returns masked mean scalar.
+    """
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+
+    B, C, H, W = alpha.shape
+    oh = torch.zeros((B, C, H, W), device=alpha.device, dtype=torch.bool)
+    oh.scatter_(1, target.unsqueeze(1), True)   # one-hot ground truth
+    mask_incorrect = ~oh
+    tilde_a0 = 1.0 + (alpha * mask_incorrect.float()).sum(dim=1, keepdim=True)
+    term = (alpha - 1.0)**2 * (polygamma(1, alpha) - polygamma(1, tilde_a0))
+    per_pix = 0.5 * (term * mask_incorrect.float()).sum(dim=1)  # [B,H,W]
+    return (per_pix * valid.float()).sum() / valid.sum()
+
+# ----------------- single lightweight wrapper -----------------
+
+class DirichletCriterion(nn.Module):
+    """
+    One instance, alpha-only API.
+    You pass weights for whichever terms you want; terms with w == 0.0 are NOT computed.
+    """
+    def __init__(self, num_classes: int, ignore_index: int | None = 0,
+                 eps: float = 1e-8, prior_concentration: float = 30.0,
+                 p_moment: float = 2.0, kl_mode: str = "evidence", smoothing=0.25, nll_mode="density",
+                 comp_gamma: float=2.0, comp_tau: float=0.6, comp_sigma: float=0.1, comp_normalize: bool=True, ema_momentum: float=0.99):
         super().__init__()
-        assert objective in ("nll", "dce", "imax")
-        assert kl_prior_mode in ("evidence", "symmetric")
+        assert kl_mode in ("evidence", "symmetric")
         self.num_classes = num_classes
-        self.objective = objective
-        self.smoothing = smoothing
-        self.temperature = temperature
-        self.prior_concentration = prior_concentration
-        self.kl_weight = kl_weight    # not used internally anymore; just stored
-        self.eps = eps
-        self.kl_prior_mode = kl_prior_mode
         self.ignore_index = ignore_index
-        self.p_moment = float(p_moment)
-
-    # ----- internals -----
-    @staticmethod
-    def _kl_map(alpha: torch.Tensor, alpha_prior: torch.Tensor) -> torch.Tensor:
-        a0  = alpha.sum(dim=1, keepdim=True)
-        a0p = alpha_prior.sum(dim=1, keepdim=True)
-        t1 = lgamma(a0) - lgamma(a0p)
-        t2 = (lgamma(alpha_prior) - lgamma(alpha)).sum(dim=1, keepdim=True)
-        t3 = ((alpha - alpha_prior) * (digamma(alpha) - digamma(a0))).sum(dim=1, keepdim=True)
-        return t1 + t2 + t3  # [B,1,H,W]
-
-    @staticmethod
-    def _dce_perpix(alpha: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        a0 = alpha.sum(dim=1)
-        ay = alpha.gather(1, y.unsqueeze(1)).squeeze(1)
-        return (digamma(a0) - digamma(ay))  # [B,H,W]
-
-    def _imax_perpix(self, alpha: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        p   = self.p_moment
-        a0  = alpha.sum(dim=1, keepdim=False)             # [B,H,W]
-        a_c = alpha.gather(1, y.unsqueeze(1)).squeeze(1)  # [B,H,W]
-        b_c = a0 - a_c                                    # [B,H,W]
-        # E[(1 - p_c)^p]
-        term_c = _beta_moment(b_c, a_c, p)
-        # sum_j E[p_j^p] - E[p_c^p]
-        a_all  = alpha                                    # [B,C,H,W]
-        b_all  = a0.unsqueeze(1) - a_all                  # [B,C,H,W]
-        ep_all = _beta_moment(a_all, b_all, p)            # [B,C,H,W]
-        ep_sum = ep_all.sum(dim=1)                        # [B,H,W]
-        ep_c   = _beta_moment(a_c, b_c, p)                # [B,H,W]
-        F = (term_c + (ep_sum - ep_c) + 1e-12).pow(1.0 / p)
-        return F
-
-    # ----- public split API -----
-    @torch.no_grad()
-    def _valid_mask(self, target: torch.Tensor) -> torch.Tensor:
-        if target.dim() == 4 and target.size(1) == 1:
-            target = target[:, 0]
-        if self.ignore_index is None:
-            return torch.ones_like(target, dtype=torch.bool)
-        return (target != self.ignore_index)
-
-    def data_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute data term only.
-        Returns a scalar (mean over valid pixels).
-        """
-        if target.dim() == 4 and target.size(1) == 1:
-            target = target[:, 0]
-        valid = self._valid_mask(target)
-        if valid.sum() == 0:
-            return alpha.sum() * 0.0
-
-        if self.objective == "dce":
-            per_pix = self._dce_perpix(alpha, target)                 # [B,H,W]
-            return (per_pix * valid.float()).sum() / valid.sum()
-
-        if self.objective == "nll":
-            dist   = alphas_to_Dirichlet(alpha)
-            tgt_sm = smooth_one_hot(torch.where(valid, target, 0),
-                                    num_classes=self.num_classes,
-                                    smoothing=self.smoothing)         # [B,C,H,W]
-            logp   = dist.log_prob(tgt_sm.permute(0, 2, 3, 1))        # [B,H,W]
-            return (-(logp) * valid.float()).sum() / valid.sum()
-
-        # "imax"
-        per_pix = self._imax_perpix(alpha, target)                    # [B,H,W]
-        return (per_pix * valid.float()).sum() / valid.sum()
-
-    def kl_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute KL prior term only.
-        Returns a scalar (mean over valid pixels).
-        """
-        if target.dim() == 4 and target.size(1) == 1:
-            target = target[:, 0]
-        valid = self._valid_mask(target)
-        if valid.sum() == 0:
-            return alpha.sum() * 0.0
-
-        if self.kl_prior_mode == "symmetric":
-            # Symmetric prior:
-            #   alpha_prior = c * 1   (each class has the same concentration = prior_concentration)
-            #   => p_hat_prior = 1/C
-            #
-            # Effect:
-            #   KL(Dir(alpha) || Dir(c*1)) penalizes BOTH:
-            #     (i) mean shift: pushes predicted mean p_hat_j = alpha_j / alpha0 towards uniform 1/C
-            #    (ii) evidence magnitude: discourages alpha0 = sum_j alpha_j from growing too large
-            #
-            # Good for: strong regularization, stabilizing training if predictions collapse.
-            # Risk: can hurt IoU on rare classes, since it pulls means toward uniform.
-            alpha_prior = torch.full_like(alpha, self.prior_concentration)
-        else:  # "evidence", tries to make the sum match self.prior_concentration while keeping the same mean, confidence regularizer
-            # Evidence prior:
-            #   alpha_prior = s * p_hat,   with p_hat = alpha / alpha0
-            #   => p_hat_prior = p_hat   (same mean as the prediction, only "strength" = s)
-            #
-            # Effect:
-            #   KL(Dir(alpha) || Dir(s * p_hat)) approx penalizes |alpha0 - s|,
-            #   i.e. how far the total evidence diverges from the target prior_concentration,
-            #   while leaving the MEAN p_hat intact.
-            #
-            # Good for: controlling overconfident alpha0 growth (calibration) without
-            # interfering with class proportions learned by the data term.
-            # This plays nicely with iMAX (mean-shaping) + Lovasz (IoU).
-            with torch.no_grad():
-                a0    = alpha.sum(dim=1, keepdim=True) + self.eps
-                p_hat = alpha / a0
-                alpha_prior = self.prior_concentration * p_hat
-
-        kl_map = self._kl_map(alpha, alpha_prior).squeeze(1)          # [B,H,W]
-        return (kl_map * valid.float()).sum() / valid.sum()
-
-    # ----- convenience wrappers (alpha or logits) -----
-    def data_from_logits(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
-        return self.data_from_alpha(alpha, target)
-
-    def kl_from_logits(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
-        return self.kl_from_alpha(alpha, target)
-
-    # ----- legacy wrappers (keep if other code still calls them) -----
-    def forward_from_alpha(self, alpha: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        data = self.data_from_alpha(alpha, target)
-        kl   = self.kl_from_alpha(alpha, target)
-        return data, kl
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        alpha = to_alpha_concentrations(logits, T=self.temperature, eps=self.eps)
-        return self.forward_from_alpha(alpha, target)
-    
-
-class DirichletNLLLoss(nn.Module):
-    """Probabilistic loss for semantic segmentation with Dirichlet outputs.
-    Supports two objectives:
-      - "nll":  NLL of a smoothed one-hot target under Dir(alpha).
-      - "dce":  Dirichlet cross-entropy E[-log p_y] = psi(alpha0) - psi(alpha_y).  (Recommended)
-
-    Adds a KL regularizer KL[ Dir(alpha) || Dir(prior) ] with a symmetric prior to
-    control evidence magnitude (alpha0) and prevent overconfidence.
-    """
-    def __init__(self, smooth=0.05, eps=1e-8):
-
-        self.smooth = smooth
         self.eps = eps
-        super().__init__()
+        self.prior_concentration = float(prior_concentration)
+        self.p_moment = float(p_moment)
+        self.kl_mode = kl_mode
+        self.smoothing = smoothing
+        self.nll_mode = nll_mode # | "density" or "dircat"
+        # comp parameters
+            # - gamma (default 2.0): power on (1 - p_y). Bigger gamma focuses the penalty on very uncertain pixels (small p_y).
+            # - tau (default 0.6): center of the sigmoid gate on p_y. The term ramps up when p_y < tau. 
+            #     0.6 means "start engaging when top-class prob drops below ~60%".
+            # - sigma (default 0.1): slope of that sigmoid ramp. Smaller sigma = sharper switch. 0.1 gives a smooth but decisive transition.
+            # - s_target (default = prior_concentration): evidence target used by evidence-KL. 
+            #     Using the same value here makes the complement term small when alpha0 >> s_target (i.e., the model already has strong evidence).
+            # - normalize (default True): divides by log(C-1) so the term lies in [0,1]. This makes your global weight w_comp interpretable and stable across different C.
+        self.comp_gamma = comp_gamma
+        self.comp_tau = comp_tau
+        self.comp_sigma = comp_sigma
+        self.comp_normalize = comp_normalize
+        self.ema_momentum = ema_momentum
+        self.register_buffer("ema_counts", torch.zeros(num_classes, dtype=torch.float32))
+        self.register_buffer("class_weights", torch.ones(num_classes, dtype=torch.float32))
+    
+    @torch.no_grad()
+    def update_class_weights(self, labels, method="effective_num", beta=0.999,
+                             clip_min=0.2, clip_max=5.0):
+        # batch counts (int64!) from labels
+        if labels.dim() == 4 and labels.size(1) == 1:
+            labels = labels[:, 0]
+        flat = labels.reshape(-1)
+        if self.ignore_index is not None:
+            flat = flat[flat != self.ignore_index]
+        flat = flat.to(torch.int64)
 
-    def forward(self, predicted_logits, target, num_classes=20):
-        """
-        Dirichlet Negative Log-Likelihood loss for semantic segmentation.
+        counts = torch.bincount(flat, minlength=self.num_classes).to(self.ema_counts)
 
-        Args:
-            alpha: Tensor of shape [B, C, H, W], Dirichlet parameters (alpha > 0)
-            target: Tensor of shape [B, C, H, W], one-hot encoded ground truth
-            epsilon: Small constant for numerical stability
+        # EMA update on counts (float32)
+        m = self.ema_momentum
+        self.ema_counts.mul_(m).add_(counts.to(self.ema_counts.dtype), alpha=1.0 - m)
 
-        Returns:
-            Scalar loss value
-        """
-        # get Dirichlet distribution of NN output logits and alpha concentration parameters
-        alpha = to_alpha_concentrations(predicted_logits)
-        dist = alphas_to_Dirichlet(alpha)
+        # weights from EMA counts
+        self.class_weights = compute_class_weights_from_counts(
+            self.ema_counts, method=method, beta=beta,
+            clip_min=clip_min, clip_max=clip_max
+        )
         
-        # smooth the targets 
-        target = smooth_one_hot(target,num_classes=num_classes,smoothing=self.smooth)
+    def forward(self, alpha: torch.Tensor, target: torch.Tensor,
+                w_dce: float = 0.0, w_nll: float = 0.0, w_imax: float = 0.0,
+                w_ir: float = 0.0, w_kl: float = 0.0, w_comp: float=0.0) -> tuple[torch.Tensor, dict]:
+        """
+        Returns (total_loss, dict_of_terms). Only computes terms with weight > 0.
+        """
+        # valid mask used by all target-dependent terms and to mask KL if desired
+        if target.dim() == 4 and target.size(1) == 1:
+            tgt_hw = target[:, 0]
+        else:
+            tgt_hw = target
+        valid = _valid_mask(tgt_hw, self.ignore_index)
 
-        # Compute log probability under the Dirichlet distribution
-        log_prob = dist.log_prob(target.permute(0, 2, 3, 1))    # same shape
+        terms = {}
+        total = alpha.sum() * 0.0  # zero on correct device/dtype
 
-        # Loss is the negative log-likelihood
-        loss = -log_prob.mean()
+        if w_dce > 0.0:
+            val = dce_from_alpha(alpha, target, self.ignore_index)
+            terms["dce"] = val; total = total + w_dce * val
+        
+        if w_nll > 0.0:
+            if self.nll_mode == "dircat":
+                #val = nll_dirichlet_categorical(alpha, target, self.ignore_index, self.eps)
+                val = nll_dirichlet_categorical_weighted(alpha, target, self.class_weights, ignore_index=self.ignore_index)
+            else:  # "density"
+                val = nll_from_alpha(alpha, target, self.num_classes, self.smoothing,
+                                     self.ignore_index, self.eps)
+            terms["nll"] = val; total = total + w_nll * val
 
-        return loss
+        if w_imax > 0.0:
+            val = imax_from_alpha(alpha, target, self.p_moment, self.ignore_index)
+            terms["imax"] = val; total = total + w_imax * val
+
+        if w_ir > 0.0:
+            val = info_reg_from_alpha(alpha, target, self.ignore_index)
+            terms["ir"] = val; total = total + w_ir * val
+
+        if w_kl > 0.0:
+            if self.kl_mode == "evidence":
+                # Mask KL by valid pixels so unlabeled regions do not bias it.
+                val = kl_evidence_from_alpha(alpha, self.prior_concentration, mask=valid, eps=self.eps)
+            else:
+                val = kl_sym_from_alpha(alpha, self.prior_concentration, mask=valid)
+            terms["kl"] = val; total = total + w_kl * val
+        
+        if w_comp > 0.0:
+            val = complement_kl_uniform_from_alpha(
+                alpha, target, ignore_index=self.ignore_index, eps=self.eps,
+                gamma=self.comp_gamma, tau=self.comp_tau, sigma=self.comp_sigma,
+                s_target=self.prior_concentration, normalize=self.comp_normalize
+            )
+            terms["comp"] = val; total = total + w_comp * val
+
+        return total, terms
+
+import math
+
+@torch.no_grad()
+def compute_class_weights_from_counts(
+    counts: torch.Tensor,
+    method: str = "effective_num",
+    beta: float = 0.999,
+    clip_min: float = 0.2,
+    clip_max: float = 5.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    counts: [C] float or int, non-negative
+    returns weights [C], mean over seen classes == 1.0
+    """
+    counts = counts.to(dtype=torch.float32)
+    C = counts.numel()
+    seen = counts > 0
+
+    if method == "effective_num":
+        # Cui et al. CVPR'19  w_c ∝ (1 - beta) / (1 - beta^{n_c})
+        eff = 1.0 - torch.pow(torch.full_like(counts, beta), counts)
+        w = (1.0 - beta) / (eff + eps)
+    elif method == "inv_sqrt":
+        w = 1.0 / torch.sqrt(counts + eps)
+    elif method == "inv":
+        w = 1.0 / (counts + eps)
+    elif method == "median":
+        w = torch.zeros_like(counts)
+        if seen.any():
+            med = counts[seen].median()
+            w[seen] = med / (counts[seen] + eps)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    # unseen classes -> weight 0
+    w = torch.where(seen, w, torch.zeros_like(w))
+
+    # normalize seen-class weights to mean 1
+    if seen.any():
+        w_seen_mean = w[seen].mean()
+        w[seen] = w[seen] / (w_seen_mean + eps)
+
+    # clamp to avoid extremes
+    w.clamp_(clip_min, clip_max)
+    return w
+
+@torch.no_grad()
+def compute_class_weights_from_labels(
+    labels: torch.Tensor,
+    num_classes: int,
+    ignore_index: int | None = None,
+    method: str = "effective_num",   # "effective_num" | "inv_sqrt" | "inv" | "median"
+    beta: float = 0.999,             # used for "effective_num"
+    clip_min: float = 0.2,
+    clip_max: float = 5.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Build class weights [C] from label indices [B,H,W] or [B,1,H,W].
+    Mean(weight over seen classes) == 1.0. Unseen classes -> weight 0.
+    """
+    if labels.dim() == 4 and labels.size(1) == 1:
+        labels = labels[:, 0]                 # [B,H,W]
+    flat = labels.reshape(-1)
+
+    if ignore_index is not None:
+        flat = flat[flat != ignore_index]
+
+    # IMPORTANT: bincount needs integer indices
+    flat = flat.to(torch.int64)
+
+    counts = torch.bincount(flat, minlength=num_classes).to(
+        device=labels.device, dtype=torch.float32
+    )
+    return compute_class_weights_from_counts(
+        counts, method=method, beta=beta,
+        clip_min=clip_min, clip_max=clip_max, eps=eps
+    )
+
+
+# ============================================
+# Complement KL-to-Uniform regularizer (non-negative)
+# Acts on off-class conditional distribution to encourage uncertainty spread
+# ============================================
+
+def complement_kl_uniform_from_alpha(
+    alpha: torch.Tensor, target: torch.Tensor,
+    ignore_index: int = 0, eps: float = 1e-8,
+    gamma: float = 2.0, tau: float = 0.6, sigma: float = 0.1,
+    s_target: float | None = None, normalize: bool = True
+) -> torch.Tensor:
+    """
+    Computes R_comp = w_total * KL(tilde_p || Uniform), averaged over valid pixels.
+
+    Definitions:
+        p      = alpha / alpha0
+        S      = 1 - p_y    Bigger gamma focuses the penalty on very uncertain pixels
+        tilde_p_j = p_j / S, for j != y
+        U_j    = 1 / (C - 1)
+        KL(tilde_p || U) = sum_j tilde_p_j * log(tilde_p_j / U_j)
+                        = sum_j tilde_p_j * log(tilde_p_j) + log(C - 1)
+        w_uncert = (1 - p_y)^gamma * sigmoid((tau - p_y)/sigma)
+        w_evid   = s_target / (alpha0 + s_target)      # optional
+        w_total  = w_uncert * w_evid
+
+    parameters:
+        - gamma (default 2.0): power on (1 - p_y). Bigger gamma focuses the penalty on very uncertain pixels (small p_y).
+        - tau (default 0.6): center of the sigmoid gate on p_y. The term ramps up when p_y < tau. 
+            0.6 means "start engaging when top-class prob drops below ~60%".
+        - sigma (default 0.1): slope of that sigmoid ramp. Smaller sigma = sharper switch. 0.1 gives a smooth but decisive transition.
+        - s_target (default = prior_concentration): evidence target used by evidence-KL. 
+            Using the same value here makes the complement term small when alpha0 >> s_target (i.e., the model already has strong evidence).
+        - normalize (default True): divides by log(C-1) so the term lies in [0,1]. This makes your global weight w_comp interpretable and stable across different C.
+
+    Notes:
+        - Returns a non-negative scalar. 0 at optimum (tilde_p uniform).
+        - Scale-invariant w.r.t. alpha0 (depends on mean p only).
+        - For C <= 2 there is no "complement" distribution; returns 0.
+    """
+    # alpha: [B,C,H,W], target: [B,H,W] or [B,1,H,W]
+    # returns mean over valid pixels of w_total * KL(tilde_p || Uniform)
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    valid = _valid_mask(target, ignore_index)
+    if valid.sum() == 0:
+        return alpha.sum() * 0.0
+
+    B, C, H, W = alpha.shape
+    if C <= 2:
+        # no complement distribution in binary case
+        return alpha.sum() * 0.0
+
+    # predictive mean probs
+    a0 = alpha.sum(dim=1, keepdim=True) + eps
+    p  = alpha / a0
+    py = p.gather(1, target.unsqueeze(1)).clamp_min(eps)  # [B,1,H,W]
+
+    # build off-class conditional distribution tilde_p over C-1 classes
+    oh = torch.zeros((B, C, H, W), device=p.device, dtype=torch.bool)
+    oh.scatter_(1, target.unsqueeze(1), True)  # one-hot mask of target
+    p_off = p.masked_fill(oh, 0.0)             # zero out target class
+    S = (1.0 - py).clamp_min(eps)              # off-class mass
+    tilde = p_off / S                          # tilde_p_j = p_j / S
+
+    # KL(tilde || U), U_j = 1/(C-1)
+    # KL = sum tilde*log tilde + log(C-1), in [0, log(C-1)]
+    log_tilde = (tilde.clamp_min(eps)).log()
+    kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)   # [B,H,W] >= 0
+
+    # optional normalization to [0,1] for stable global weighting
+    if normalize:
+        kl_u = kl_u / math.log(C - 1)
+
+    # uncertainty gate: large when p_y is small, near zero when p_y ~ 1
+    w_uncert = (1.0 - py).pow(gamma).squeeze(1) * torch.sigmoid((tau - py) / sigma).squeeze(1)
+
+    # evidence gate: downweight when alpha0 is already large (confident/high-evidence)
+    if s_target is not None:
+        s_val = float(s_target)                           # ensure scalar
+        w_evid = s_val / (a0.squeeze(1) + s_val)          # in (0,1]
+        w = w_uncert * w_evid
+    else:
+        w = w_uncert
+
+    per_pix = w * kl_u                                    # >= 0
+    return (per_pix * valid.float()).sum() / valid.sum()
