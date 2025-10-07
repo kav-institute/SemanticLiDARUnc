@@ -24,6 +24,87 @@ class_names = {
   19: "traffic-sign", # True
 }
 
+import torch, numpy as np
+
+class IoUEvaluator:
+    def __init__(self, num_classes: int, device="cpu"):
+        self.C = num_classes
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.confmat = torch.zeros((self.C, self.C), dtype=torch.long, device=self.device)
+        # Rows = GT, Cols = Pred
+
+    @torch.no_grad()
+    def update(self, preds: torch.Tensor, targets: torch.Tensor):
+        """
+        preds/targets: [B,H,W] int64 with values in [0, C-1] (you can include unlabeled here).
+        We accumulate ALL pixels; ignoring can be applied later at compute time.
+        """
+        preds   = preds.to(self.device).view(-1)
+        targets = targets.to(self.device).view(-1)
+
+        # Drop anything out of range just in case
+        ok = (targets >= 0) & (targets < self.C) & (preds >= 0) & (preds < self.C)
+        if ok.any():
+            idx = targets[ok] * self.C + preds[ok]
+            cm  = torch.bincount(idx, minlength=self.C*self.C).reshape(self.C, self.C)
+            self.confmat += cm
+
+    def compute(self,
+                class_names,
+                test_mask=None,          # list/bool tensor length C; which classes to average
+                ignore_gt=None,          # list of GT labels to ignore entirely (e.g., [0, 255])
+                reduce="mean",
+                ignore_th=None           # drop classes with IoU<ignore_th from the average (optional)
+               ):
+        cm = self.confmat.clone().double()
+
+        # 1) Remove *GT rows* you want to ignore (so unlabeled pixels don’t penalize anything)
+        if ignore_gt:
+            rows = torch.tensor(ignore_gt, dtype=torch.long, device=cm.device)
+            rows = rows[(rows >= 0) & (rows < self.C)]
+            cm[rows, :] = 0.0
+
+        # 2) Per-class IoU from confusion matrix
+        TP = cm.diag()                     # true positives
+        FP = cm.sum(0) - TP                # column sum minus TP
+        FN = cm.sum(1) - TP                # row sum minus TP
+        denom = TP + FP + FN               # union
+        iou = torch.full((self.C,), float("nan"), dtype=torch.float64, device=cm.device)
+        valid = denom > 0
+        iou[valid] = TP[valid] / denom[valid]
+
+        # 3) Reporting / averaging mask (class-level)
+        if test_mask is None:
+            test_mask = torch.ones(self.C, dtype=torch.bool, device=cm.device)
+        else:
+            test_mask = torch.as_tensor(test_mask, dtype=torch.bool, device=cm.device)
+            if test_mask.numel() != self.C: raise ValueError("test_mask length != num_classes")
+
+        # Optional IoU threshold filter for the average
+        if ignore_th is not None:
+            avg_mask = test_mask & torch.isfinite(iou) & (iou >= ignore_th)
+        else:
+            avg_mask = test_mask & torch.isfinite(iou)
+
+        # Per-class dict
+        out = {}
+        for k in range(self.C):
+            name = class_names[k] if (isinstance(class_names, list) or isinstance(class_names, dict)) else class_names[str(k)]
+            out[name] = float(iou[k].item()) if torch.isfinite(iou[k]) else float("nan")
+
+        # mIoU
+        if avg_mask.any():
+            vals = iou[avg_mask].cpu().numpy()
+            mIoU = float(np.mean(vals)) if reduce == "mean" else float(np.median(vals))
+        else:
+            mIoU = float("nan")
+        out["mIoU"] = mIoU
+        return mIoU, out
+
+
 class SemanticSegmentationEvaluator:
 
     def __init__(self, num_classes, test_mask=[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]):
@@ -96,7 +177,7 @@ class SemanticSegmentationEvaluator:
                 raise NotImplementedError
         return_dict["mIoU"] = mIoU
         return mIoU, return_dict
-
+    
 
 # -------------------------------------------
 # Uncertainty per class: aggregator + boxplot
@@ -760,4 +841,4 @@ class UncertaintyAccuracyAggregator:
         if save_path:
             plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
             print(f"Saved selective-accuracy curve to {save_path}")
-        plt.show()
+        #plt.show()
