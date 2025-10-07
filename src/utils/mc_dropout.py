@@ -95,6 +95,28 @@ def mc_dropout_probs(
 
     return torch.cat(probs, dim=0)  # [T,B,C,H,W]
 
+@torch.no_grad()
+def mc_forward(
+    model: torch.nn.Module,
+    inputs,                 # whatever your model expects (list/tuple of tensors)
+    T: int = 30,            # #MC samples
+):
+    """
+    MC-dropout sampling that keeps BN frozen (model.eval()) and enables only dropout layers.
+    Returns a tensor of shape [T,B,C,H,W] with *logits*.
+
+    Pipeline per sample:
+        out = model(*inputs)            # logits OR probs OR log_probs
+    """
+    model.eval()  # keep BN frozen
+    out_tensor = []
+
+    with dropout_sampling(model, enable=True):
+        for _ in range(T):
+            out = model(*inputs)                # [B,C,H,W]
+            out_tensor.append(out.unsqueeze(0)) # [1,B,C,H,W]
+
+    return torch.cat(out_tensor, dim=0)  # [T,B,C,H,W]
 
 @torch.no_grad()
 def predictive_entropy_mc(mc_probs: torch.Tensor, eps: float = 1e-12, normalize: bool = True):
