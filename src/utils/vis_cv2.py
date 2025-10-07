@@ -42,7 +42,7 @@ def visualize_semantic_segmentation_cv2(mask, class_colors):
         vis[mask == class_id] = color
     return vis
 
-def open_window(name="inf", width=512, height=350):
+def open_window(name="inf", width=1024, height=700):
     try:
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(name, width, height)
@@ -60,20 +60,55 @@ def close_window(name="inf"):
     except cv2.error:
         pass
 
-def show_stack(images, scale=1.5, ensure_even=True, name="inf"):
+def _fit_within(h, w, max_w, max_h, scale=1.0):
+    """
+    Scale (h,w) by 'scale' but clamp to (max_w, max_h) preserving aspect ratio.
+    Returns (disp_w, disp_h, effective_scale).
+    """
+    req_w, req_h = int(round(w * scale)), int(round(h * scale))
+    if req_w == 0 or req_h == 0:
+        return 1, 1, 1.0
+    cap = min(max_w / req_w, max_h / req_h, 1.0)  # never upscale beyond requested
+    eff = scale * cap
+    return int(round(w * eff)), int(round(h * eff)), eff
+
+def show_stack(images, scale=1.5, ensure_even=True, name="inf", max_window=(1280, 800)):
     """
     images: iterable of equally-wide HxWx3 arrays
-    scale : up/downscale factor for display
+    scale : requested up/downscale for display
+    max_window: (max_width, max_height) hard cap for the window/image
     """
     img = np.vstack(images)
-    if ensure_even:                      # some WMs dislike odd sizes
+    if ensure_even:
         h, w = img.shape[:2]
         if h % 2: img = img[:-1]
         if w % 2: img = img[:, :-1]
-    if scale != 1.0:
-        h, w = img.shape[:2]
-        img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_NEAREST)
-    cv2.imshow(name, img)
-    # optional: adjust window to image size
-    cv2.resizeWindow(name, img.shape[1], img.shape[0])
-    return img
+
+    h, w = img.shape[:2]
+    disp_w, disp_h, eff = _fit_within(h, w, max_window[0], max_window[1], scale=scale)
+    if eff != 1.0:
+        img_disp = cv2.resize(img, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        img_disp = img
+
+    cv2.imshow(name, img_disp)
+    cv2.resizeWindow(name, img_disp.shape[1], img_disp.shape[0])  # keep window equal to clamped image
+    return img_disp  # (optionally inspect img_disp.shape or eff if needed)
+
+# def show_stack(images, scale=1.5, ensure_even=True, name="inf"):
+#     """
+#     images: iterable of equally-wide HxWx3 arrays
+#     scale : up/downscale factor for display
+#     """
+#     img = np.vstack(images)
+#     if ensure_even:                      # some WMs dislike odd sizes
+#         h, w = img.shape[:2]
+#         if h % 2: img = img[:-1]
+#         if w % 2: img = img[:, :-1]
+#     if scale != 1.0:
+#         h, w = img.shape[:2]
+#         img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_NEAREST)
+#     cv2.imshow(name, img)
+#     # optional: adjust window to image size
+#     cv2.resizeWindow(name, img.shape[1], img.shape[0])
+#     return img
