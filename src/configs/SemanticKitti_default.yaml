@@ -5,10 +5,10 @@ dataset_name: "SemanticKitti"
 model_settings: {
   # Defines model backbone architecture
   # Baseline model. type: str. options: SalsaNext | Reichert | SalsaNextAdf
-    baseline: "Reichert", 
+    baseline: "SalsaNext", 
   # Backbone architecture
     model_type: "efficientnet_v2_l",
-  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf
+  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf | SalsaNext
     loss_function: "Dirichlet",
   # Model Layer settings
   ## toggle attention block. type: bool
@@ -29,27 +29,50 @@ model_settings: {
   ## flip augmentation. type: bool
     flip: true,
   
-  # Toggle use of Dropout
-  use_dropout: false,
+  # Toggle use of Dropout at inference
+  use_mc_sampling: false,
+  mc_samples:  50,
 
   ## Image projection resolution
     projection: [64, 2048], # [64, 2048]
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/Reichert/test_split_0008/efficientnet_v2_l_anmDirichlet/25-09-29_22-45-44/best_epoch_000082.pt", #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/Reichert/test_split_0008/efficientnet_v2_l_anmDirichlet/25-08-22_13-59-48/best_epoch_000000.pt", #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/Reichert/test_split_0008/efficientnet_v2_l_anmDirichlet/25-08-22_13-59-48/best_epoch_000054.pt" #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
-    # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmTversky/25-07-17_12-55-47/model_final.pt"
+    pretrained: null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmDirichlet/25-10-06_11-55-00/best_epoch_000.pt" #null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmSalsaNext/25-10-02_12-34-06/model_final.pt" #null,
+    # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmSalsaNext/25-10-02_12-34-06/model_final.pt"
     # Reichert Dirchlet: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
     # Reichert pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
 }
 
+model_weights: {
+  Dirichlet: {
+    w_ls:    0.25,   # add only if you want extra IoU (on softmax probs)
+    w_nll:   1.0,  # Dirichlet-categorical NLL or density based
+    w_imax:  3.5,   # 2.0
+    w_dce:   0.0,   # 1.0
+    w_kl:    0.8,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_ir:    0.0,  # information regularization term, keeps off-class near 1
+    w_comp:  3.0    # shapes uncertainty on unsure pixels
+  },
+  SalsaNext: {
+    w_nll:   1.0, 
+    w_ls:    1.0
+  },
+  Tversky: {
+    w_ce:         1.0, 
+    w_tversky:    1.0
+  }
+}
+  
 # at 64,512: batch_size: 16, num_workers: 8
 # at 64,2048: batch_size: 6, num_workers: 16
+# for SalsaNextAdf at 64,2048: batch_size: 1, num_workers: 16
+# for SalsaNext at 64, 2048: batch_size: 8, num_workers: 16
 train_params: {
   ## learning rate for training
     learning_rate: 5.e-4,
   ## Sets batch size for training
-    batch_size: 6,  
+    batch_size: 8,  
   ## Sets numbor of worker processes
     num_workers: 16,
   ## Sets number of total training epochs
@@ -76,14 +99,3 @@ logging_settings: {
       IouPlt: true
     }
 }
-calibration: 
-  enable: false
-  run_each_eval: false      # true = refit every eval; false = fit once when T is None
-  #cache_mode: "mc"     # "default" or "mc"
-  optimizer: "lbfgs"        # "lbfgs" or "adam"
-  lr: 0.05
-  epochs: 2
-  chunk_size: 1000000
-  max_iter: 100
-  mc_samples: 30
-  save_path: ""             # optional: save {"temperature": T}

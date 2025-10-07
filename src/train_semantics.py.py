@@ -19,6 +19,8 @@ import time
 import matplotlib
 matplotlib.use("TkAgg")  # often more robust than Tk
 
+from baselines.SalsaNext import adf
+
 def count_folders(directory):
     return len([name for name in os.listdir(directory) if os.path.isdir(os.path.join(directory, name))])
 
@@ -89,6 +91,10 @@ def main(args):
         case "SemanticWADS": from dataset.dataloader_semantic_WADS import SemanticWADS as SemanticDataset
         case _: raise KeyError("in yaml config parameter dataset_name is invalid")
     
+    # TODO: Debugging only, tiny dset
+    # data_path_train=data_path_train[:10]
+    # data_path_test=data_path_test[:10]
+    
     depth_dataset_train = SemanticDataset(
                             data_path=data_path_train, 
                             rotate=cfg["model_settings"]["rotate"],
@@ -145,7 +151,7 @@ def main(args):
     elif cfg["model_settings"]["baseline"] in {"SalsaNext", "SalsaNextAdf"}:
         # import base SalsaNext or uncertainty yielding model SalsaNextAdf
         if cfg["model_settings"]["baseline"]=="SalsaNext":      from baselines.SalsaNext.SalsaNext import SalsaNext
-        elif cfg["model_settings"]["baseline"]=="SalsaNextAdf": from baselines.SalsaNext.SalsaNextAdf import SalsaNextUncertainty as SalsaNext
+        elif cfg["model_settings"]["baseline"]=="SalsaNextAdf": from baselines.SalsaNext.SalsaNextAdf import SalsaNextUncertainty as SalsaNext  # TODO: testing original version!
         
         # minimum channels=4: range image (1ch) and xyz image (3ch)
         nchannels = 4
@@ -156,6 +162,16 @@ def main(args):
         
         # Model definition
         model = SalsaNext(nclasses=cfg["extras"]["num_classes"], nchannels=nchannels)
+        
+        # SalsaNextAdf has very high vram usage, -> batch size of 1 is only possible with rtx 4090, thus remove adf.BatchNorm2d as it will introduce NaNs
+        if cfg["model_settings"]["baseline"]=="SalsaNextAdf":
+            for m in model.modules():
+                if isinstance(m, adf.BatchNorm2d):
+                    m.momentum = 0.0           # don’t change running stats
+                    m.eval()                   # forces running stats usage
+                    # keep affine trainable
+                    for p in m.parameters():
+                        p.requires_grad = True
     
     # remove activation function from last layer of decoder
     # if cfg["extras"]["loss_function"] == "Dirichlet":
@@ -171,7 +187,7 @@ def main(args):
         model,
         cfg['model_settings']['pretrained'],
         device="cuda",
-        ignore_keys_with=("logits.",),     # skip classification head (mismatch 20 vs 21)
+        ignore_keys_with=(),     # skip classification head (mismatch 20 vs 21), ("logits.",)
         copy_head_overlap=False,           # set True if you want partial row copy for heads
         verbose=True,
     )
@@ -181,11 +197,32 @@ def main(args):
     #####################################
     
     # Define optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=cfg["train_params"].get("learning_rate", 1e-3),
-        weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
-    )
+    if cfg["model_settings"]["baseline"]=="SalsaNextAdf":
+        # parameter groups: no weight decay for 1D params (norms, biases, logits head)
+        decay, nodecay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim < 2 or any(k in n.lower() for k in ["bn", "norm", "bias", "logits"]):
+                nodecay.append(p)
+            else:
+                decay.append(p)
+
+        optimizer = torch.optim.SGD(
+            [
+                {"params": decay,   "weight_decay": cfg["train_params"].get("weight_decay", 1e-4)},
+                {"params": nodecay, "weight_decay": 0.0},
+            ],
+            lr=cfg["train_params"].get("learning_rate", 5e-4),  # start lower than AdamW’s 1e-3 base
+            momentum=0.9,
+            nesterov=True,
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=cfg["train_params"].get("learning_rate", 5e-4),
+            weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
+        )
     # Linear warm-up over first N epochs
     num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
