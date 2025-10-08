@@ -14,7 +14,8 @@ from utils.mc_dropout import predictive_entropy_mc
 
 # aggregator classes for evaluation
 from models.evaluator import (
-    SemanticSegmentationEvaluator,
+    #SemanticSegmentationEvaluator,
+    IoUEvaluator,
     UncertaintyPerClassAggregator,
     UncertaintyAccuracyAggregator,
     plot_iou_sorted_by_uncertainty
@@ -35,6 +36,8 @@ from utils.mc_dropout import (
 )
 
 from dataset.definitions import class_names, color_map
+
+import json
 
 class Tester:
     """
@@ -75,11 +78,17 @@ class Tester:
         
         self.save_path = cfg["extras"].get("save_path", "")
         # SemanticKitti test dataset has 95_937_758 valid lidar points not including class unlabeled
-        self.evaluator = SemanticSegmentationEvaluator(self.num_classes)
+        self.iou_evaluator = IoUEvaluator(self.num_classes)
+        
+        self.test_mask = [1] * cfg["extras"]["num_classes"]
+        self.test_mask[0] = 0
+            
         self.unc_agg = UncertaintyPerClassAggregator(num_classes=self.num_classes, max_per_class=100_000_000)  # cap is optional
         self.ua_agg = UncertaintyAccuracyAggregator(max_samples=100_000_000)  # cap optional
 
+        self.ignore_idx = 0
 
+        self.checkpoint = checkpoint
         # Load checkpoint if provided
         if checkpoint:
             try:
@@ -93,9 +102,39 @@ class Tester:
         self.T_value: float | None = None
 
         # Detected once on first batch (kept consistent with Trainer)
-        self._model_act_kind: str | None = None  # 'logits' | 'probs' | 'log_probs'
+        self._model_act_kind: str | None = None  # 'logits' | '' | 'log_probs'
 
     # ---------- helpers for activations / temperature ----------
+
+    def save_results(self, result_dict):
+        # Get directory of checkpoint
+        base_dir = os.path.dirname(self.checkpoint)
+        per_class_keys = [k for k in result_dict.keys() if k not in ("mIoU")]
+        out = {
+            "iou": {k: result_dict[k] for k in per_class_keys},  # all class-wise IoUs
+            "mIoU": result_dict["mIoU"],
+            "checkpoint": self.checkpoint,             # separate top-level line
+        }
+
+        def clean_nans(obj):
+            """Recursively replace float('nan') with None (=> null in JSON)."""
+            if isinstance(obj, dict):
+                return {k: clean_nans(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [clean_nans(v) for v in obj]
+            if isinstance(obj, float):
+                return None if math.isnan(obj) else obj
+            return obj
+        
+        # replace NaN -> null
+        out = clean_nans(out)
+
+        # Save result_dict to JSON in the same folder
+        result_path = os.path.join(base_dir, "result_dict.json")
+        with open(result_path, "w") as f:
+            json.dump(out, f, indent=4)
+
+        print(f"✅ Saved results to {result_path}")
 
     @torch.no_grad()
     def _to_logits(self, out: torch.Tensor, kind: str) -> torch.Tensor:
@@ -203,7 +242,7 @@ class Tester:
 
         inference_times = []
         self.model.eval()
-        self.evaluator.reset()
+        self.iou_evaluator.reset()
 
         # toggles
         use_dropout = bool(self.cfg["model_settings"].get("use_dropout", 0))
@@ -291,7 +330,7 @@ class Tester:
                         probs = mean_p
 
                 preds = probs.argmax(dim=1)
-                self.evaluator.update(preds, labels)
+                self.iou_evaluator.update(preds, labels)
                 
                 # statistics inference time end
                 self._end.record()
@@ -334,7 +373,7 @@ class Tester:
                     f"Channel mismatch: probs C={probs.shape[1]} vs cfg num_classes={self.num_classes}"
 
                 preds = probs.argmax(dim=1)
-                self.evaluator.update(preds, labels)
+                self.iou_evaluator.update(preds, labels)
                 
                 # statistics inference time end
                 self._end.record()
@@ -374,9 +413,17 @@ class Tester:
                         ent_err_err += err
         
         # per class mIoU and overall mIoU
-        mIoU, result_dict = self.evaluator.compute_final_metrics(class_names=self.class_names)
+        mIoU, result_dict = self.iou_evaluator.compute(
+            class_names=self.class_names,
+            test_mask=self.test_mask,
+            ignore_gt=[self.ignore_idx],
+            reduce="mean",
+            ignore_th=None
+        )
         print(f"[eval] epoch {epoch + 1},  mIoU={mIoU:.4f}")
 
+        cfg = self.save_results(result_dict)
+    
         #--> IoU vs thresholded predictive uncertainty
         # self.unc_agg.plot_boxplot(
         #     class_names=list(class_names.values()),
@@ -472,25 +519,9 @@ class Tester:
         return mIoU, result_dict
 
     # convenience wrapper
-    def run(self, dataloader_test, calib_loader=None, do_calibration: bool = False,
-            ts_mode: str = "default", mc_samples: int = 30):
+    def run(self, dataloader_test, mc_samples: int = 30):
         """
         If do_calibration=True and calib_loader is given, fit T first.
         Then test one epoch and return (mIoU, class_metrics).
         """
-        if do_calibration and calib_loader is not None:
-            json_out = None
-            if self.save_path:
-                json_out = os.path.join(self.save_path, "eval", "temperature.json")
-            self.calibrate_temperature(
-                calib_loader,
-                mode=ts_mode,
-                mc_samples=mc_samples,
-                optimizer_type="lbfgs",
-                max_iter_lbfgs=100,
-                epochs=2,
-                chunk_size=1_000_000,
-                init_T="auto",
-                save_json=json_out
-            )
         return self.test_epoch(dataloader_test, epoch=0)
