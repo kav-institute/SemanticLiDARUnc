@@ -38,7 +38,7 @@ model_settings: {
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmDirichlet/25-10-06_11-55-00/best_epoch_000.pt" #null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmSalsaNext/25-10-02_12-34-06/model_final.pt" #null,
+    pretrained: null
     # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmSalsaNext/25-10-02_12-34-06/model_final.pt"
     # Reichert Dirchlet: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
     # Reichert pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
@@ -46,13 +46,13 @@ model_settings: {
 
 model_weights: {
   Dirichlet: {
-    w_ls:    0.25,   # add only if you want extra IoU (on softmax probs)
-    w_nll:   1.0,  # Dirichlet-categorical NLL or density based
-    w_imax:  3.5,   # 2.0
-    w_dce:   0.0,   # 1.0
-    w_kl:    0.8,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_ls:    1.0,   # add only if you want extra IoU (on softmax probs)
+    w_nll:   3.0,  # Dirichlet-categorical NLL or density based
+    w_imax:  0.0,   # 
+    w_dce:   0.0,   # 
+    w_kl:    2.0,  # KL evidence term governs alpha0, keeps near prior_concentration
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  3.0    # shapes uncertainty on unsure pixels
+    w_comp:  7.0    # shapes uncertainty on unsure pixels
   },
   SalsaNext: {
     w_nll:   1.0, 

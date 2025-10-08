@@ -294,12 +294,8 @@ def main(args):
             checkpoint=cfg["model_settings"].get("pretrained")  # or a separate path
         )
 
-        do_calib = cfg["calibration"].get("enable", False)
         tester.run(
             dataloader_test=dataloader_test,
-            calib_loader=dataloader_test,   # or a dedicated calib loader
-            do_calibration=do_calib,
-            ts_mode="mc" if cfg['model_settings']['use_dropout'] else "default",              # or "mc" (averages logits with dropout)
             mc_samples=30
         )
     
