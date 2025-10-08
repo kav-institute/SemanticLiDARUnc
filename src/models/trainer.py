@@ -322,8 +322,8 @@ class Trainer:
                 kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
                 nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, scale-invariant)
                 comp_gamma = 2.0,
-                comp_tau   = 0.7,    # if you still see confident mistakes, try 0.7 later
-                comp_sigma = 0.10,
+                comp_tau   = 0.75,    # if you still see confident mistakes, try 0.75 later
+                comp_sigma = 0.10,      # bounded to [0.06, 0.12]
                 comp_normalize = True
             )
 
@@ -471,7 +471,8 @@ class Trainer:
                 
                 # get dirichlet losses
                 L_dir_dict={}
-                self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
+                if step % 2 ==0:    # every 2nd iteration update ema class weight accumulator
+                    self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
                 if True: #epoch >=2:   # TODO: hard coded warm-start num epochs
                     loss_dirichlet, L_dir_dict = self.criterion_dirichlet(
                         alpha, labels,
@@ -586,7 +587,7 @@ class Trainer:
             # Logging (every 10 steps)
             if will_log:
                 self.writer.add_scalar("loss/iter", loss.item(), self.global_step)
-                self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], self.global_step)
+                self.writer.add_scalar("LR/iter", self.optimizer.param_groups[0]['lr'], self.global_step)
                 if self.loss_name == "Dirichlet":
                     # weighted loss terms that exist
                     for name, val in L_dir_dict.items():
@@ -744,12 +745,15 @@ class Trainer:
             test_mask=self.test_mask,
             ignore_gt=[self.ignore_idx],
             reduce="mean",
-            ignore_th=0.01
+            ignore_th=None
         )
         print(f"[train] epoch {epoch + 1}/{self.num_epochs}, mIoU={mIoU:.4f}")
         avg_loss = total_loss / max(1, len(loader))
         print(f"[train] epoch {epoch+1}/{self.num_epochs}, loss={avg_loss:.4f}")
         if self.logging and self.writer:
+            # LR epoch
+            self.writer.add_scalar("LR/epoch", self.optimizer.param_groups[0]['lr'], epoch)
+            # loss epoch
             self.writer.add_scalar("loss/epoch", avg_loss, epoch)
             # IoU logging
             for cls in range(self.num_classes):
@@ -863,7 +867,7 @@ class Trainer:
             test_mask=self.test_mask,
             ignore_gt=[self.ignore_idx],
             reduce="mean",
-            ignore_th=0.01
+            ignore_th=None
         )
         print(f"[eval] epoch {epoch + 1}/{self.num_epochs},  mIoU={mIoU:.4f}")
 
