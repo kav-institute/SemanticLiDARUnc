@@ -529,14 +529,40 @@ def nll_dirichlet_categorical(alpha: torch.Tensor, target: torch.Tensor,
     return (per_pix * valid.float()).sum() / valid.sum()
 
 # class_weights: tensor[C], e.g. w_c = 1 / sqrt(freq_c + eps), then normalize to mean 1
-def nll_dirichlet_categorical_weighted(alpha, target, class_weights, ignore_index: int | None = 0, eps=1e-12):
-    if target.dim()==4 and target.size(1)==1: target = target[:,0]
-    valid = (target != ignore_index) if ignore_index is not None else torch.ones_like(target, dtype=torch.bool)
-    a0 = alpha.sum(dim=1)
-    ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1)
-    per = -(torch.log(ay+eps) - torch.log(a0+eps))
-    w = class_weights.to(alpha.device)[target].clamp_min(1e-3)
-    num = (per * w * valid).sum()
+def nll_dirichlet_categorical_weighted(
+    alpha: torch.Tensor,
+    target: torch.Tensor,
+    class_weights: torch.Tensor,
+    ignore_index: int | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    # alpha: [B,C,H,W]
+    # target: [B,H,W] or [B,1,H,W] with int labels (0..C-1) and possibly ignore_index
+    # class_weights: [C] (already mean-normalized, clipped)
+
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]            # [B,H,W]
+    target = target.long()
+
+    # valid mask
+    valid = (target != ignore_index) if ignore_index is not None \
+            else torch.ones_like(target, dtype=torch.bool)
+
+    # safe target for indexing/gather (replace ignored indices with 0)
+    tgt_safe = torch.where(valid, target, torch.zeros_like(target))
+
+    # per-pixel -log p_hat_y = -log(alpha_y / alpha0)
+    a0 = alpha.sum(dim=1)                                    # [B,H,W]
+    ay = alpha.gather(1, tgt_safe.unsqueeze(1)).squeeze(1)   # [B,H,W]
+    per = -(torch.log(ay + eps) - torch.log(a0 + eps))       # [B,H,W]
+
+    # class weights (do not index at ignore_index)
+    w_all = class_weights.to(alpha.device)
+    w = w_all[tgt_safe].clamp_min(1e-3)                      # [B,H,W]
+
+    # weighted mean over valid pixels
+    per = per * w * valid
+    num = per.sum()
     den = (w * valid).sum().clamp_min(1.0)
     return num / den
 
@@ -838,77 +864,134 @@ def complement_kl_uniform_from_alpha(
     s_target: float | None = None, normalize: bool = True
 ) -> torch.Tensor:
     """
-    Computes R_comp = w_total * KL(tilde_p || Uniform), averaged over valid pixels.
+    Purpose
+    -------
+    Encourage uncertainty *spread* across off-classes when the model is unsure.
+    We minimize a gated KL divergence between the off-class conditional
+    distribution and the uniform distribution over off-classes.
 
-    Definitions:
-        p      = alpha / alpha0
-        S      = 1 - p_y    Bigger gamma focuses the penalty on very uncertain pixels
-        tilde_p_j = p_j / S, for j != y
-        U_j    = 1 / (C - 1)
-        KL(tilde_p || U) = sum_j tilde_p_j * log(tilde_p_j / U_j)
-                        = sum_j tilde_p_j * log(tilde_p_j) + log(C - 1)
-        w_uncert = (1 - p_y)^gamma * sigmoid((tau - p_y)/sigma)
-        w_evid   = s_target / (alpha0 + s_target)      # optional
-        w_total  = w_uncert * w_evid
+    Shapes
+    ------
+    alpha : [B,C,H,W], C >= 2, alpha_i > 0
+    target: [B,H,W] or [B,1,H,W], integer labels in {0..C-1} or ignore_index
+    returns: scalar tensor (mean over valid pixels)
 
-    parameters:
-        - gamma (default 2.0): power on (1 - p_y). Bigger gamma focuses the penalty on very uncertain pixels (small p_y).
-        - tau (default 0.6): center of the sigmoid gate on p_y. The term ramps up when p_y < tau. 
-            0.6 means "start engaging when top-class prob drops below ~60%".
-        - sigma (default 0.1): slope of that sigmoid ramp. Smaller sigma = sharper switch. 0.1 gives a smooth but decisive transition.
-        - s_target (default = prior_concentration): evidence target used by evidence-KL. 
-            Using the same value here makes the complement term small when alpha0 >> s_target (i.e., the model already has strong evidence).
-        - normalize (default True): divides by log(C-1) so the term lies in [0,1]. This makes your global weight w_comp interpretable and stable across different C.
+    Definitions (ASCII math)
+    ------------------------
+    alpha0  = sum_i alpha_i
+    p       = alpha / alpha0               # Dirichlet mean, p_i in (0,1), sum_i p_i = 1
+    y       = ground-truth class index
+    S       = 1 - p_y                      # total off-class mass
+    tilde_p_j = p_j / S for j != y         # conditional over off-classes, sum_{j!=y} tilde_p_j = 1
+    U_j     = 1 / (C - 1)                  # uniform over off-classes
 
-    Notes:
-        - Returns a non-negative scalar. 0 at optimum (tilde_p uniform).
-        - Scale-invariant w.r.t. alpha0 (depends on mean p only).
-        - For C <= 2 there is no "complement" distribution; returns 0.
+    KL(tilde_p || U) = sum_{j!=y} tilde_p_j * log( tilde_p_j / U_j )
+                     = sum_{j!=y} tilde_p_j * log(tilde_p_j) + log(C-1)
+      range: [0, log(C-1)], 0 at tilde_p = Uniform
+
+    Gating (when should the regularizer act?)
+    -----------------------------------------
+    We scale the term by w_total = w_uncert * w_evid, where
+
+      w_uncert(p_y) = (1 - p_y)^gamma * sigmoid( (tau - p_y) / sigma )
+        - (1 - p_y)^gamma        : polynomial emphasis on low p_y
+        - sigmoid(...)           : soft step that turns on near p_y = tau
+        - gamma (>=1)            : bigger -> focus more on very uncertain pixels
+        - tau (in (0,1))         : larger -> turns on *earlier* (acts at higher p_y)
+        - sigma (>0)             : smaller -> sharper step around tau
+
+      w_evid(alpha0) = s_target / (alpha0 + s_target)   (optional)
+        - downweights when evidence alpha0 is already high
+        - monotone: alpha0->0 => w_evid->1 ; alpha0->inf => w_evid->0
+
+    Loss (per pixel) and averaging
+    ------------------------------
+    per_pix = w_total * KL_norm(tilde_p || U)
+      where KL_norm = KL / log(C-1) if normalize=True, otherwise raw KL
+    Output = mean(per_pix over valid pixels)
+
+    Effects
+    -------
+    - Minimizing KL pushes the largest off-class tilde_p_j down and the smallest up,
+      i.e., spreads off-class mass toward uniform when uncertainty is high.
+    - Scale-invariant in alpha (depends on p only), so it does not inflate alpha0.
+    - The optional evidence gate w_evid further suppresses the term when alpha0 is large.
+
+    Parameter intuition (quick)
+    ---------------------------
+      gamma: 1.0 (broad), 2.0 (default), 3.0 (narrow to very low p_y)
+      tau  : 0.6 (acts late), 0.7 (earlier), 0.8 (quite early; caution)
+      sigma: 0.15 (soft ramp), 0.10 (crisp), 0.06 (very sharp; may jitter)
+    Example strengths (gamma=2, tau=0.6, sigma=0.1; ignoring w_evid):
+      p_y=0.90 -> w_uncert ~ 0.00047  (almost off)
+      p_y=0.70 -> w_uncert ~ 0.024    (light)
+      p_y=0.60 -> w_uncert ~ 0.080    (moderate)
+      p_y=0.50 -> w_uncert ~ 0.183    (strong)
+      p_y=0.30 -> w_uncert ~ 0.468    (very strong)
+
+    Implementation
+    --------------
+    - We build a safe target index 'tgt_safe' for gather so ignore_index outside [0..C-1]
+      never gets used for indexing.
+    - 'valid' mask excludes ignore_index from the final average.
+    - KL is normalized to [0,1] if normalize=True, making w_comp easier to tune.
     """
-    # alpha: [B,C,H,W], target: [B,H,W] or [B,1,H,W]
-    # returns mean over valid pixels of w_total * KL(tilde_p || Uniform)
+
+    # -- unify target shape and dtype --
     if target.dim() == 4 and target.size(1) == 1:
-        target = target[:, 0]
-    valid = _valid_mask(target, ignore_index)
+        target = target[:, 0]                 # [B,H,W]
+    target = target.long()
+
+    # -- valid pixels (exclude ignore_index) --
+    valid = _valid_mask(target, ignore_index)  # [B,H,W] bool
     if valid.sum() == 0:
-        return alpha.sum() * 0.0
+        return alpha.sum() * 0.0               # same device/dtype zero
 
     B, C, H, W = alpha.shape
     if C <= 2:
-        # no complement distribution in binary case
+        # no complement distribution exists in binary case
         return alpha.sum() * 0.0
 
-    # predictive mean probs
-    a0 = alpha.sum(dim=1, keepdim=True) + eps
-    p  = alpha / a0
-    py = p.gather(1, target.unsqueeze(1)).clamp_min(eps)  # [B,1,H,W]
+    # -- predictive mean probs p = alpha / alpha0 --
+    a0 = alpha.sum(dim=1, keepdim=True) + eps     # [B,1,H,W]
+    p  = alpha / a0                                # [B,C,H,W]
 
-    # build off-class conditional distribution tilde_p over C-1 classes
+    # -- safe gather index: replace ignored labels by 0 to avoid OOB gather --
+    tgt_safe = torch.where(valid, target, torch.zeros_like(target))   # [B,H,W]
+
+    # p_y = gather p at GT class; clamp for log stability later
+    py = p.gather(1, tgt_safe.unsqueeze(1)).clamp_min(eps)            # [B,1,H,W]
+
+    # -- build off-class conditional tilde_p over C-1 classes --
+    # mask out the GT channel
     oh = torch.zeros((B, C, H, W), device=p.device, dtype=torch.bool)
-    oh.scatter_(1, target.unsqueeze(1), True)  # one-hot mask of target
-    p_off = p.masked_fill(oh, 0.0)             # zero out target class
-    S = (1.0 - py).clamp_min(eps)              # off-class mass
-    tilde = p_off / S                          # tilde_p_j = p_j / S
+    oh.scatter_(1, tgt_safe.unsqueeze(1), True)        # one-hot: True at GT channel
+    p_off = p.masked_fill(oh, 0.0)                     # zero GT prob
+    S = (1.0 - py).clamp_min(eps)                      # total off-class mass
+    tilde = p_off / S                                  # conditional probs, sum over j!=y equals 1
 
-    # KL(tilde || U), U_j = 1/(C-1)
-    # KL = sum tilde*log tilde + log(C-1), in [0, log(C-1)]
+    # -- KL(tilde || U), U_j = 1/(C-1) --
+    # KL = sum tilde * log(tilde / U) = sum tilde*log(tilde) + log(C-1)
     log_tilde = (tilde.clamp_min(eps)).log()
-    kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)   # [B,H,W] >= 0
+    kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)    # [B,H,W], >= 0
 
-    # optional normalization to [0,1] for stable global weighting
+    # optionally normalize KL to [0,1] by dividing by log(C-1)
     if normalize:
         kl_u = kl_u / math.log(C - 1)
 
-    # uncertainty gate: large when p_y is small, near zero when p_y ~ 1
+    # -- gating by uncertainty and optional evidence --
+    # w_uncert = (1 - p_y)^gamma * sigmoid((tau - p_y)/sigma)
     w_uncert = (1.0 - py).pow(gamma).squeeze(1) * torch.sigmoid((tau - py) / sigma).squeeze(1)
 
-    # evidence gate: downweight when alpha0 is already large (confident/high-evidence)
+    # evidence gate w_evid = s / (alpha0 + s) in (0,1], monotone decreasing in alpha0
     if s_target is not None:
-        s_val = float(s_target)                           # ensure scalar
-        w_evid = s_val / (a0.squeeze(1) + s_val)          # in (0,1]
+        s_val = float(s_target)
+        w_evid = s_val / (a0.squeeze(1) + s_val)
         w = w_uncert * w_evid
     else:
         w = w_uncert
 
-    per_pix = w * kl_u                                    # >= 0
-    return (per_pix * valid.float()).sum() / valid.sum()
+    # -- masked mean over valid pixels --
+    per_pix = w * kl_u                                   # [B,H,W], >= 0
+    return (per_pix * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+
