@@ -13,13 +13,12 @@ from utils.weights import load_pretrained_safely
 
 import json
 import yaml
+import math
 
 import time
 
 import matplotlib
 matplotlib.use("TkAgg")  # often more robust than Tk
-
-from baselines.SalsaNext import adf
 
 def count_folders(directory):
     return len([name for name in os.listdir(directory) if os.path.isdir(os.path.join(directory, name))])
@@ -148,10 +147,9 @@ def main(args):
             attention=cfg["model_settings"]["attention"],
             multi_scale_meta=cfg["model_settings"]["multi_scale_meta"]
         )
-    elif cfg["model_settings"]["baseline"] in {"SalsaNext", "SalsaNextAdf"}:
-        # import base SalsaNext or uncertainty yielding model SalsaNextAdf
-        if cfg["model_settings"]["baseline"]=="SalsaNext":      from baselines.SalsaNext.SalsaNext import SalsaNext
-        elif cfg["model_settings"]["baseline"]=="SalsaNextAdf": from baselines.SalsaNext.SalsaNextAdf import SalsaNextUncertainty as SalsaNext  # TODO: testing original version!
+    elif cfg["model_settings"]["baseline"] == "SalsaNext":
+        # import base SalsaNext
+        from baselines.SalsaNext.SalsaNext import SalsaNext
         
         # minimum channels=4: range image (1ch) and xyz image (3ch)
         nchannels = 4
@@ -163,19 +161,6 @@ def main(args):
         # Model definition
         model = SalsaNext(nclasses=cfg["extras"]["num_classes"], nchannels=nchannels)
         
-        # SalsaNextAdf has very high vram usage, -> batch size of 1 is only possible with rtx 4090, thus remove adf.BatchNorm2d as it will introduce NaNs
-        if cfg["model_settings"]["baseline"]=="SalsaNextAdf":
-            for m in model.modules():
-                if isinstance(m, adf.BatchNorm2d):
-                    m.momentum = 0.0           # don’t change running stats
-                    m.eval()                   # forces running stats usage
-                    # keep affine trainable
-                    for p in m.parameters():
-                        p.requires_grad = True
-    
-    # remove activation function from last layer of decoder
-    # if cfg["extras"]["loss_function"] == "Dirichlet":
-    #     del model.decoder_semantic[-1]
     # count number of model parameters
     num_params = count_parameters(model)
     print("num_params", num_params)
@@ -196,54 +181,32 @@ def main(args):
         time.sleep(1)
     #####################################
     
-    # Define optimizer
-    if cfg["model_settings"]["baseline"]=="SalsaNextAdf":
-        # parameter groups: no weight decay for 1D params (norms, biases, logits head)
-        decay, nodecay = [], []
-        for n, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.ndim < 2 or any(k in n.lower() for k in ["bn", "norm", "bias", "logits"]):
-                nodecay.append(p)
-            else:
-                decay.append(p)
-
-        optimizer = torch.optim.SGD(
-            [
-                {"params": decay,   "weight_decay": cfg["train_params"].get("weight_decay", 1e-4)},
-                {"params": nodecay, "weight_decay": 0.0},
-            ],
-            lr=cfg["train_params"].get("learning_rate", 5e-4),  # start lower than AdamW’s 1e-3 base
-            momentum=0.9,
-            nesterov=True,
-        )
-    else:
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=cfg["train_params"].get("learning_rate", 5e-4),
-            weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
-        )
-    # Linear warm-up over first N epochs
-    num_warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.3,   # start at 30% of base LR, or higher when using small batches (e.g., <16)
-        end_factor=1.0,     # ramp to 100% of base LR
-        total_iters=num_warmup_epochs
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg["train_params"].get("learning_rate", 5e-4),
+        weight_decay=cfg["train_params"].get("weight_decay", 1e-4)  # typical: 1e-2 -> 1e-4
     )
-    #Cosine annealing with restarts thereafter
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=15,           # first restart after T_0 epochs, e.g., 15
-        T_mult=1,         # no increase in cycle length
-        eta_min=5e-6      # floor LR
-    )  
-    #Chain them: warm-up then cosine restarts
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[num_warmup_epochs]
-    ) 
+    
+    num_epochs = cfg["train_params"].get("num_epochs", 50)
+    steps_per_epoch = len(dataloader_train)
+    total_steps = max(1, num_epochs * steps_per_epoch)
+
+    warmup_epochs = cfg["train_params"].get("num_warmup_epochs", 2)
+    warmup_steps = max(1, warmup_epochs * steps_per_epoch)
+
+    base_lr = optimizer.param_groups[0]["lr"]
+    eta_min = cfg["train_params"].get("learning_rate_min", 5e-6)
+    warmup_start = 0.3  # start at 30% of base LR
+
+    def lr_lambda(global_step: int):
+        if global_step < warmup_steps:  # linear warmup (per-iter)
+            return warmup_start + (1.0 - warmup_start) * (global_step / warmup_steps)
+        # cosine decay to eta_min
+        t = (global_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cos = 0.5 * (1 + math.cos(math.pi * t))
+        return (eta_min / base_lr) + (1 - eta_min / base_lr) * cos
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     # ReduceLROnPlateau
     #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = "min", factor = 0.1)
@@ -255,7 +218,14 @@ def main(args):
         else:
             save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_final"
         
-        save_path_p2 ='{}_{}{}{}{}{}'.format(cfg["model_settings"]["model_type"], "a" if cfg["model_settings"]["attention"] else "", "n" if cfg["model_settings"]["normals"] else "", "m" if cfg["model_settings"]["multi_scale_meta"] else "", "p" if cfg["model_settings"]["pretrained"] else "", cfg["model_settings"]["loss_function"])
+        save_path_p2 ='{}_{}{}{}{}{}'.format(
+            cfg["model_settings"]["loss_function"],
+            "n" if cfg["model_settings"]["normals"] else "",
+            "r" if cfg["model_settings"]["reflectivity"] else "",
+            "a" if (cfg["model_settings"]["attention"] and cfg["model_settings"]["baseline"]=="Reichert") else "",
+            "m" if (cfg["model_settings"]["multi_scale_meta"] and cfg["model_settings"]["baseline"]=="Reichert") else "",
+            "p" if cfg["model_settings"]["pretrained"] else ""
+        )
         save_path = os.path.join(save_path_p1,save_path_p2)
         
         # add time information
