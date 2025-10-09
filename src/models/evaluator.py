@@ -628,20 +628,27 @@ def plot_iou_sorted_by_uncertainty(
 
 # ------------------------------------------------------------
 # Accuracy vs (normalized) predictive-uncertainty aggregator
+# (robust histogram-based; colored by bin percentage)
 # ------------------------------------------------------------
-import torch, numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt
+import math, numpy as np, torch
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize, LogNorm, to_rgb
+from matplotlib.cm import get_cmap, ScalarMappable
+import matplotlib.patheffects as patheffects
+import pandas as pd
 
 class UncertaintyAccuracyAggregator:
     """
-    Aggregates (uncertainty, correctness) pairs across batches for plots like:
-      - Accuracy per uncertainty bin (bar chart)
-      - Selective accuracy vs threshold (line curve; optional)
+    Aggregates (uncertainty, correctness) pairs and plots accuracy per
+    uncertainty bin. Uses histogramming (no pandas groupby) so empty
+    bins cannot show a bogus accuracy.
     """
+
     def __init__(self, max_samples: int | None = None, seed: int = 0):
         self.max_samples = max_samples
         self.rng = np.random.default_rng(seed)
-        self._uncert = torch.empty(0, dtype=torch.float32)   # values in [0,1] (normalized)
-        self._correct = torch.empty(0, dtype=torch.uint8)    # 1 = correct, 0 = incorrect
+        self._uncert = torch.empty(0, dtype=torch.float32)   # values in [0,1]
+        self._correct = torch.empty(0, dtype=torch.uint8)    # 1 = correct
         self._seen = 0
 
     def reset(self):
@@ -650,13 +657,8 @@ class UncertaintyAccuracyAggregator:
         self._seen = 0
 
     @torch.no_grad()
-    def update(
-        self,
-        labels: torch.Tensor,       # (B,H,W) int
-        preds: torch.Tensor,        # (B,H,W) int (argmax over logits/alpha)
-        uncertainty: torch.Tensor,  # (B,H,W) float, normalized to [0,1]
-        ignore_ids=(),
-    ):
+    def update(self, labels: torch.Tensor, preds: torch.Tensor,
+               uncertainty: torch.Tensor, ignore_ids=()):
         assert labels.shape == preds.shape == uncertainty.shape, "shapes must match"
         lab = labels.detach().to(torch.int64).cpu().reshape(-1)
         prd = preds.detach().to(torch.int64).cpu().reshape(-1)
@@ -664,7 +666,7 @@ class UncertaintyAccuracyAggregator:
 
         if ignore_ids:
             mask = ~torch.isin(lab, torch.tensor(list(ignore_ids), dtype=torch.int64))
-            if not mask.any():  # all ignored
+            if not mask.any():
                 return
             lab, prd, unc = lab[mask], prd[mask], unc[mask]
 
@@ -687,7 +689,6 @@ class UncertaintyAccuracyAggregator:
             self._uncert = torch.cat([self._uncert, unc], dim=0)
             self._correct = torch.cat([self._correct, corr], dim=0)
         else:
-            # keep each incoming with prob p ~ max/seen (approx)
             p = min(1.0, float(self.max_samples) / float(self._seen + 1e-9))
             keep = torch.from_numpy(self.rng.random(n_new) < p)
             if keep.any():
@@ -698,147 +699,157 @@ class UncertaintyAccuracyAggregator:
                 self._uncert[replace_idx] = unc
                 self._correct[replace_idx] = corr
 
-    def as_dataframe(self) -> pd.DataFrame:
-        if self._uncert.numel() == 0:
-            return pd.DataFrame(columns=["uncertainty", "correct"])
+    # ---------- compute ----------
+    def _ensure_arrays(self):
+        u = self._uncert.numpy()
+        c = self._correct.numpy().astype(np.float32)
+        return u, c
+
+    def make_bins(self, num_bins: int | None = None, bin_width: float | None = None,
+                  bin_edges: np.ndarray | None = None) -> np.ndarray:
+        """
+        Return strictly increasing edges covering [0,1].
+        Priority: bin_edges > bin_width > num_bins.
+        """
+        if bin_edges is not None:
+            edges = np.asarray(bin_edges, dtype=np.float32)
+        elif bin_width is not None:
+            K = max(1, int(round(1.0 / float(bin_width))))
+            edges = np.linspace(0.0, 1.0, K + 1, dtype=np.float32)
+        else:
+            K = int(num_bins) if num_bins is not None else 10
+            edges = np.linspace(0.0, 1.0, K + 1, dtype=np.float32)
+        edges[0] = 0.0; edges[-1] = 1.0
+        assert np.all(np.diff(edges) > 0), "bin edges must be strictly increasing"
+        return edges
+
+    def binned_accuracy(self, num_bins: int = 10, bin_width: float | None = None,
+                        bin_edges: np.ndarray | None = None) -> pd.DataFrame:
+        """
+        Robust binning via numpy.histogram. Returns DataFrame with:
+        [low, high, label, n, pct, accuracy]
+        Empty bins: n=0, accuracy=NaN, pct=0.
+        """
+        u, c = self._ensure_arrays()
+        if u.size == 0:
+            return pd.DataFrame(columns=["low","high","label","n","pct","accuracy"])
+        edges = self.make_bins(num_bins=num_bins, bin_width=bin_width, bin_edges=bin_edges)
+        n    = np.histogram(u, bins=edges)[0].astype(int)
+        csum = np.histogram(u, bins=edges, weights=c)[0]
+        acc  = np.divide(csum, n, out=np.full_like(csum, np.nan, dtype=float), where=n>0)
+        pct  = 100.0 * n / max(1, u.size)
+
+        lows, highs = edges[:-1], edges[1:]
+        labels = [f"[{l:.2f}, {h:.2f})" if i < len(lows)-1 else f"[{l:.2f}, {h:.2f}]"
+                  for i,(l,h) in enumerate(zip(lows, highs))]
+
         return pd.DataFrame({
-            "uncertainty": self._uncert.numpy(),
-            "correct": self._correct.numpy().astype(np.int32),
+            "low": lows, "high": highs, "label": labels,
+            "n": n, "pct": pct, "accuracy": acc
         })
 
-    # --------- computations & plots ---------
-    def binned_accuracy(self, num_bins: int = 10, bin_edges: np.ndarray | None = None) -> pd.DataFrame:
-        """
-        Returns a DataFrame with columns: bin, low, high, n, accuracy, unc_mean.
-        Keeps EMPTY bins so labels are stable (e.g., always shows [0.00,0.10)).
-        """
-        df = self.as_dataframe()
-        if df.empty:
-            return df
-
-        if bin_edges is None:
-            bin_edges = np.linspace(0.0, 1.0, num_bins + 1, dtype=np.float32)
-        else:
-            bin_edges = np.asarray(bin_edges, dtype=np.float32)
-            assert (bin_edges[0] <= 0) and (bin_edges[-1] >= 1) and np.all(np.diff(bin_edges) > 0)
-
-        # assign bin indices [0..K-1]
-        K = len(bin_edges) - 1
-        bins = np.digitize(df["uncertainty"].to_numpy(), bin_edges[1:-1], right=False)
-        # make it categorical with ALL bins so empty ones don't disappear
-        df["bin"] = pd.Categorical(bins, categories=np.arange(K), ordered=True)
-
-        grouped = (
-            df.groupby("bin", observed=False)
-            .agg(n=("correct", "size"),
-                accuracy=("correct", "mean"),
-                unc_mean=("uncertainty", "mean"))
-            .reset_index()
-        )
-
-        lows, highs = bin_edges[:-1], bin_edges[1:]
-        grouped["low"]  = grouped["bin"].astype(int).map({i: lows[i]  for i in range(K)})
-        grouped["high"] = grouped["bin"].astype(int).map({i: highs[i] for i in range(K)})
-        grouped["label"] = grouped.apply(lambda r: f"[{r.low:.2f}, {r.high:.2f})", axis=1)
-
-        # empty bins: keep n=0 and show accuracy as NaN
-        grouped.loc[grouped["n"] == 0, ["accuracy", "unc_mean"]] = np.nan
-
-        return grouped.sort_values("low").reset_index(drop=True)
-
-
+    # ---------- plots ----------
     def plot_accuracy_vs_uncertainty_bins(
         self,
         num_bins: int = 10,
+        bin_width: float | None = None,      # e.g., 0.05 for 20 bins
         bin_edges: np.ndarray | None = None,
         figsize=(14, 5),
         title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
         x_label="Normalized predictive-entropy bin",
         y_label="Accuracy",
-        annotate_counts: bool = True,
-        counts_at: str = "bottom",  # "bottom" or "top"
-        save_path: str | None = None,
+        show_percent_on_bars: bool = True,   # set False to hide all % labels (use colorbar only)
+        annotate_min_pct: float = 0.25,      # do NOT print a label if bin percentage < this (in %)
+        annotate_every: int = 1,             # label every Nth bar (1 = all)
+        percent_fmt: str = "{:.2f}%",
+        save_path: str | None = None,        # <<< save here if provided
+        show: bool = False,                  # <<< set True to also display; default is save-only
+        close_fig: bool = True,              # close after saving to free memory
         dpi: int = 200,
+        cmap_name: str = "viridis",
+        color_norm: str = "linear",            # "auto" | "linear" | "log"
     ):
-        stats = self.binned_accuracy(num_bins=num_bins, bin_edges=bin_edges)
+        stats = self.binned_accuracy(num_bins=num_bins, bin_width=bin_width, bin_edges=bin_edges)
         if stats.empty or stats["n"].sum() == 0:
-            print("No data to plot."); return
-
-        sns.set_style("whitegrid")
-        plt.figure(figsize=figsize)
-        ax = sns.barplot(data=stats, x="label", y="accuracy")
-        ax.set_ylim(0.0, 1.0)
-        ax.set_title(title, fontsize=18, weight="bold", pad=12)
-        ax.set_xlabel(x_label, fontsize=12)
-        ax.set_ylabel(y_label, fontsize=12)
-        ax.tick_params(axis="x", rotation=0)
-
-        # overall accuracy line
-        overall = float(self._correct.float().mean()) if self._correct.numel() else np.nan
-        if np.isfinite(overall):
-            ax.axhline(overall, ls="--", lw=2, color="black", alpha=0.8)
-            ax.text(len(stats) - 0.5, overall + 0.01, f"overall = {overall:.3f}",
-                    ha="right", va="bottom", fontsize=12, fontweight="bold")
-
-        # counts with underscores, positioned to avoid overlap
-        if annotate_counts:
-            y0, y1 = ax.get_ylim()
-            base = y0 + 0.02 * (y1 - y0)  # a bit above axis baseline
-            for p, n in zip(ax.patches, stats["n"].to_list()):
-                x = p.get_x() + p.get_width() / 2.0
-                if counts_at == "bottom":
-                    y = base; va = "bottom"
-                else:
-                    y = p.get_height(); va = "bottom"
-                ax.text(
-                    x, y, f"n={int(n):_}",
-                    ha="center", va=va, fontsize=9, color="black", clip_on=False
-                )
-
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-            print(f"Saved binned accuracy plot to {save_path}")
-        else:
-            plt.show()
-
-
-    # (Optional) selective-accuracy curve: accuracy over samples with uncertainty <= τ
-    def plot_selective_accuracy(
-        self,
-        thresholds: np.ndarray | None = None,
-        figsize=(7, 5),
-        title="Selective Accuracy vs Uncertainty Threshold",
-        x_label="Threshold τ on normalized predictive entropy (accept ≤ τ)",
-        y_label="Accuracy on accepted",
-        save_path: str | None = None,
-        dpi: int = 200,
-    ):
-        df = self.as_dataframe()
-        if df.empty:
             print("No data to plot.")
             return
-        if thresholds is None:
-            thresholds = np.linspace(0, 1, 21)
 
-        covs, accs = [], []
-        u = df["uncertainty"].to_numpy()
-        c = df["correct"].to_numpy().astype(np.float32)
-        for t in thresholds:
-            m = u <= t
-            cov = float(m.mean())
-            covs.append(cov)
-            accs.append(float(c[m].mean()) if m.any() else np.nan)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize, LogNorm
+        from matplotlib.cm import get_cmap, ScalarMappable
+        import matplotlib.patheffects as patheffects
+        import numpy as np
 
-        sns.set_style("whitegrid")
-        plt.figure(figsize=figsize)
-        plt.plot(thresholds, accs, marker="o")
-        plt.ylim(0, 1)
-        plt.title(title, fontsize=15, weight="bold")
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.grid(True, alpha=0.3)
-        if save_path:
-            plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-            print(f"Saved selective-accuracy curve to {save_path}")
-        #plt.show()
+        # --- color mapping by percentage in bin ---
+        cmap = get_cmap(cmap_name)
+        pct = stats["pct"].to_numpy()
+
+        if color_norm == "linear":
+            norm = Normalize(vmin=0.0, vmax=max(1.0, float(pct.max())))
+        elif color_norm == "log":
+            vmin = max(1e-3, float(pct[pct > 0].min()) if (pct > 0).any() else 1e-3)
+            norm = LogNorm(vmin=vmin, vmax=max(vmin * 10, float(pct.max() or 1.0)))
+        else:  # auto
+            vmax = float(pct.max() or 1.0)
+            vmin_pos = float(pct[pct > 0].min()) if (pct > 0).any() else 1.0
+            if vmax / max(vmin_pos, 1e-3) >= 20:
+                norm = LogNorm(vmin=max(1e-3, vmin_pos), vmax=max(vmax, vmin_pos * 10))
+            else:
+                norm = Normalize(vmin=0.0, vmax=max(1.0, vmax))
+
+        colors = cmap(norm(pct))
+        empty = (stats["n"].to_numpy() == 0)
+        colors[empty, 3] = 0.25  # lower alpha for empty bins
+
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        heights = np.nan_to_num(stats["accuracy"].to_numpy(), nan=0.0)
+        bars = ax.bar(stats["label"].to_list(), heights,
+                    color=colors, edgecolor="black", linewidth=0.8)
+
+        ax.set_ylim(0.0, 1.0)
+        ax.set_title(title, fontsize=20, weight="bold", pad=10)
+        ax.set_xlabel(x_label, fontsize=12)
+        ax.set_ylabel(y_label, fontsize=12)
+        ax.tick_params(axis="x", rotation=45)
+
+        # overall accuracy dashed line
+        overall = float(self._correct.float().mean()) if self._correct.numel() else float("nan")
+        if np.isfinite(overall):
+            ax.axhline(overall, ls="--", lw=2, color="black", alpha=0.85)
+            ax.text(len(stats) - 0.5, overall + 0.012, f"overall = {overall:.3f}",
+                    ha="right", va="bottom", fontsize=12, fontweight="bold")
+
+        # ---- annotate percentages (optional) ----
+        if show_percent_on_bars:
+            for i, (pbar, pct_i, n_i) in enumerate(zip(bars, stats["pct"].to_list(), stats["n"].to_list())):
+                # skip empty bins and tiny percentages; honor annotate_every
+                if (n_i == 0) or (pct_i < float(annotate_min_pct)) or (i % max(1, int(annotate_every)) != 0):
+                    continue
+                r, g, b, _ = pbar.get_facecolor()
+                L = 0.2126 * r + 0.7152 * g + 0.0722 * b  # luminance → choose black/white text
+                txt_color = "black" if L > 0.6 else "white"
+                ax.text(
+                    pbar.get_x() + pbar.get_width() / 2.0, 0.015, percent_fmt.format(pct_i),
+                    ha="center", va="bottom", fontsize=9, color=txt_color, clip_on=False,
+                    path_effects=[patheffects.withStroke(linewidth=1.2,
+                                foreground=("black" if txt_color == "white" else "white"))]
+                )
+
+        # colorbar for % of points
+        sm = ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+        cbar.set_label("Percentage of points (%)", rotation=90)
+
+        fig.tight_layout()
+
+        # ----- save/show/close -----
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        if show:
+            plt.show()
+        elif close_fig:
+            plt.close(fig)
+
+        return fig, ax
+
+

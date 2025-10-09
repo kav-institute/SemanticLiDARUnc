@@ -27,7 +27,7 @@ from utils.mc_dropout import (
     predictive_entropy_mc,
 )
 from utils.inputs import set_model_inputs
-from utils.loss_balancer import LossBalancer
+#from utils.loss_balancer import LossBalancer
 from utils.vis_cv2 import (
     visualize_semantic_segmentation_cv2,
 )
@@ -909,15 +909,17 @@ class Trainer:
             if (not use_mc_sampling) and \
                     (self.loss_name=="Dirichlet"):
                 self.ua_agg.plot_accuracy_vs_uncertainty_bins(
-                    bin_edges=np.linspace(0.0, 1.0, 11),  # 10 bins
+                    bin_width=0.05, 
+                    show_percent_on_bars=True,
                     title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png")
+                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png"),
                 )
             elif use_mc_sampling:
                 self.ua_agg.plot_accuracy_vs_uncertainty_bins(
-                    bin_edges=np.linspace(0.0, 1.0, 11),  # 10 bins
+                    bin_width=0.05, 
+                    show_percent_on_bars=True,
                     title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png")
+                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png"),
                 )
         self.ua_agg.reset()
 
