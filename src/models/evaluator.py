@@ -759,9 +759,9 @@ class UncertaintyAccuracyAggregator:
         x_label="Normalized predictive-entropy bin",
         y_label="Accuracy",
         show_percent_on_bars: bool = True,   # set False to hide all % labels (use colorbar only)
-        annotate_min_pct: float = 0.25,      # do NOT print a label if bin percentage < this (in %)
+        annotate_min_pct: float = 1.0,      # do NOT print a label if bin percentage < this (in %)
         annotate_every: int = 1,             # label every Nth bar (1 = all)
-        percent_fmt: str = "{:.2f}%",
+        percent_fmt: str = "{:.1f}%",
         save_path: str | None = None,        # <<< save here if provided
         show: bool = False,                  # <<< set True to also display; default is save-only
         close_fig: bool = True,              # close after saving to free memory
@@ -784,8 +784,10 @@ class UncertaintyAccuracyAggregator:
         cmap = get_cmap(cmap_name)
         pct = stats["pct"].to_numpy()
 
-        if color_norm == "linear":
+        if color_norm == "linear_rel":
             norm = Normalize(vmin=0.0, vmax=max(1.0, float(pct.max())))
+        if color_norm == "linear":
+            norm = Normalize(vmin=0.0, vmax=100.0)
         elif color_norm == "log":
             vmin = max(1e-3, float(pct[pct > 0].min()) if (pct > 0).any() else 1e-3)
             norm = LogNorm(vmin=vmin, vmax=max(vmin * 10, float(pct.max() or 1.0)))
@@ -823,8 +825,19 @@ class UncertaintyAccuracyAggregator:
         if show_percent_on_bars:
             for i, (pbar, pct_i, n_i) in enumerate(zip(bars, stats["pct"].to_list(), stats["n"].to_list())):
                 # skip empty bins and tiny percentages; honor annotate_every
-                if (n_i == 0) or (pct_i < float(annotate_min_pct)) or (i % max(1, int(annotate_every)) != 0):
+                if (n_i == 0): continue
+                if (pct_i < float(annotate_min_pct)) or (i % max(1, int(annotate_every)) != 0):
+                    r, g, b, _ = pbar.get_facecolor()
+                    L = 0.2126 * r + 0.7152 * g + 0.0722 * b  # luminance → choose black/white text
+                    txt_color = "black" if L > 0.6 else "white"
+                    ax.text(
+                        pbar.get_x() + pbar.get_width() / 2.0, 0.015, f"<{float(annotate_min_pct):.0f}%",
+                        ha="center", va="bottom", fontsize=9, color=txt_color, clip_on=False,
+                        path_effects=[patheffects.withStroke(linewidth=1.2,
+                                    foreground=("black" if txt_color == "white" else "white"))]
+                    )
                     continue
+
                 r, g, b, _ = pbar.get_facecolor()
                 L = 0.2126 * r + 0.7152 * g + 0.0722 * b  # luminance → choose black/white text
                 txt_color = "black" if L > 0.6 else "white"
@@ -847,8 +860,8 @@ class UncertaintyAccuracyAggregator:
             fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
         if show:
             plt.show()
-        elif close_fig:
-            plt.close(fig)
+        # elif close_fig:
+        #     plt.close(fig)
 
         return fig, ax
 
