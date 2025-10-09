@@ -502,8 +502,16 @@ class Trainer:
         ):
             self.global_step = epoch * len(loader) + step
             
+            # Equalizer scheduling, decoupled from logging
             do_log = bool(self.logging and self.writer and (step % 20 == 0))
+            if not hasattr(self, "update_step"):             # increments after each optimizer.step()
+                self.update_step = 0
+            eq_interval = int(getattr(self, "loss_w_eq_interval", 50))
+            
+            do_eq   = (self.update_step % eq_interval == 0)   # equalizer update cadence
+            need_raw = (do_eq or do_log)  
 
+            # input image prepare
             range_img    = range_img.to(self.device, non_blocking=True)
             reflectivity = reflectivity.to(self.device, non_blocking=True)
             xyz          = xyz.to(self.device, non_blocking=True)
@@ -518,7 +526,8 @@ class Trainer:
 
             self._start_timer()
             outputs = self.model(*inputs)
-            logits_var = None
+            
+            
 
             # Decide output kind once (first batch)
             if self._model_act_kind is None:
@@ -545,6 +554,20 @@ class Trainer:
                 loss_nll = self.criterion_nll(torch.log(outputs.clamp(min=1e-8)), labels)#, num_classes=self.num_classes, model_act="log_probs")
                 loss_ls = self.criterion_lovasz(outputs, labels, model_act="probs")
                 loss = self.w_nll * loss_nll + self.w_ls * loss_ls
+
+                raw_g = {}
+                if need_raw:
+                    # lovasz grad_norm
+                    if self.w_nll > 0.0 and loss_ls.requires_grad:
+                        raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
+                    # nll grad_norm
+                    if self.w_nll > 0.0 and loss_ls.requires_grad:
+                        raw_g["nll"] = grad_norm_wrt(loss_nll, self.model_ref_params, retain_graph=True)
+
+                    # cache latest norms for later logging steps that don't measure
+                    self._last_raw_g = raw_g
+                else:
+                    raw_g = getattr(self, "_last_raw_g", {})
                 
             elif self.loss_name == "Dirichlet":
                 def _to_float(x):
@@ -589,14 +612,6 @@ class Trainer:
                 # else:
                 loss = loss_dirichlet + (self.w_ls * loss_ls)
                 total_loss += float(loss.item())
-                
-                # Equalizer scheduling, decoupled from logging
-                if not hasattr(self, "update_step"):             # increments after each optimizer.step()
-                    self.update_step = 0
-                eq_interval = int(getattr(self, "loss_w_eq_interval", 50))
-                
-                do_eq   = (self.update_step % eq_interval == 0)   # equalizer update cadence
-                need_raw = (do_eq or do_log)  
                 
                 # ----------------- PRE-BACKWARD: compute grad norms -----------------
                 raw_g = {}
@@ -678,14 +693,19 @@ class Trainer:
                         self.writer.add_scalar("loss/ls", _to_float(loss_ls) * new_w["ls"], self.global_step)
 
                     if raw_g:
+                        # grad norms raw per loss
                         for name, g in raw_g.items():
                             self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
+                        # rss raw
+                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5 if raw_g else 0.0
+                        self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
+
                     if eff_g:
+                        # grad norms eff per loss
                         for name, g in eff_g.items():
                             self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
-                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5 if raw_g else 0.0
+                        # rss eff
                         rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
-                        self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
                         self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
                     
                     # alpha0 stats (use cached alpha)
@@ -704,7 +724,13 @@ class Trainer:
                 elif self.loss_name=="SalsaNext" and self.baseline=="SalsaNext":
                     self.writer.add_scalar('loss/loss_nll', loss_nll.item(), self.global_step)
                     self.writer.add_scalar('loss/loss_ls', loss_ls.item(), self.global_step)
-            
+
+                    if raw_g:
+                        for name, g in raw_g.items():
+                            self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
+                        # rss raw
+                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5 if raw_g else 0.0
+                        self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
             # Interactive visualization (cheap, reusing computed items)
             if self.visualize:
                 idx0 = 0
