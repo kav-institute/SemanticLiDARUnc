@@ -6,18 +6,19 @@ model_settings: {
   # Defines model backbone architecture
   # Baseline model. type: str. options: SalsaNext | Reichert | SalsaNextAdf
     baseline: "SalsaNext", 
-  # Backbone architecture
-    model_type: "efficientnet_v2_l",
   # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf | SalsaNext
     loss_function: "Dirichlet",
-  # Model Layer settings
-  ## toggle attention block. type: bool
-    attention: true,
-  ## inject meta data at multiple scales. type: bool
-    multi_scale_meta: true,
+
+  # Model Layer settings, specific to "Reichert" baseline
+    ## Backbone architecture. Note: Reichert only
+      model_type: "efficientnet_v2_l",
+    ## toggle attention block. type: bool. Note: Reichert only
+      attention: true,
+    ## inject meta data at multiple scales. type: bool. Note: Reichert only
+      multi_scale_meta: true,
   
   # Define what optional input channel types are used
-    # range (1 channel) and xyz (3 channels) are always considered -> min.4 channels
+    ## range (1 channel) and xyz (3 channels) are always considered -> min.4 channels
   ## toggle use of normals as input (+3 extra channels). type: bool
     normals: true,
   ## toggle use of reflectivity as input (+1 extra channels). type: bool
@@ -47,12 +48,12 @@ model_settings: {
 model_weights: {
   Dirichlet: {
     w_ls:    1.0,   # add only if you want extra IoU (on softmax probs)
-    w_nll:   3.0,  # Dirichlet-categorical NLL or density based
+    w_nll:   1.0,  # Dirichlet-categorical NLL or density based
     w_imax:  0.0,   # 
     w_dce:   0.0,   # 
-    w_kl:    2.0,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_kl:    0.0,  # KL evidence term governs alpha0, keeps near prior_concentration, 2.0
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  7.0    # shapes uncertainty on unsure pixels
+    w_comp:  0.0    # shapes uncertainty on unsure pixels, 7.0
   },
   SalsaNext: {
     w_nll:   1.0, 
@@ -71,6 +72,8 @@ model_weights: {
 train_params: {
   ## learning rate for training
     learning_rate: 5.e-4,
+  ## min LR
+    learning_rate_min: 5.e-6,
   ## Sets batch size for training
     batch_size: 8,  
   ## Sets numbor of worker processes
