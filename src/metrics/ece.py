@@ -1,175 +1,179 @@
-import torch
+# ------------------------------------------------------------
+# Expected Calibration Error (ECE) Aggregator
+# - Accumulates per-batch data
+# - Computes ECE at epoch end
+# - Saves a reliability diagram
+# ------------------------------------------------------------
+import math, numpy as np, torch
+import matplotlib.pyplot as plt
+import pandas as pd
 
 class ECEAggregator:
     """
-    Streaming Expected Calibration Error (ECE) + reliability diagram aggregator
-    for dense segmentation.
+    Expected Calibration Error for segmentation.
 
-    Usage:
-      ece = ECEAggregator(n_bins=15, ignore_index=255, title="Reliability Diagram")
-      for probs, labels in loader:   # probs: [B,C,H,W] (softmax), labels: [B,1,H,W] or [B,H,W]
-          ece.add_batch(probs, labels)
-      res = ece.finalize(make_plot=True, save_dir=".../eval", epoch=epoch)
+    Mode:
+      - 'alpha'  : preds are Dirichlet alphas [B,C,H,W]; p = alpha / alpha0
+      - 'logits' : preds are logits [B,C,H,W]; p = softmax(logits)
+      - 'probs'  : preds are probs [B,C,H,W]; p used as-is (re-normalized for safety)
 
-    Returns from finalize():
-    {
-        "ECE": float,
-        "bin_counts": np.ndarray[n_bins],
-        "bin_accuracy": np.ndarray[n_bins],
-        "bin_confidence": np.ndarray[n_bins],
-        "save_path": Optional[str]
-    }
+    API:
+      ece = ece_eval.compute(save_plot_path="...", title="...")[0]
+      ece_eval.reset()
     """
 
-    def __init__(self, n_bins: int = 15, ignore_index: int = 255, title: str = "Reliability Diagram"):
+    def __init__(
+        self,
+        n_bins: int = 15,
+        mode: str = "alpha",
+        ignore_index: int | None = None,
+        max_samples: int | None = None,  # cap memory; None = keep all
+        seed: int = 0,
+        eps: float = 1e-12,
+    ):
+        assert mode in {"alpha", "logits", "probs"}
+        assert n_bins >= 2
         self.n_bins = int(n_bins)
-        self.ignore_index = int(ignore_index)
-        self.title = title
+        self.mode = mode
+        self.ignore_index = ignore_index
+        self.max_samples = max_samples
+        self.rng = np.random.default_rng(seed)
+        self.eps = float(eps)
+        self._conf = torch.empty(0, dtype=torch.float32)
+        self._correct = torch.empty(0, dtype=torch.uint8)
+        self._seen = 0
 
-        # Buffers start on CPU; we’ll move them to the right device on first use.
-        self.bin_edges = torch.linspace(0, 1, self.n_bins + 1)              # float32
-        self.tot_counts = torch.zeros(self.n_bins, dtype=torch.long)        # long
-        self.correct_counts = torch.zeros(self.n_bins, dtype=torch.long)    # long
-        self.confidence_sums = torch.zeros(self.n_bins, dtype=torch.float32)
-
-    # --- helpers ---
-    @torch.no_grad()
-    def _ensure_device(self, device: torch.device):
-        """Keep internal buffers on the same device as incoming tensors."""
-        if self.bin_edges.device != device:
-            self.bin_edges = self.bin_edges.to(device)
-            self.tot_counts = self.tot_counts.to(device)
-            self.correct_counts = self.correct_counts.to(device)
-            self.confidence_sums = self.confidence_sums.to(device)
-
-    @property
-    def bin_centers(self):
-        edges = self.bin_edges
-        return 0.5 * (edges[:-1] + edges[1:])
-
-    @torch.no_grad()
     def reset(self):
-        """Clear accumulated counts (keeps configuration)."""
-        self.tot_counts.zero_()
-        self.correct_counts.zero_()
-        self.confidence_sums.zero_()
+        self._conf = torch.empty(0, dtype=torch.float32)
+        self._correct = torch.empty(0, dtype=torch.uint8)
+        self._seen = 0
 
-    # --- streaming API ---
+    # ---------- internal: convert preds -> probs ----------
     @torch.no_grad()
-    def add_batch(self, probs: torch.Tensor, labels: torch.Tensor):
+    def _to_probs(self, preds: torch.Tensor) -> torch.Tensor:
+        if self.mode == "alpha":
+            a0 = preds.sum(dim=1, keepdim=True)
+            p = preds / (a0 + self.eps)
+        elif self.mode == "logits":
+            p = preds.softmax(dim=1)
+        else:  # 'probs'
+            p = preds.clamp_min(0)
+            p = p / p.sum(dim=1, keepdim=True).clamp_min(self.eps)
+        return p
+
+    @torch.no_grad()
+    def update(self, preds: torch.Tensor, labels: torch.Tensor):
         """
-        Accumulate per-bin counts from one batch.
-
-        Args:
-            probs  : [B,C,H,W] softmax probabilities
-            labels : [B,1,H,W] or [B,H,W] integer labels
+        preds : [B,C,H,W] (alpha/logits/probs depending on mode)
+        labels: [B,H,W] (int class ids)
         """
-        device = probs.device
-        self._ensure_device(device)
+        assert preds.dim() == 4 and labels.dim() == 3
+        p = self._to_probs(preds)  # [B,C,H,W]
 
-        if labels.device != device:
-            labels = labels.to(device, non_blocking=True)
+        conf, pred = p.max(dim=1)               # [B,H,W], [B,H,W]
+        lab = labels.long()
 
-        if labels.ndim == 4:
-            labels = labels.squeeze(1)
-        labels = labels.long()
+        if self.ignore_index is not None:
+            valid = (lab != self.ignore_index)
+        else:
+            valid = torch.ones_like(lab, dtype=torch.bool)
 
-        # mask ignore
-        valid = labels != self.ignore_index
         if not valid.any():
             return
 
-        # Flatten valid pixels: probs -> [N,C], labels -> [N]
-        p = probs.permute(0, 2, 3, 1)[valid]   # [N,C]
-        y = labels[valid]                      # [N]
+        conf = conf[valid].detach().to(torch.float32).view(-1).clamp_(0, 1)
+        corr = (pred[valid].view(-1) == lab[valid].view(-1)).to(torch.uint8)
 
-        conf, pred = p.max(dim=1)              # [N], [N]
-        correct = (pred == y)                  # [N], bool
+        # Accumulate with optional reservoir-style cap (like your other class)
+        if self.max_samples is None:
+            self._conf = torch.cat([self._conf, conf.cpu()], dim=0)
+            self._correct = torch.cat([self._correct, corr.cpu()], dim=0)
+            self._seen += conf.numel()
+            return
 
-        # Bin assignment on the SAME device as buffers
-        idx = torch.bucketize(conf, self.bin_edges, right=False) - 1
-        idx = idx.clamp_(0, self.n_bins - 1)
+        n_new = conf.numel()
+        self._seen += n_new
+        if self._conf.numel() < self.max_samples:
+            take = min(self.max_samples - self._conf.numel(), n_new)
+            if take < n_new:
+                idx = torch.from_numpy(self.rng.choice(n_new, size=take, replace=False))
+                conf, corr = conf[idx], corr[idx]
+            self._conf = torch.cat([self._conf, conf.cpu()], dim=0)
+            self._correct = torch.cat([self._correct, corr.cpu()], dim=0)
+        else:
+            p_keep = min(1.0, float(self.max_samples) / float(self._seen + 1e-9))
+            keep = torch.from_numpy(self.rng.random(n_new) < p_keep)
+            if keep.any():
+                conf, corr = conf[keep], corr[keep]
+                replace_idx = torch.from_numpy(
+                    self.rng.choice(self.max_samples, size=conf.numel(), replace=False)
+                )
+                self._conf[replace_idx] = conf.cpu()
+                self._correct[replace_idx] = corr.cpu()
 
-        # Tally counts
-        ones = torch.ones_like(conf, dtype=torch.long)
-        self.tot_counts.index_add_(0, idx, ones)
-        self.correct_counts.index_add_(0, idx, correct.to(torch.long))
-        self.confidence_sums.index_add_(0, idx, conf)
+    # ---------- compute ECE ----------
+    def _bin_edges(self) -> np.ndarray:
+        edges = np.linspace(0.0, 1.0, self.n_bins + 1, dtype=np.float32)
+        edges[0] = 0.0; edges[-1] = 1.0
+        return edges
 
-    @torch.no_grad()
-    def finalize(self,
-                make_plot: bool = True,
-                save_dir: str | None = None,
-                epoch: int | None = None,
-                filename: str | None = None,
-                dpi: int = 150,
-                show: bool = False,
-                close: bool = True):
+    def _stats_df(self) -> pd.DataFrame:
+        if self._conf.numel() == 0:
+            return pd.DataFrame(columns=["low","high","center","n","pct","acc","conf"])
+        conf = self._conf.numpy()
+        corr = self._correct.numpy().astype(np.float32)
+        edges = self._bin_edges()
+        n     = np.histogram(conf, bins=edges)[0].astype(int)
+        acc_s = np.histogram(conf, bins=edges, weights=corr)[0]
+        conf_s= np.histogram(conf, bins=edges, weights=conf)[0]
+        acc = np.divide(acc_s, n, out=np.full_like(acc_s, np.nan, dtype=float), where=n>0)
+        avg_conf = np.divide(conf_s, n, out=np.full_like(conf_s, np.nan, dtype=float), where=n>0)
+        pct = 100.0 * n / max(1, conf.size)
+        centers = 0.5*(edges[:-1] + edges[1:])
+        return pd.DataFrame({
+            "low": edges[:-1], "high": edges[1:], "center": centers,
+            "n": n, "pct": pct, "acc": acc, "conf": avg_conf
+        })
+
+    def compute(self, save_plot_path: str | None = None, title: str = "Reliability Diagram", dpi: int = 200):
         """
-        Compute ECE and (optionally) save a reliability diagram.
-
-        Args:
-            make_plot : whether to build a reliability diagram
-            save_dir  : directory to save the figure (created if needed)
-            epoch     : if provided, filename defaults to f"ece_epoch_{epoch:06d}.png"
-            filename  : custom filename (overrides epoch-based naming)
-            dpi       : output figure DPI
-            show      : call plt.show() (blocks in interactive backends)
-            close     : close the figure after saving/showing
-
-        Returns:
-            dict with ECE and per-bin arrays + save_path (if saved)
+        Returns (ece_scalar, stats_df). If save_plot_path is given, saves the plot.
         """
-        # Per-bin accuracy & confidence
-        valid_bins = self.tot_counts > 0
-        bin_acc = torch.zeros_like(self.confidence_sums)
-        bin_conf = torch.zeros_like(self.confidence_sums)
+        stats = self._stats_df()
+        if stats.empty or stats["n"].sum() == 0:
+            return float("nan"), stats
 
-        bin_acc[valid_bins] = self.correct_counts[valid_bins].float() / self.tot_counts[valid_bins].float()
-        bin_conf[valid_bins] = self.confidence_sums[valid_bins] / self.tot_counts[valid_bins].float()
+        w = stats["n"].to_numpy().astype(np.float64)
+        w = w / max(1, w.sum())
+        gap = np.abs(stats["acc"].to_numpy() - stats["conf"].to_numpy())
+        ece = float(np.nansum(w * gap))
 
-        # Expected Calibration Error (weighted |acc - conf|)
-        total = self.tot_counts.sum().clamp_min(1).float()
-        weights = torch.zeros_like(self.confidence_sums)
-        weights[valid_bins] = self.tot_counts[valid_bins].float() / total
-        ece = (weights * (bin_acc - bin_conf).abs()).sum().item()
+        if save_plot_path is not None:
+            fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=dpi)
+            x = stats["center"].to_numpy()
 
-        save_path = None
-        if make_plot:
-            import os
-            import matplotlib.pyplot as plt
+            # perfect calibration
+            ax.plot([0, 1], [0, 1], label="perfect calibration")
 
-            vb = valid_bins.cpu().numpy()
-            centers = self.bin_centers.cpu().numpy()
-            bc = centers[vb]
-            ba = bin_acc.detach().cpu().numpy()[vb]
+            # accuracy per bin
+            acc = np.nan_to_num(stats["acc"].to_numpy(), nan=0.0)
+            ax.plot(x, acc, marker="o", label="accuracy")
 
-            fig = plt.figure(figsize=(5, 5))
-            ax = fig.add_subplot(111)
-            ax.plot([0, 1], [0, 1], '--', linewidth=1)
-            if len(bc) > 0:
-                ax.plot(bc, ba, marker='o')
-            ax.set_xlabel('Confidence')
-            ax.set_ylabel('Accuracy')
-            ax.set_title(f'{self.title}\nECE = {ece:.4f}')
+            # mean confidence per bin
+            conf = np.nan_to_num(stats["conf"].to_numpy(), nan=0.0)
+            ax.plot(x, conf, marker="x", linestyle="--", label="avg. confidence")
+
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+            ax.set_xlabel("Confidence (bin center)")
+            ax.set_ylabel("Accuracy / Avg. Confidence")
+            ax.set_title(f"{title}\nECE = {ece:.4f}")
+            ax.grid(True, alpha=0.3)
+
+            # NEW: legend
+            ax.legend(loc="lower right", frameon=True)
+
             fig.tight_layout()
+            fig.savefig(save_plot_path, bbox_inches="tight", dpi=dpi)
+            plt.close(fig)
 
-            if save_dir is not None:
-                os.makedirs(save_dir, exist_ok=True)
-                if filename is None:
-                    filename = f"ece_epoch_{int(epoch):06d}.png" if epoch is not None else "ece.png"
-                save_path = os.path.join(save_dir, filename)
-                fig.savefig(save_path, bbox_inches="tight", dpi=dpi)
-
-            if show:
-                plt.show()
-            if close:
-                plt.close(fig)
-
-        return {
-            "ECE": ece,
-            "bin_counts": self.tot_counts.detach().cpu().numpy(),
-            "bin_accuracy": bin_acc.detach().cpu().numpy(),
-            "bin_confidence": bin_conf.detach().cpu().numpy(),
-            "save_path": save_path,
-        }
+        return ece, stats
