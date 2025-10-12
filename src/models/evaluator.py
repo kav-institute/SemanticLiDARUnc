@@ -759,7 +759,7 @@ class UncertaintyAccuracyAggregator:
         x_label="Normalized predictive-entropy bin",
         y_label="Accuracy",
         show_percent_on_bars: bool = True,   # set False to hide all % labels (use colorbar only)
-        annotate_min_pct: float = 1.0,      # do NOT print a label if bin percentage < this (in %)
+        annotate_min_pct: float = 0.1,      # do NOT print a label if bin percentage < this (in %)
         annotate_every: int = 1,             # label every Nth bar (1 = all)
         percent_fmt: str = "{:.1f}%",
         save_path: str | None = None,        # <<< save here if provided
@@ -831,7 +831,7 @@ class UncertaintyAccuracyAggregator:
                     L = 0.2126 * r + 0.7152 * g + 0.0722 * b  # luminance → choose black/white text
                     txt_color = "black" if L > 0.6 else "white"
                     ax.text(
-                        pbar.get_x() + pbar.get_width() / 2.0, 0.015, f"<{float(annotate_min_pct):.0f}%",
+                        pbar.get_x() + pbar.get_width() / 2.0, 0.015, f"<{float(annotate_min_pct):.1f}%",
                         ha="center", va="bottom", fontsize=9, color=txt_color, clip_on=False,
                         path_effects=[patheffects.withStroke(linewidth=1.2,
                                     foreground=("black" if txt_color == "white" else "white"))]
