@@ -12,19 +12,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 # --- project modules ---
 from models.evaluator import (
-    SemanticSegmentationEvaluator,
     IoUEvaluator,
     UncertaintyAccuracyAggregator
 )
-
-from models.temp_scaling import (
-    cache_calib_logits,
-    calibrate_temperature_from_cache,
-)
 from utils.mc_dropout import (
-    set_dropout_mode,
     mc_forward,
-    predictive_entropy_mc,
 )
 from utils.inputs import set_model_inputs
 #from utils.loss_balancer import LossBalancer
@@ -36,17 +28,9 @@ from models.probability_helper import (
     to_alpha_concentrations,
     get_predictive_entropy_norm,
     build_uncertainty_layers,
-    smoothing_schedule,
-    predictive_entropy_from_logistic_normal,
     # Global parameter getter
     get_eps_value,
     get_alpha_temperature,
-    # Metrics
-    compute_entropy_error_iou,
-    plot_mIOU_errorEntropy,
-    compute_entropy_reliability,
-    compute_mc_reliability_bins,
-    save_reliability_diagram
 )
 
 from typing import Dict, Callable, Optional, Tuple, Iterable, Union
@@ -55,7 +39,6 @@ from utils.viz_panel import (
     create_ia_plots,
     register_optional_names
 )
-
 
 # ------------------------------
 # Small helpers
@@ -91,6 +74,10 @@ def _classify_output_kind(outputs: torch.Tensor, class_dim: int = 1, sample_frac
             return 'log_probs'
     return 'logits'
 
+def _to_float(x):
+    if isinstance(x, (float, int)): return float(x)
+    if torch.is_tensor(x): return float(x.detach().cpu().item())
+    return float(x)
 
 def _to_logits(out: torch.Tensor, kind: str) -> torch.Tensor:
     eps = get_eps_value()
@@ -394,29 +381,16 @@ class Trainer:
         elif self.loss_name == "Lovasz":
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
         elif self.loss_name == "Dirichlet":
-            # def s_for_entropy_floor(C, h_norm, tol=1e-8):
-            #     import math
-            #     def H_norm(s):
-            #         if s<=0: return 0.0
-            #         return (-(1-s)*math.log(1-s) - s*math.log(s/(C-1))) / math.log(C)
-            #     # binary search on s in [0, 1 - 1/C)
-            #     lo, hi = 0.0, 1.0 - 1.0/C
-            #     for _ in range(80):
-            #         mid = (lo+hi)/2
-            #         if H_norm(mid) < h_norm: lo = mid
-            #         else: hi = mid
-            #     return (lo+hi)/2
-            # set target smoothing value for minimum desired enryopy [0,1]
-            self.nll_smoothing_start = 0.25 # s_for_entropy_floor(self.num_classes, 0.05)
-            self. criterion_dirichlet = DirichletCriterion(
+            self.nll_smoothing_start = 0.25
+            self.criterion_dirichlet = DirichletCriterion(
                 num_classes=self.num_classes,
                 ignore_index=self.ignore_idx,
                 eps=get_eps_value(),
-                prior_concentration=1.5*self.num_classes,
+                prior_concentration=2*self.num_classes,
                 p_moment=2.0,
                 smoothing=self.nll_smoothing_start,
                 kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
-                nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, scale-invariant)
+                nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, acts on p_hat)
                 comp_gamma = 2.0,
                 comp_tau   = 0.75,    # if you still see confident mistakes, try 0.75 later
                 comp_sigma = 0.10,      # bounded to [0.06, 0.12]
@@ -424,8 +398,6 @@ class Trainer:
             )
 
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
-            
-            self.criterion_nll_temp = torch.nn.NLLLoss()
             
             # loss weights
             defaults = dict(w_nll=0.0, 
@@ -440,14 +412,14 @@ class Trainer:
             self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
             self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
             self.w_comp = w["w_comp"]
-            
             # define prior/base weights (your cfg) and your desired target ratios
-            self.base_weights = {"nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
-                    "imax": self.w_imax, "ir": self.w_ir, "kl": self.w_kl, "comp": self.w_comp}
+            self.base_weights = {
+                "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
+                "imax": self.w_imax, "ir": self.w_ir, "kl": self.w_kl, "comp": self.w_comp,
+            }
 
-            # target proportions: keep KL smaller than NLL/Lovasz, etc.
-            targets = {"nll": 1.0, "ls": 1.0, "dce": 0.8, "imax": 0.8, "ir": 0.3, "kl": 0.15, "comp": 0.15}
-
+            # target proportions don't necessarily need to be softmaxed
+            targets = {"nll": 0.425, "ls": 0.425, "dce": 0.0, "imax": 0.0, "ir": 0.0, "kl": 0.05, "comp": 0.1}
             self.loss_w_eq = ProportionalGradNorm(targets=targets, base=self.base_weights, ema_beta=0.9, power=0.5,
                                     min_mult=0.25, max_mult=4.0)
             
@@ -493,9 +465,6 @@ class Trainer:
         # Dirichlet-specific schedules
         if self.loss_name == "Dirichlet":
             get_predictive_entropy_norm.reset()
-            # gentle late late decay
-            #self.criterion_dirichlet.smoothing = smoothing_schedule(epoch, self.num_epochs, s0=self.nll_smoothing_start, s_min=0.15, start_frac=0.25, end_frac=0.8)
-            # self.balancer.begin_epoch(epoch)
 
         for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
             tqdm.tqdm(loader, desc=f"train {epoch+1}")
@@ -527,8 +496,6 @@ class Trainer:
             self._start_timer()
             outputs = self.model(*inputs)
             
-            
-
             # Decide output kind once (first batch)
             if self._model_act_kind is None:
                 self._model_act_kind = _classify_output_kind(outputs, class_dim=1)
@@ -570,48 +537,28 @@ class Trainer:
                     raw_g = getattr(self, "_last_raw_g", {})
                 
             elif self.loss_name == "Dirichlet":
-                def _to_float(x):
-                    if isinstance(x, (float, int)): return float(x)
-                    if torch.is_tensor(x): return float(x.detach().cpu().item())
-                    return float(x)
-                
-                # alpa computed ONCE here and reused everywhere below
-                # For stability, convert to *logits-like* first and then alpha
-                #logits_like = _to_logits(outputs, self._model_act_kind)
                 alpha = to_alpha_concentrations(outputs)
                 
                 # get dirichlet losses
                 L_dir_dict={}
-                if step % 10 ==0:    # every 2nd iteration update ema class weight accumulator
+                if step % 10 ==0:    # every 10 iteration update ema class weight accumulator, TODO: currently hard coded
                     self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
-                if True: #epoch >=2:   # TODO: hard coded warm-start num epochs
-                    loss_dirichlet, L_dir_dict = self.criterion_dirichlet(
-                        alpha, labels,
-                        w_nll=self.w_nll,
-                        w_dce=self.w_dce,
-                        w_imax=self.w_imax,
-                        w_ir=self.w_ir,
-                        w_kl=self.w_kl,        # tune to keep alpha0 in range
-                        w_comp=self.w_comp
-                    )
-            
-                # Lovasz on either Dirichlet mean 
-                    # alpha0 = alpha.sum(dim=1, keepdim=True) + get_eps_value()
-                    # p_hat = alpha / alpha0
-                # or softmax
-                    # alpha0 treated as constant -> It stops Lovasz gradients from shrinking as alpha0 inflates (without the detach they scale like ~1/alpha0
-                    # should shape class proportions only; letting it backprop through alpha0 makes it push the evidence scale (can collapse or inflate alpha0)
-                #.detach() # NOTE: detach here is wanted. # debugging: print(p_hat[0,:,32,32],"\n", alpha[0,:,32,32],"\n", alpha0[0,:,32,32]) 
-                loss_ls = self.criterion_lovasz(F.softmax(outputs, dim=1), labels.long(), model_act="probs")
                 
-                # if False: #epoch < 2: # first two epoch geometry warm-start # TODO: hard coded warm-start num epochs
-                #     from models.losses import nll_dirichlet_categorical, dce_from_alpha
-                #     #loss_dircat = nll_dirichlet_categorical(alpha, labels, self.ignore_idx)
-                #     loss_dce = dce_from_alpha(alpha, labels, self.ignore_idx)
-                #     loss = self.w_ls * loss_ls + loss_dce #self.criterion_nll_temp(torch.log(p_hat), labels))
-                # else:
-                loss = loss_dirichlet + (self.w_ls * loss_ls)
-                total_loss += float(loss.item())
+                loss_dirichlet, L_dir_dict = self.criterion_dirichlet(
+                    alpha, labels,
+                    w_nll=self.w_nll,
+                    w_dce=self.w_dce,
+                    w_imax=self.w_imax,
+                    w_ir=self.w_ir,
+                    w_kl=self.w_kl,        # tune to keep alpha0 in range
+                    w_comp=self.w_comp
+                )
+            
+                # Lovasz on either Dirichlet mean (p_hat) or softmaxed model logits F.softmax(outputs, dim=1). We found on Dirichlet mean yielding better results.
+                alpha0 = alpha.sum(dim=1, keepdim=True) + get_eps_value()
+                p_hat = alpha / alpha0  # debugging: print(p_hat[0,:,32,32],"\n", alpha[0,:,32,32],"\n", alpha0[0,:,32,32]) 
+                
+                loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
                 
                 # ----------------- PRE-BACKWARD: compute grad norms -----------------
                 raw_g = {}
@@ -623,7 +570,7 @@ class Trainer:
                     # lovasz
                     if self.base_weights.get("ls", 0.0) > 0.0 and loss_ls.requires_grad:
                         raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
-
+                        
                     # update equalizer only on schedule; else keep current weights
                     if do_eq and raw_g:
                         new_w = self.loss_w_eq.step(raw_g)       # uses EFFECTIVE-norm control internally
@@ -639,15 +586,15 @@ class Trainer:
                     raw_g = getattr(self, "_last_raw_g", {})
                     eff_g = getattr(self, "_last_eff_g", {})
 
-                # rebuild total using the updated weights
-                total = 0.0
-                if new_w.get("dce", 0.0)  > 0: total = total + new_w["dce"]  * L_dir_dict.get("dce",  0.0)
-                if new_w.get("nll", 0.0)  > 0: total = total + new_w["nll"]  * L_dir_dict.get("nll",  0.0)
-                if new_w.get("imax", 0.0) > 0: total = total + new_w["imax"] * L_dir_dict.get("imax", 0.0)
-                if new_w.get("ir", 0.0)   > 0: total = total + new_w["ir"]   * L_dir_dict.get("ir",   0.0)
-                if new_w.get("kl", 0.0)   > 0: total = total + new_w["kl"]   * L_dir_dict.get("kl",   0.0)
-                if new_w.get("comp", 0.0) > 0: total = total + new_w["comp"] * L_dir_dict.get("comp", 0.0)
-                if new_w.get("ls", 0.0)   > 0: total = total + new_w["ls"]   * loss_ls
+                # rebuild total using the updated weights, NOTE: loss parameter below was called "total"
+                loss = 0.0
+                if new_w.get("dce", 0.0)  > 0: loss = loss + new_w["dce"]  * L_dir_dict.get("dce",  0.0)
+                if new_w.get("nll", 0.0)  > 0: loss = loss + new_w["nll"]  * L_dir_dict.get("nll",  0.0)
+                if new_w.get("imax", 0.0) > 0: loss = loss + new_w["imax"] * L_dir_dict.get("imax", 0.0)
+                if new_w.get("ir", 0.0)   > 0: loss = loss + new_w["ir"]   * L_dir_dict.get("ir",   0.0)
+                if new_w.get("kl", 0.0)   > 0: loss = loss + new_w["kl"]   * L_dir_dict.get("kl",   0.0)
+                if new_w.get("comp", 0.0) > 0: loss = loss + new_w["comp"] * L_dir_dict.get("comp", 0.0)
+                if new_w.get("ls", 0.0)   > 0: loss = loss + new_w["ls"]   * loss_ls
 
                 # keep a clean, detached copy for viz AFTER losses computed
                 self._alpha_cache = alpha.detach()
@@ -656,7 +603,7 @@ class Trainer:
                 raise RuntimeError("unreachable")
 
             # @@@ After loss calculaltion @@@
-            
+            total_loss += float(loss.item())
             # Backprop
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -667,17 +614,17 @@ class Trainer:
             # ----------------- POST-STEP: logging -----------------
             elapsed_ms = self._stop_timer_ms()
             
-            # IoU handler accumulate
-            #log_probs = torch.log_softmax(outputs, dim=1)
-            #probs = log_probs.exp() # [B,C,H,W]
+            # get predicted class argmax
             preds = outputs.argmax(dim=1)
+            
+            # IoU handler accumulate
             self.iou_evaluator.update(preds, labels)
             
             # Dirichlet running uncertainty stat (reuse cached alpha)
             if self.loss_name == "Dirichlet" and self._alpha_cache is not None:
                 H_norm = get_predictive_entropy_norm.accumulate(self._alpha_cache.cpu())
                 
-            # Logging (every 10 steps)
+            # Logging
             if do_log:
                 self.writer.add_scalar("loss/iter", loss.item(), self.global_step)
                 self.writer.add_scalar("LR/iter", self.optimizer.param_groups[0]['lr'], self.global_step)
@@ -691,7 +638,7 @@ class Trainer:
                     # Lovasz
                     if new_w.get("ls", 0.0) != 0.0:
                         self.writer.add_scalar("loss/ls", _to_float(loss_ls) * new_w["ls"], self.global_step)
-
+                                            
                     if raw_g:
                         # grad norms raw per loss
                         for name, g in raw_g.items():
@@ -938,14 +885,14 @@ class Trainer:
                     bin_width=0.05, 
                     show_percent_on_bars=True,
                     title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png"),
+                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
                 )
             elif use_mc_sampling:
                 self.ua_agg.plot_accuracy_vs_uncertainty_bins(
                     bin_width=0.05, 
                     show_percent_on_bars=True,
                     title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:06d}.png"),
+                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
                 )
         self.ua_agg.reset()
 
@@ -971,10 +918,14 @@ class Trainer:
                 if self.scheduler and isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(mIoU)
 
-                if self.logging and self.save_path and mIoU > best_mIoU:
-                    best_mIoU = mIoU
-                    ckpt_path = os.path.join(self.save_path, f"best_epoch_{epoch:03d}.pt")
-                    torch.save(self.model.state_dict(), ckpt_path)
+                if self.logging and self.save_path: 
+                    if mIoU > best_mIoU: # save best weight
+                        best_mIoU = mIoU
+                        ckpt_path = os.path.join(self.save_path, f"best_epoch_{epoch:03d}.pt")
+                        torch.save(self.model.state_dict(), ckpt_path)
+                    else:   # save weights regardless but not labeled as "best"                       
+                        ckpt_path = os.path.join(self.save_path, f"epoch_{epoch:03d}.pt")
+                        torch.save(self.model.state_dict(), ckpt_path)
 
         # final eval & save
         self.test_one_epoch(val_loader, self.num_epochs - 1)
