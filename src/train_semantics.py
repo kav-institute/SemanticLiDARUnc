@@ -92,7 +92,7 @@ def main(args):
     
     # TODO: Debugging only, tiny dset
     # data_path_train=data_path_train[:10]
-    # data_path_test=data_path_test[:10]
+    #data_path_test=data_path_test[:1000]
     
     depth_dataset_train = SemanticDataset(
                             data_path=data_path_train, 
@@ -233,18 +233,18 @@ def main(args):
         time_start = time.strftime("%y-%m-%d_%H-%M-%S", t)  # Changed format to avoid colons
         save_path = os.path.join(save_path, time_start)
         
-        os.makedirs(save_path, exist_ok=True)
-        cfg["extras"]["save_path"] = save_path
+        if args.mode!="test":
+            os.makedirs(save_path, exist_ok=True)
+            cfg["extras"]["save_path"] = save_path
 
-        #save_path = os.path.dirname(cfg["extras"]["save_path"])
-        # write config file
-        with open(os.path.join(cfg["extras"]["save_path"], "config.yaml"), "w") as file:
-            yaml.safe_dump(
-                cfg, 
-                file,
-                default_flow_style=False,   # use block style (indented) rather than inline when set to False
-                sort_keys=False             # preserve the order in your dict (if PyYAML >=5.1) when set to False
-            )
+            # write config file
+            with open(os.path.join(cfg["extras"]["save_path"], "config.yaml"), "w") as file:
+                yaml.safe_dump(
+                    cfg, 
+                    file,
+                    default_flow_style=False,   # use block style (indented) rather than inline when set to False
+                    sort_keys=False             # preserve the order in your dict (if PyYAML >=5.1) when set to False
+                )
             
         # with open(os.path.join(cfg["extras"]["save_path"], "config.json"), 'w') as fp:
         #     json.dump(cfg, fp)
@@ -255,6 +255,62 @@ def main(args):
         trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
         trainer(dataloader_train, dataloader_test)
     elif args.mode=="test":
+        # class_names = {
+        #     0 : "unlabeled",
+        #     1 : "car",
+        #     2 : "bicycle",
+        #     3 : "motorcycle",
+        #     4 : "truck",
+        #     5 : "other-vehicle",
+        #     6: "person",
+        #     7: "bicyclist",
+        #     8: "motorcyclist",
+        #     9: "road",
+        #     10: "parking",
+        #     11: "sidewalk",
+        #     12: "other-ground",
+        #     13: "building",
+        #     14: "fence",
+        #     15: "vegetation",
+        #     16: "trunk",
+        #     17: "terrain",
+        #     18: "pole",
+        #     19: "traffic-sign",
+        #     20: "snow"
+        #     }
+        # choose test mask for the desired classes from above
+        cfg["extras"]["test_mask"] = {
+            0 : False,
+            1 : True,
+            2 : True,
+            3 : True,
+            4 : True,
+            5 : True,
+            6 : True,
+            7 : True,
+            8 : True,
+            9 : True,
+            10: True,
+            11: True,
+            12: True,
+            13: True,
+            14: True,
+            15: True,
+            16: True,
+            17: True,
+            18: True,
+            19: True
+        }
+        
+        match cfg['dataset_name']:
+            case "SemanticKitti": pass
+            case "SemanticSTF": pass    # TODO: get class distributions TBD
+            case "SemanticTHAB": cfg["extras"]["test_mask"][7]=False; cfg["extras"]["test_mask"][8]=False   # bicyclist and motorcyclist not in test set
+            case "Panoptic-CUDAL": pass # TODO: get class distributions TBD
+            case "SemanticWADS": cfg["extras"]["test_mask"][20]=True    # TODO: get class distributions TBD
+            case _: raise KeyError("in yaml config parameter dataset_name is invalid") 
+        
+        
         from models.tester import Tester
         tester = Tester(
             model=model,
@@ -287,12 +343,12 @@ if __name__ == '__main__':
     parser.add_argument('--cfg_path', 
                         #action='store_true',
                         type=str, 
-                        default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
+                        default="/home/devuser/workspace/src/configs/SemanticTHAB_default.yaml",
                         help='Path to the config file used for training')
     parser.add_argument('--mode', 
                         #action='store_true',
                         type=str, 
-                        default="train",
+                        default="test",
                         help="Training option whether to 'train' or 'test' the model")
     args = parser.parse_args()
     main(args)

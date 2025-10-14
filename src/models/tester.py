@@ -153,8 +153,11 @@ class Tester:
         # SemanticKitti test dataset has 95_937_758 valid lidar points not including class unlabeled
         self.iou_evaluator = IoUEvaluator(self.num_classes)
         
-        self.test_mask = [1] * cfg["extras"]["num_classes"]
-        self.test_mask[0] = 0
+        if cfg["extras"].get("test_mask", 0):
+            self.test_mask = list(cfg["extras"]["test_mask"].values())
+        else:
+            self.test_mask = [1] * cfg["extras"]["num_classes"]
+            self.test_mask[0] = 0
         
         # ignore index
         self.ignore_idx = 0
@@ -573,26 +576,20 @@ class Tester:
             class_names=list(class_names.values()),
             color_map=color_map,
             ignore_ids=(0,2,3,4,5,7,8,10,12,14,16,19),
-            bins=100_000,                 # try 4096 if you like
+            bins=100_000,                 
             bandwidth="scott",     # or "scott" or a float (e.g., 0.02)
             title="Normalized Uncertainty per Class (Ridged Plot)",
-            save_path="uncertainty_ridgedplot.png",
-        )
-        
-        self.ua_agg.plot_accuracy_vs_uncertainty_bins(
-            bin_edges=np.linspace(0.0, 1.0, 11),  # 10 bins
-            title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-            save_path="acc_vs_unc_bins.png",
+            save_path=os.path.join(out_dir, f"uncertainty_ridgedplot_{epoch_name}.png"),
         )
 
-        plot_iou_sorted_by_uncertainty(
-            self.unc_agg,
-            result_dict=result_dict,
-            class_names=list(class_names.values()),
-            color_map=color_map,
-            ignore_ids=(0,),  # ignore 'unlabeled'
-            save_path="iou_sorted_by_uncertainty.png"
-        )
+        # plot_iou_sorted_by_uncertainty(
+        #     self.unc_agg,
+        #     result_dict=result_dict,
+        #     class_names=list(class_names.values()),
+        #     color_map=color_map,
+        #     ignore_ids=self.test_mask,  # ignore 'unlabeled'
+        #     save_path="iou_sorted_by_uncertainty.png"
+        # )
         
 
     # convenience wrapper
