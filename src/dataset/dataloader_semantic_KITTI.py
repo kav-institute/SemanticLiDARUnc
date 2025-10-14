@@ -123,7 +123,7 @@ def main(path_to_dataset, split_type="train", num_classes=20, visu=False):
         counts = np.bincount(semantics.reshape(-1).astype(np.int64), minlength=num_classes)
         total_counts += counts
         
-        if batch_idx > 20: break
+        #if batch_idx > 20: break
         if visu:
             reflectivity = (reflectivity[:,0,:,:]).permute(0, 1, 2)[0,...].cpu().detach().numpy()
             normal_img = (normals.permute(0, 2, 3, 1)[0,...].cpu().detach().numpy()+1)/2
@@ -146,13 +146,14 @@ def main(path_to_dataset, split_type="train", num_classes=20, visu=False):
         annot_rotation=50,         # horizontal totals
         annot_offset=5,          # push labels a bit higher    
         top_pad=None,               # even more headroom if needed , None for auto adjust top height
-        title="SemanticKITTI Class Distribution [train split]",
-        save_path="/home/devuser/workspace/src/dataset/class_distributions/classDistribution_SemanticKitti.png"
+        title=f"SemanticKITTI Class Distribution [{split_type} split]",
+        save_path=f"/home/devuser/workspace/src/dataset/class_distributions/classDistribution_SemanticKitti_{split_type}.png"
     )
     print(class_counts)
+    print("END")
 
 if __name__ == "__main__":
-    path_to_dataset = "/home/devuser/workspace/data/SemanticKitti/dataset/sequences"
-    split_type = "train" # choose dataset split, options: "train" | "test"
+    path_to_dataset = "/home/devuser/workspace/data/semantic_datasets/SemanticKitti/dataset/sequences"
+    split_type = "test" # choose dataset split, options: "train" | "test"
     num_classes = 20
-    main(path_to_dataset, split_type, num_classes)
+    main(path_to_dataset, split_type, num_classes, visu=False)
