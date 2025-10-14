@@ -1,12 +1,12 @@
 # path to SemanticTHAB dataset (sequences), no tailing path seperator!
-dataset_dir: "/home/devuser/workspace/data/SemanticKitti/dataset/sequences"
+dataset_dir: "/home/devuser/workspace/data/semantic_datasets/SemanticKitti/dataset/sequences"
 dataset_name: "SemanticKitti"
 
 model_settings: {
   # Defines model backbone architecture
-  # Baseline model. type: str. options: SalsaNext | Reichert | SalsaNextAdf
+  # Baseline model. type: str. options: SalsaNext | Reichert
     baseline: "SalsaNext", 
-  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf | SalsaNext
+  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNext
     loss_function: "Dirichlet",
 
   # Model Layer settings, specific to "Reichert" baseline
@@ -39,7 +39,7 @@ model_settings: {
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: null
+    pretrained: null, #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/Dirichlet_nr/25-10-10_10-29-54/model_final.pt"
     # SalsaNext: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticKitti/SalsaNext/test_split_0008/efficientnet_v2_l_anmSalsaNext/25-10-02_12-34-06/model_final.pt"
     # Reichert Dirchlet: "/home/devuser/workspace/data/train_semantic_THAB_v3/test_split_final/efficientnet_v2_l_anmpDirichlet/25-07-01_17-13-35/model_000001.pt"
     # Reichert pretrained: "/home/devuser/workspace/data/train_semantic_THAB_v3/efficientnet_v2_l_anmpTversky/model_final.pth"
@@ -51,9 +51,9 @@ model_weights: {
     w_nll:   1.0,  # Dirichlet-categorical NLL or density based
     w_imax:  0.0,   # 
     w_dce:   0.0,   # 
-    w_kl:    0.0,  # KL evidence term governs alpha0, keeps near prior_concentration, 2.0
+    w_kl:    1.0,  # KL evidence term governs alpha0, keeps near prior_concentration, 2.0 * num_classes
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  0.0    # shapes uncertainty on unsure pixels, 7.0
+    w_comp:  5.0,    # shapes uncertainty on unsure pixels, 5.0
   },
   SalsaNext: {
     w_nll:   1.0, 
@@ -79,7 +79,7 @@ train_params: {
   ## Sets numbor of worker processes
     num_workers: 16,
   ## Sets number of total training epochs
-    num_epochs: 60, # using CosineAnnealingWarmRestarts LR scheduler with length 15epochs each cycle -> 15*4=60
+    num_epochs: 50, # using CosineAnnealingWarmRestarts LR scheduler with length 15epochs each cycle -> 15*4=60
   ## Sets weight decay
   weight_decay: 1.e-4,
   ## Gradually/Linearilly increases learning rate until base learning is reached for 'num_warmup_epochs' Epochs
