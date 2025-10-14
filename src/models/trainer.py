@@ -284,9 +284,10 @@ class Trainer:
 
         # evaluator
         self.iou_evaluator = IoUEvaluator(self.num_classes)
-        if test_mask is None:
-            self.test_mask = [1] * cfg["extras"]["num_classes"]
-            self.test_mask[0] = 0
+        if cfg["extras"].get("test_mask", 0):
+            self.test_mask = list(cfg["extras"]["test_mask"].values())
+        else:
+            self.test_mask = [0] + [1] * (cfg["extras"]["num_classes"] - 1)
 
         # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -345,9 +346,7 @@ class Trainer:
             TverskyLoss,
             CrossEntropyLoss,
             LovaszSoftmaxStable,
-            DirichletCriterion,
-            SoftmaxHeteroscedasticLoss
-            #DirichletLoss
+            DirichletCriterion
         )
         
         def load_loss_weights(cfg: dict, loss_name: str, defaults: dict) -> dict:
@@ -387,7 +386,7 @@ class Trainer:
                 ignore_index=self.ignore_idx,
                 eps=get_eps_value(),
                 prior_concentration=2*self.num_classes,
-                p_moment=2.0,
+                p_moment=1.0,
                 smoothing=self.nll_smoothing_start,
                 kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
                 nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, acts on p_hat)
@@ -412,18 +411,38 @@ class Trainer:
             self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
             self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
             self.w_comp = w["w_comp"]
-            # define prior/base weights (your cfg) and your desired target ratios
+            # define prior/base weights (from cfg)
             self.base_weights = {
                 "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
-                "imax": self.w_imax, "ir": self.w_ir, "kl": self.w_kl, "comp": self.w_comp,
+                "imax": self.w_imax, "comp": self.w_comp,
+                "ir": self.w_ir, "kl": self.w_kl    # should not be part of the loss weight balancer
             }
-
-            # target proportions don't necessarily need to be softmaxed
-            targets = {"nll": 0.425, "ls": 0.425, "dce": 0.0, "imax": 0.0, "ir": 0.0, "kl": 0.05, "comp": 0.1}
-            self.loss_w_eq = ProportionalGradNorm(targets=targets, base=self.base_weights, ema_beta=0.9, power=0.5,
-                                    min_mult=0.25, max_mult=4.0)
             
-            # lovasz baseline gn_fractions DCE ≈ 0.6–1.0×, iMAX ≈ 0.3–0.7×, KL ≈ 0.3–0.6× (more if alpha0 grows), IR ≈ 0.2–0.4×, nll≈0.9x not above 1.0x
+            # Which losses should be *balanced* by GradNorm (supervised/shape only)
+            # Anything *not* in BALANCE_KEYS should be added to the loss with a fixed weight outside GradNorm.
+            BALANCE_KEYS = ("nll", "ls", "imax", "comp", "dce")
+            self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
+            
+            # target proportions don't necessarily need to be softmaxed
+            self.targets = {"nll": 1.0, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.2} # "ir": 0.0, "kl": 0.0
+            
+            base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
+            targets_for_balancer = {k: self.targets.get(k, 0.0) for k in self.activeKeys_weightBalancer}
+
+            self.loss_w_eq = ProportionalGradNorm(      #ema_beta=0.9, power=0.5, # 0.9, min_mult=0.25, max_mult=4.0
+                    targets=targets_for_balancer, 
+                    base=base_for_balancer, 
+                    ema_beta=0.99,
+                    power=0.3, 
+                    min_mult=0.5, 
+                    max_mult=2.0)
+            # set target kl lambda to the one in config
+            def kl_lambda_schedule(step, max_val=self.base_weights.get("kl", 1e-2), warmup=1000):
+                x = (step - warmup) / max(1, warmup // 3)
+                # smooth 0 -> max_val
+                return float(max_val) * (0.5 * (1.0 + torch.tanh(torch.tensor(x))).item())
+            self.kl_lambda_schedule = kl_lambda_schedule
+
         elif self.loss_name == "SalsaNext":
             self.criterion_nll = torch.nn.NLLLoss()#CrossEntropyLoss(ignore_index=self.ignore_idx)
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
@@ -495,6 +514,7 @@ class Trainer:
 
             self._start_timer()
             outputs = self.model(*inputs)
+            elapsed_ms = self._stop_timer_ms()
             
             # Decide output kind once (first batch)
             if self._model_act_kind is None:
@@ -563,22 +583,26 @@ class Trainer:
                 # ----------------- PRE-BACKWARD: compute grad norms -----------------
                 raw_g = {}
                 if need_raw:
-                    # dirichlet terms (RAW norms w.r.t. params)
+                    # Measure raw grad norms (for ALL losses you want to see)
                     for name, val in L_dir_dict.items():
-                        if self.base_weights.get(name, 0.0) > 0.0 and val.requires_grad:
+                        if self.base_weights.get(name, 0.0) > 0.0 and isinstance(val, torch.Tensor) and val.requires_grad:
                             raw_g[name] = grad_norm_wrt(val, self.model_ref_params, retain_graph=True)
-                    # lovasz
-                    if self.base_weights.get("ls", 0.0) > 0.0 and loss_ls.requires_grad:
+                    # Lovasz is separate
+                    if self.base_weights.get("ls", 0.0) > 0.0 and isinstance(loss_ls, torch.Tensor) and loss_ls.requires_grad:
                         raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
                         
                     # update equalizer only on schedule; else keep current weights
                     if do_eq and raw_g:
-                        new_w = self.loss_w_eq.step(raw_g)       # uses EFFECTIVE-norm control internally
+                        active_g = {k: raw_g[k] for k in self.activeKeys_weightBalancer if k in raw_g}
+                        new_w = self.loss_w_eq.step(active_g)       # uses EFFECTIVE-norm control internally
                     else:
                         new_w = self.loss_w_eq.weights()
 
-                    # cache latest norms for later logging steps that don't measure
-                    eff_g = {k: abs(float(new_w.get(k, 0.0))) * float(raw_g[k]) for k in raw_g}
+                    # Effective grad norms: use balanced weight if present, else fall back to fixed base weight
+                    def _eff_weight(name: str) -> float:
+                        return float(new_w.get(name, self.base_weights.get(name, 0.0)))
+                    eff_g = {k: _eff_weight(k) * float(raw_g[k]) for k in raw_g}
+
                     self._last_raw_g = raw_g
                     self._last_eff_g = eff_g
                 else:
@@ -586,15 +610,23 @@ class Trainer:
                     raw_g = getattr(self, "_last_raw_g", {})
                     eff_g = getattr(self, "_last_eff_g", {})
 
-                # rebuild total using the updated weights, NOTE: loss parameter below was called "total"
+                # ----------------- BUILD TOTAL LOSS -----------------
                 loss = 0.0
+                # balanced terms
                 if new_w.get("dce", 0.0)  > 0: loss = loss + new_w["dce"]  * L_dir_dict.get("dce",  0.0)
                 if new_w.get("nll", 0.0)  > 0: loss = loss + new_w["nll"]  * L_dir_dict.get("nll",  0.0)
                 if new_w.get("imax", 0.0) > 0: loss = loss + new_w["imax"] * L_dir_dict.get("imax", 0.0)
-                if new_w.get("ir", 0.0)   > 0: loss = loss + new_w["ir"]   * L_dir_dict.get("ir",   0.0)
-                if new_w.get("kl", 0.0)   > 0: loss = loss + new_w["kl"]   * L_dir_dict.get("kl",   0.0)
                 if new_w.get("comp", 0.0) > 0: loss = loss + new_w["comp"] * L_dir_dict.get("comp", 0.0)
                 if new_w.get("ls", 0.0)   > 0: loss = loss + new_w["ls"]   * loss_ls
+                
+                # fixed (NOT balanced) regularizers - still included in total and logs
+                if self.base_weights.get("ir", 0.0) > 0.0:
+                    loss = loss + self.base_weights["ir"] * L_dir_dict.get("ir", 0.0)
+
+                if self.base_weights.get("kl", 0.0) > 0.0:
+                    lam_kl = self.kl_lambda_schedule(self.global_step)
+                    self.base_weights["kl"] = lam_kl
+                    loss = loss + self.base_weights["kl"] * L_dir_dict.get("kl", 0.0)
 
                 # keep a clean, detached copy for viz AFTER losses computed
                 self._alpha_cache = alpha.detach()
@@ -612,7 +644,6 @@ class Trainer:
 
             self.update_step += 1
             # ----------------- POST-STEP: logging -----------------
-            elapsed_ms = self._stop_timer_ms()
             
             # get predicted class argmax
             preds = outputs.argmax(dim=1)
@@ -635,23 +666,29 @@ class Trainer:
                         if w_cur != 0.0:
                             self.writer.add_scalar(f"loss/{name}", _to_float(val) * w_cur, self.global_step)
 
-                    # Lovasz
-                    if new_w.get("ls", 0.0) != 0.0:
-                        self.writer.add_scalar("loss/ls", _to_float(loss_ls) * new_w["ls"], self.global_step)
-                                            
+                    # Lovasz (same effective weight logic; new_w should have it, but fallback is fine)
+                    w_ls_eff = new_w.get("ls", self.base_weights.get("ls", 0.0))
+                    if w_ls_eff != 0.0:
+                        self.writer.add_scalar("loss/ls", _to_float(loss_ls) * float(w_ls_eff), self.global_step)
+                    
+                    # KL evidence
+                    if self.base_weights.get("kl", 0.0) != 0.0:
+                        self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * self.base_weights["kl"], self.global_step)
+                    
+                    # Information regularization term
+                    if self.base_weights.get("ir", 0.0) != 0.0:
+                        self.writer.add_scalar("loss/ir", _to_float(L_dir_dict.get("ir", 0.0)) * self.base_weights["ir"], self.global_step)
+
+                    # grad norms raw / eff already prepared (eff_g uses effective weights for all keys)
                     if raw_g:
-                        # grad norms raw per loss
                         for name, g in raw_g.items():
                             self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
-                        # rss raw
-                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5 if raw_g else 0.0
+                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5
                         self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
 
                     if eff_g:
-                        # grad norms eff per loss
                         for name, g in eff_g.items():
                             self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
-                        # rss eff
                         rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
                         self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
                     
@@ -756,7 +793,7 @@ class Trainer:
         
         mIoU, result_dict = self.iou_evaluator.compute(
             class_names=self.class_names,
-            test_mask=self.test_mask,
+            test_mask=[0] + [1] * (self.num_classes - 1),
             ignore_gt=[self.ignore_idx],
             reduce="mean",
             ignore_th=None
@@ -810,6 +847,9 @@ class Trainer:
             # --- inside test_one_epoch loop, MC path ---
             if use_mc_sampling:
                 mc_outputs = mc_forward(self.model, inputs, T=mc_T)     # [T,B,C,H,W]
+                
+                inference_times.append(self._stop_timer_ms())
+                
                 # debugging sanity check: print(mc_outputs.std().item(), mc_outputs.std(dim=0).mean().item())
                 log_probs = F.log_softmax(mc_outputs, dim=2)    # Log-softmax for numerical stability
                 probs = log_probs.exp()                             # get probs
@@ -822,8 +862,6 @@ class Trainer:
                 H_norm = entropy/ math.log(self.num_classes)    # [B,(H,W)]
                 
                 preds = p_bar.argmax(dim=1) # [B,1,H,W]
-
-                inference_times.append(self._stop_timer_ms())
                 
                 self.iou_evaluator.update(preds, labels)
                 self.ua_agg.update(
@@ -835,6 +873,8 @@ class Trainer:
             else: # single pass (no MC)
                 outputs = self.model(*inputs)
                 
+                inference_times.append(self._stop_timer_ms())
+                
                 if self._model_act_kind is None:
                     self._model_act_kind = _classify_output_kind(outputs, class_dim=1)
                     
@@ -843,7 +883,6 @@ class Trainer:
                 probs = log_probs.exp() # [B,C,H,W]
 
                 preds = probs.argmax(dim=1) # [B,1,H,W]
-                inference_times.append(self._stop_timer_ms())
                 
                 self.iou_evaluator.update(preds, labels)
                 
