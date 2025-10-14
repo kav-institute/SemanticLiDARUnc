@@ -213,10 +213,7 @@ def main(args):
     
     if args.with_logging:
         # Save Path
-        if cfg["logging_settings"]["test_id"] != -1:
-            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_{str(cfg['logging_settings']['test_id']).zfill(4)}"
-        else:
-            save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}/test_split_final"
+        save_path_p1 =f"{cfg['logging_settings']['log_dir']}/{cfg['model_settings']['baseline']}" #/test_split_final"
         
         save_path_p2 ='{}_{}{}{}{}{}'.format(
             cfg["model_settings"]["loss_function"],
@@ -246,16 +243,8 @@ def main(args):
                     sort_keys=False             # preserve the order in your dict (if PyYAML >=5.1) when set to False
                 )
             
-        # with open(os.path.join(cfg["extras"]["save_path"], "config.json"), 'w') as fp:
-        #     json.dump(cfg, fp)
-
-    # train model
-    if args.mode=="train":
-        from models.trainer import Trainer
-        trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
-        trainer(dataloader_train, dataloader_test)
-    elif args.mode=="test":
-        # class_names = {
+        # choose a test mask! if not set below default will be test on every class but the unlabeled "0".
+            # class_names = {
         #     0 : "unlabeled",
         #     1 : "car",
         #     2 : "bicycle",
@@ -278,7 +267,7 @@ def main(args):
         #     19: "traffic-sign",
         #     20: "snow"
         #     }
-        # choose test mask for the desired classes from above
+        
         cfg["extras"]["test_mask"] = {
             0 : False,
             1 : True,
@@ -302,6 +291,8 @@ def main(args):
             19: True
         }
         
+        # class distribution info stems from the dataset/dataloder_*.py files. 
+        # If no points in class present "test" mask for that class is set to False
         match cfg['dataset_name']:
             case "SemanticKitti": pass
             case "SemanticSTF": pass    # TODO: get class distributions TBD
@@ -310,7 +301,12 @@ def main(args):
             case "SemanticWADS": cfg["extras"]["test_mask"][20]=True    # TODO: get class distributions TBD
             case _: raise KeyError("in yaml config parameter dataset_name is invalid") 
         
-        
+    # train model
+    if args.mode=="train":
+        from models.trainer import Trainer
+        trainer = Trainer(model, optimizer, cfg, scheduler = scheduler, visualize = args.visualization, logging=args.with_logging)
+        trainer(dataloader_train, dataloader_test)
+    elif args.mode=="test":        
         from models.tester import Tester
         tester = Tester(
             model=model,
@@ -348,7 +344,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode', 
                         #action='store_true',
                         type=str, 
-                        default="test",
+                        default="train",
                         help="Training option whether to 'train' or 'test' the model")
     args = parser.parse_args()
     main(args)
