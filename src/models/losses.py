@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Function
 
 ### >>> Output-kind classifier (logits / probs / log_probs) <<< ###
 @torch.no_grad()
@@ -128,69 +127,7 @@ class TverskyLoss(nn.Module):
             return loss.sum()
         return loss
 
-# -------- Lovasz-Softmax helpers --------
-def lovasz_grad(gt_sorted):
-    """
-    Computes gradient of the Lovasz extension w.r.t sorted errors
-    See Alg. 1 in paper
-    """
-    p = len(gt_sorted)
-    gts = gt_sorted.sum()
-    intersection = gts - gt_sorted.float().cumsum(0)
-    union = gts + (1 - gt_sorted).float().cumsum(0)
-    jaccard = 1. - intersection / union
-    if p > 1:  # cover 1-pixel case
-        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
-    return jaccard
-
-class LovaszSoftmax(nn.Module):
-    def __init__(self, reduction='mean'):
-        super(LovaszSoftmax, self).__init__()
-        self.reduction = reduction
-
-    def prob_flatten(self, input, target):
-        assert input.dim() in [4, 5]
-        num_class = input.size(1)
-        if input.dim() == 4:
-            input = input.permute(0, 2, 3, 1).contiguous()
-            input_flatten = input.view(-1, num_class)
-        elif input.dim() == 5:
-            input = input.permute(0, 2, 3, 4, 1).contiguous()
-            input_flatten = input.view(-1, num_class)
-        target_flatten = target.view(-1)
-        return input_flatten, target_flatten
-
-    def lovasz_softmax_flat(self, inputs, targets):
-        num_classes = inputs.size(1)
-        losses = []
-        for c in range(num_classes):
-            target_c = (targets == c).float()
-            if num_classes == 1:
-                input_c = inputs[:, 0]
-            else:
-                input_c = inputs[:, c]
-            loss_c = (torch.autograd.Variable(target_c) - input_c).abs()
-            loss_c_sorted, loss_index = torch.sort(loss_c, 0, descending=True)
-            target_c_sorted = target_c[loss_index]
-            losses.append(torch.dot(loss_c_sorted, torch.autograd.Variable(lovasz_grad(target_c_sorted))))
-        losses = torch.stack(losses)
-
-        if self.reduction == 'none':
-            loss = losses
-        elif self.reduction == 'sum':
-            loss = losses.sum()
-        else:
-            loss = losses.mean()
-        return loss
-
-    def forward(self, inputs, targets):
-        inputs, targets = self.prob_flatten(inputs, targets)
-        losses = self.lovasz_softmax_flat(inputs, targets)
-        return losses
-
-####
-
-
+# -------- Lovasz-Softmax --------
 class LovaszSoftmaxStable(nn.Module):
     def __init__(self, ignore_index=None, classes='present'):
         super().__init__()
@@ -274,146 +211,6 @@ class LovaszSoftmaxStable(nn.Module):
         else:
             loss = losses.mean()
         return loss
-
-# -------- Combined SalsaNext objective --------
-class SalsaNextLoss(nn.Module):
-    """
-    Cross-Entropy (with class weights) + Lovasz-Softmax (probabilities),
-    works for both plain and ADF models.
-    """
-    def __init__(self, class_weights=None, ignore_index=255, lovasz_classes='present'):
-        super().__init__()
-        # lovasz_classes:
-            # ='all'    : always loops over all classes and averages their losses, even if a class doesn’t appear in the batch. This adds noise (not recommended)
-            # ='present': means only classes present in the batch contribute to Lovasz (stable for sparse scenes).
-        self.ce = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ignore_index)
-        self.lovasz = LovaszSoftmaxStable(ignore_index=ignore_index, classes=lovasz_classes)
-        self.ignore_index = ignore_index
-
-    def forward(self, outputs, labels):
-        # Accept either logits tensor or (mean_logits, var_logits)
-        if isinstance(outputs, tuple) and len(outputs) == 2:
-            logits = outputs[0]  # mean logits from ADF
-        else:
-            logits = outputs
-
-        # 1) Weighted CE on logits
-        loss_ce = self.ce(logits, labels.long())
-
-        # 2) Lovasz-Softmax on probabilities
-        probs = torch.softmax(logits, dim=1)
-        loss_ls = self.lovasz(probs, labels.long())
-
-        return loss_ce + loss_ls    #, {"ce": loss_ce.detach(), "lovasz": loss_ls.detach()}
-
-# from baselines.SalsaNext import adf
-# class SoftmaxHeteroscedasticLoss(torch.nn.Module):
-#     """Source from SalsaNext github repo: 
-#         https://github.com/TiagoCortinhal/SalsaNext/blob/7548c124b48f0259cdc40e98dfc3aeeadca6070c/train/tasks/semantic/modules/trainer.py#L37
-
-#         Added ignore index funtionality
-#     """
-#     def __init__(self, num_classes: int = 20, ignore_index: int | None = None):
-#         super().__init__()
-#         self.num_classes = num_classes
-#         self.ignore_index = ignore_index
-#         self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=lambda x: x+1e-3)
-
-#     def forward(self, outputs, targets, eps: float = 1e-5):
-#         """
-#         Original objective:
-#             L = mean( 0.5*((y - mu)^2 / (var + eps)) + 0.5*log(var + eps) )
-#         but exclude all pixels where targets == ignore_index.
-
-#         outputs: tuple(mean_logits, var_logits) -> passed through adf softmax
-#         targets: [B,H,W] or [B,1,H,W] with integer labels
-#         """
-#         mean, var = self.adf_softmax(*outputs)     # [B,C,H,W]
-
-#         # targets -> [B,H,W]
-#         if targets.ndim == 4 and targets.size(1) == 1:
-#             tgt = targets.squeeze(1)
-#         else:
-#             tgt = targets
-
-#         # mask valid pixels
-#         valid_mask = (tgt != self.ignore_index)    # [B,H,W]
-#         if not valid_mask.any():
-#             # no valid pixels — return 0 with grad
-#             return torch.tensor(0.0, device=targets.device, dtype=mean.dtype, requires_grad=True)
-
-#         # one-hot, with dummy label for ignored pixels (they'll be masked out)
-#         safe_tgt = tgt.clone()
-#         safe_tgt[~valid_mask] = 0
-#         one_hot = F.one_hot(safe_tgt, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
-
-#         # per-element loss (same as original)
-#         precision = 1.0 / (var + eps)
-#         per_elem = 0.5 * precision * (one_hot - mean) ** 2 + 0.5 * torch.log(var + eps)  # [B,C,H,W]
-
-#         # exclude all class channels at ignored pixels (exactly remove those elements from the global mean)
-#         mask_bc = valid_mask.unsqueeze(1).expand_as(per_elem)  # [B,C,H,W]
-#         loss = per_elem[mask_bc].mean()
-
-#         return loss
-
-from baselines.SalsaNext import adf
-import torch
-import torch.nn.functional as F
-
-class SoftmaxHeteroscedasticLoss(torch.nn.Module):
-    def __init__(self, num_classes: int = 20, ignore_index: int | None = None):
-        super().__init__()
-        self.num_classes  = num_classes
-        self.ignore_index = ignore_index
-        # USE GLOBAL KEEPER (softplus + cap) — not lambda x: x+const
-        self.adf_softmax  = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
-
-    def forward(self, outputs, targets, eps: float = 1e-6):
-        # outputs: (mean_logits, var_logits)
-        mean, var = self.adf_softmax(*outputs)        # [B,C,H,W]
-
-        # harden numerics
-        mean = mean.clamp(min=1e-7, max=1 - 1e-7)
-        var  = torch.clamp(var, min=1e-6, max=10.0)   # keep in the same range as the model
-
-        # targets -> [B,H,W]
-        if targets.ndim == 4 and targets.size(1) == 1:
-            tgt = targets.squeeze(1)
-        else:
-            tgt = targets
-
-        valid_mask = tgt != self.ignore_index if self.ignore_index is not None else torch.ones_like(tgt, dtype=torch.bool)
-        if not valid_mask.any():
-            return torch.tensor(0.0, device=targets.device, dtype=mean.dtype, requires_grad=True)
-
-        safe_tgt = tgt.clone()
-        safe_tgt[~valid_mask] = 0
-        one_hot = F.one_hot(safe_tgt, num_classes=self.num_classes).permute(0,3,1,2).to(mean.dtype)
-
-        # NLL-style heteroscedastic term (per class, masked)
-        precision = torch.reciprocal(var)             # safe because of clamp above
-        per_elem  = 0.5 * precision * (one_hot - mean) ** 2 + 0.5 * torch.log(var)
-
-        mask_bc = valid_mask.unsqueeze(1).expand_as(per_elem)
-        return per_elem[mask_bc].mean()
-
-# Source from SalsaNext github repo: 
-# https://github.com/TiagoCortinhal/SalsaNext/blob/7548c124b48f0259cdc40e98dfc3aeeadca6070c/train/tasks/semantic/modules/trainer.py#L37
-
-# class SoftmaxHeteroscedasticLoss(torch.nn.Module):
-#     # L = 0.5 * ((y - mu)**2 / (var + eps)) + 0.5 * log(var + eps)
-#     def __init__(self, num_classes):
-#         super(SoftmaxHeteroscedasticLoss, self).__init__()
-#         self.adf_softmax = adf.Softmax(dim=1, keep_variance_fn=adf.keep_variance_fn)
-
-#     def forward(self, outputs, targets, eps=1e-8):
-#         mean, var = self.adf_softmax(*outputs)
-#         targets = torch.nn.functional.one_hot(targets.squeeze(1), num_classes=20).permute(0,3,1,2).float()
-
-#         precision = 1 / (var + eps)
-#         nll = torch.mean(0.5 * precision * (targets - mean) ** 2 + 0.5 * torch.log(var + eps))
-#         return nll
 
 
 ### >>> Dirichlet <<< ###
@@ -602,23 +399,51 @@ def imax_from_alpha(alpha: torch.Tensor, target: torch.Tensor,
 # ----------------- regularizers (alpha-only) -----------------
 
 def kl_evidence_from_alpha(alpha: torch.Tensor, s: float,
-                           mask: torch.Tensor | None = None,
-                           eps: float = 1e-8) -> torch.Tensor:
+                            mask: torch.Tensor | None = None,
+                            eps: float = 1e-8,
+                            with_scaling: bool=True, scaling_force: float=1.0,
+                            one_sided: bool = True, gate_width: float = 0.05  # gate_width ~ e.g., 0.05-0.15 of s
+                            ) -> torch.Tensor:
     """
     Evidence prior: KL( Dir(alpha) || Dir(alpha_prior) ) with alpha_prior = s * p_hat,
     where p_hat = alpha / alpha0. This penalizes the total evidence alpha0 toward s
     while keeping the mean p_hat unchanged. KL only penalizes the magnitude and does not backprop through the prior.
     It prevents the KL from trying to reshape the mean and keeps it focused on the total evidence alpha0.
+    
+    If with_scaling=True, multiply per-pixel KL by (alpha0/s)^scaling_force for alpha0 > s (scaling_force=1),
+    which strengthens the pull when evidence is too large.
+    
+    KL acts both ways (it will try to push up when a0 < s and down when a0 > s). 
+    If you want a one-sided penalty (only act when a0 > s), add a gate with smooth transition with one_sided=True and add a gate width.
+    
     If mask is provided (bool [B,H,W]), return masked mean; else global mean.
     """
+    # total evidence
     a0    = alpha.sum(dim=1, keepdim=True) + eps
+    
+    # prior keeps the mean fixed; only total scale is penalized
     with torch.no_grad():
         p_hat = alpha / a0
-        alpha_prior = s * p_hat
+        alpha_prior = float(s) * p_hat
+        
     kl_map = _kl_map(alpha, alpha_prior)  # [B,H,W]
+    
+    if one_sided:
+        # soft gate ~ 0 below s, ~1 above s
+        width = gate_width * float(s)
+        g = torch.sigmoid((a0 - float(s)) / (width + eps)).squeeze(1)  # [B,H,W]
+        kl_map = kl_map * g
+        
+    if with_scaling:
+        # amplify only when a0 > s; scaling_momentum=1.0 (adjust if you want stronger effect with scaling_force>1)
+        scale = (a0.squeeze(1) / (float(s) + eps)).clamp_min(1.0).pow(scaling_force)
+        kl_map = kl_map * scale
+
     if mask is None:
         return kl_map.mean()
-    return (kl_map * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+    m = mask.float()
+    return (kl_map * m).sum() / m.sum().clamp_min(1.0)
 
 def kl_sym_from_alpha(alpha: torch.Tensor, c: float,
                       mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -756,7 +581,8 @@ class DirichletCriterion(nn.Module):
         if w_kl > 0.0:
             if self.kl_mode == "evidence":
                 # Mask KL by valid pixels so unlabeled regions do not bias it.
-                val = kl_evidence_from_alpha(alpha, self.prior_concentration, mask=valid, eps=self.eps)
+                val = kl_evidence_from_alpha(alpha, self.prior_concentration, mask=valid, eps=self.eps, 
+                                            with_scaling=True, scaling_force=2.0, one_sided=True, gate_width=0.05)
             else:
                 val = kl_sym_from_alpha(alpha, self.prior_concentration, mask=valid)
             terms["kl"] = val; total = total + w_kl * val
@@ -765,7 +591,7 @@ class DirichletCriterion(nn.Module):
             val = complement_kl_uniform_from_alpha(
                 alpha, target, ignore_index=self.ignore_index, eps=self.eps,
                 gamma=self.comp_gamma, tau=self.comp_tau, sigma=self.comp_sigma,
-                s_target=self.prior_concentration, normalize=self.comp_normalize
+                s_target=None, normalize=self.comp_normalize   # s_target=self.prior_concentration or None
             )
             terms["comp"] = val; total = total + w_comp * val
 
@@ -866,7 +692,7 @@ def complement_kl_uniform_from_alpha(
     """
     Purpose
     -------
-    Encourage uncertainty *spread* across off-classes when the model is unsure.
+    Encourage uncertainty *spread* across off-classes when the model is unsure (low confidence i.e. p_y on true class).
     We minimize a gated KL divergence between the off-class conditional
     distribution and the uniform distribution over off-classes.
 
@@ -897,7 +723,7 @@ def complement_kl_uniform_from_alpha(
         - (1 - p_y)^gamma        : polynomial emphasis on low p_y
         - sigmoid(...)           : soft step that turns on near p_y = tau
         - gamma (>=1)            : bigger -> focus more on very uncertain pixels
-        - tau (in (0,1))         : larger -> turns on *earlier* (acts at higher p_y)
+        - tau (in (0,1))         : larger -> turns on *earlier* (acts at higher p_y), turns on gate once p_y drops below around tau
         - sigma (>0)             : smaller -> sharper step around tau
 
       w_evid(alpha0) = s_target / (alpha0 + s_target)   (optional)
@@ -994,4 +820,150 @@ def complement_kl_uniform_from_alpha(
     # -- masked mean over valid pixels --
     per_pix = w * kl_u                                   # [B,H,W], >= 0
     return (per_pix * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+
+
+# import math, torch
+# import torch.nn as nn
+
+# class AdaptiveLogEvidencePenalty(nn.Module):
+#     """
+#     Purpose
+#     -------
+#     Keep log(alpha0) in a narrow band around a moving center mu, but
+#     make the band resist upward drift so it actually pushes back on growth.
+
+#     Key ideas
+#     ---------
+#     - asymmetric EMA for mu: slow when mu would increase, faster when it would decrease
+#     - tighter upper band (d_high) so large alpha0 gets penalized
+#     - optional per-step cap on upward move of mu
+#     - optional stronger weight on "above the band" deviations
+#     """
+
+#     def __init__(self,
+#                 ignore_index=None,
+#                 # band width (multiplicative in alpha0)
+#                 high_mult=1.20,    # was 1.60 -> too wide; try 1.20 first
+#                 low_mult=2.00,     # allow down to 0.5*mu (same as before)
+#                 # EMA behavior
+#                 ema_up=0.997,      # VERY slow when median goes up (resist inflation)
+#                 ema_down=0.95,     # faster when median goes down (allow deflation)
+#                 # optional cap on upward change of mu per step (in log space)
+#                 max_up_step=0.01,  # ~1% alpha0 per step; set None to disable
+#                 # asymmetric weights: punish above-band more than below-band
+#                 w_above=2.0, w_below=1.0,
+#                 # warmup steps (no penalty while learning baseline)
+#                 warmup_steps=300,
+#                 # Huber for stable gradients; set None for pure L2
+#                 huber_delta=0.15,
+#                 # overall scale of this loss
+#                 scale=1.0,
+#                 eps=1e-8):
+#         super().__init__()
+#         self.ignore_index = ignore_index
+#         self.d_high = math.log(float(high_mult))  # log upper factor
+#         self.d_low  = math.log(float(low_mult))   # log lower factor
+#         self.ema_up = float(ema_up)
+#         self.ema_down = float(ema_down)
+#         self.max_up_step = None if max_up_step is None else float(max_up_step)
+#         self.w_above = float(w_above)
+#         self.w_below = float(w_below)
+#         self.warmup = int(warmup_steps)
+#         self.delta = None if huber_delta is None else float(huber_delta)
+#         self.scale = float(scale)
+#         self.eps = float(eps)
+
+#         # buffers move with .to(device)
+#         self.register_buffer("mu_log_a0", torch.tensor(0.0, dtype=torch.float32))
+#         self.register_buffer("initialized", torch.tensor(False))
+#         self.steps = 0
+
+#     @torch.no_grad()
+#     def _update_center(self, med: torch.Tensor):
+#         """
+#         Update mu using asymmetric EMA and optional cap on upward move.
+#         med is the batch median of log(alpha0) over valid pixels.
+#         """
+#         if not bool(self.initialized.item()):
+#             self.mu_log_a0.copy_(med)
+#             self.initialized.fill_(True)
+#             return
+
+#         mu_old = self.mu_log_a0
+#         # choose momentum depending on direction
+#         m = self.ema_up if med > mu_old else self.ema_down
+#         mu_new = m * mu_old + (1.0 - m) * med
+
+#         # optional cap on upward movement per step
+#         if (self.max_up_step is not None) and (mu_new > mu_old):
+#             mu_new = torch.minimum(mu_new, mu_old + self.max_up_step)
+
+#         self.mu_log_a0.copy_(mu_new)
+
+#     def forward(self, alpha: torch.Tensor, target: torch.Tensor | None = None):
+#         dev = alpha.device
+#         if self.mu_log_a0.device != dev:
+#             self.mu_log_a0 = self.mu_log_a0.to(dev)
+#             self.initialized = self.initialized.to(dev)
+
+#         # alpha0 and its log
+#         a0 = alpha.sum(dim=1).clamp_min(self.eps)     # [B,H,W]
+#         log_a0 = a0.log()
+
+#         # validity mask from ignore_index
+#         if (self.ignore_index is not None) and (target is not None):
+#             if target.dim() == 4 and target.size(1) == 1:
+#                 target = target[:, 0]
+#             valid = (target.to(dev) != self.ignore_index)
+#         else:
+#             valid = torch.ones_like(log_a0, dtype=torch.bool, device=dev)
+
+#         # update mu with batch median
+#         with torch.no_grad():
+#             if valid.any():
+#                 med = log_a0[valid].median()
+#                 self._update_center(med)
+#         self.steps += 1
+
+#         # warmup -> no penalty, just report
+#         if (self.steps <= self.warmup) or (not bool(self.initialized.item())):
+#             return alpha.sum()*0.0, {
+#                 "ev_mu":   float(self.mu_log_a0.exp().detach().cpu()),
+#                 "ev_low":  float((self.mu_log_a0 - self.d_low).exp().detach().cpu()),
+#                 "ev_high": float((self.mu_log_a0 + self.d_high).exp().detach().cpu()),
+#                 "ev_frac_out": 0.0,
+#             }
+
+#         # distance to band in log space
+#         # below < 0 if below lower band; above > 0 if above upper band
+#         z = log_a0 - self.mu_log_a0
+#         below = (z + self.d_low).clamp_max(0.0)
+#         above = (z - self.d_high).clamp_min(0.0)
+
+#         # robust penalty (Huber) with asymmetric weights
+#         if self.delta is None:
+#             per = 0.5 * (self.w_below * below * below + self.w_above * above * above)
+#         else:
+#             d = self.delta
+#             def huber(x):  # x can be negative (below) or positive (above)
+#                 ax = x.abs()
+#                 return torch.where(ax <= d, 0.5*x*x, d*(ax - 0.5*d))
+#             per = self.w_below * huber(below) + self.w_above * huber(above)
+
+#         w = valid.to(per.dtype)
+#         loss = self.scale * (per * w).sum() / w.sum().clamp_min(1.0)
+
+#         # diagnostics
+#         with torch.no_grad():
+#             out_mask = ((below != 0.0) | (above != 0.0)) & valid
+#             frac_out = float(out_mask.sum().item()) / float(valid.sum().item() + 1e-12)
+
+#         info = {
+#             "ev_mu":   float(self.mu_log_a0.exp().detach().cpu()),
+#             "ev_low":  float((self.mu_log_a0 - self.d_low).exp().detach().cpu()),
+#             "ev_high": float((self.mu_log_a0 + self.d_high).exp().detach().cpu()),
+#             "ev_frac_out": frac_out,
+#         }
+#         return loss, info
+
 
