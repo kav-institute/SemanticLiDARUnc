@@ -40,6 +40,8 @@ from utils.viz_panel import (
     register_optional_names
 )
 
+from metrics.ece import ECEAggregator
+
 # ------------------------------
 # Small helpers
 # ------------------------------
@@ -246,11 +248,9 @@ class Trainer:
         - standard train / eval loops
         - optional MC-dropout path
         - Dirichlet-aware caching so alpha is computed ONCE per batch when needed
-        - optional post-hoc Temperature Scaling (TS)
 
     Expectation:
       - model.forward(*inputs) returns either logits, probs, or log_probs
-      - for ADF baseline returns (logits_mean, logits_var)
     """
 
     def __init__(
@@ -270,6 +270,9 @@ class Trainer:
         self.scheduler = scheduler
         self.cfg = cfg
         self.visualize = visualize
+        
+        self.use_mc_sampling = bool(self.cfg["model_settings"].get("use_mc_sampling", 0))
+        
         self.logging = logging
 
         # data / task meta
@@ -282,13 +285,25 @@ class Trainer:
         self.loss_name = cfg["model_settings"]["loss_function"]
         self.baseline = cfg["model_settings"]["baseline"]
 
-        # evaluator
+        # Evaluator inits
+        ## ignore index for training, e.g. unlabeled class; else None
+        self.ignore_idx: int| None = 0
+        
         self.iou_evaluator = IoUEvaluator(self.num_classes)
         if cfg["extras"].get("test_mask", 0):
             self.test_mask = list(cfg["extras"]["test_mask"].values())
         else:
             self.test_mask = [0] + [1] * (cfg["extras"]["num_classes"] - 1)
-
+        # eval_on_outputkind in {"alpha", "logits", "probs"}
+        if self.loss_name=="Dirichlet": eval_on_outputkind = "alpha"
+        elif self.use_mc_sampling: eval_on_outputkind = "probs"
+        else: eval_on_outputkind = "logits"
+        self.ece_eval = ECEAggregator(
+                            n_bins=15,
+                            mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
+                            ignore_index=self.ignore_idx,        
+                            max_samples=100_000_000       # None or an int cap like 2_000_000 to bound memory
+                        )
         # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -310,9 +325,6 @@ class Trainer:
             import time
             self._t0 = 0.0
             self._time = time
-
-        # ignore index for training, e.g. unlabeled class; else None
-        self.ignore_idx: int| None = 0
         
         # losses
         self._init_losses()
@@ -492,7 +504,7 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         self.iou_evaluator.reset()
-
+        
         # Dirichlet-specific schedules
         if self.loss_name == "Dirichlet":
             get_predictive_entropy_norm.reset()
@@ -844,10 +856,8 @@ class Trainer:
     @torch.no_grad()
     def test_one_epoch(self, loader, epoch: int):
         self.model.eval()
-        self.iou_evaluator.reset()
         inference_times = []
 
-        use_mc_sampling = bool(self.cfg["model_settings"].get("use_mc_sampling", 0))
         mc_T = int(self.cfg["model_settings"].get("mc_samples", 30))
 
         for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
@@ -868,7 +878,7 @@ class Trainer:
             # --- inference ---
             self._start_timer()
             # --- inside test_one_epoch loop, MC path ---
-            if use_mc_sampling:
+            if self.use_mc_sampling:
                 mc_outputs = mc_forward(self.model, inputs, T=mc_T)     # [T,B,C,H,W]
                 
                 inference_times.append(self._stop_timer_ms())
@@ -886,12 +896,17 @@ class Trainer:
                 
                 preds = p_bar.argmax(dim=1) # [B,1,H,W]
                 
+                # Metric aggregator accumulation
+                ## iou
                 self.iou_evaluator.update(preds, labels)
+                ## H_norm vs accuracy
                 self.ua_agg.update(
                         labels=labels, 
                         preds=preds, 
                         uncertainty=H_norm, 
                         ignore_ids=(0,))
+                ## calibration
+                self.ece_eval.update(p_bar, labels)
     
             else: # single pass (no MC)
                 outputs = self.model(*inputs)
@@ -907,6 +922,8 @@ class Trainer:
 
                 preds = probs.argmax(dim=1) # [B,1,H,W]
                 
+                # Metric aggregator accumulation
+                ## iou
                 self.iou_evaluator.update(preds, labels)
                 
                 if self.loss_name=="Dirichlet":
@@ -914,12 +931,18 @@ class Trainer:
                     alpha = to_alpha_concentrations(logits)
                     H_norm = get_predictive_entropy_norm(alpha)
                     
+                    ## H_norm vs accuracy
                     self.ua_agg.update(
                         labels=labels, 
                         preds=preds, 
                         uncertainty=H_norm, 
                         ignore_ids=(0,)     # ignore unlabeled if ignore_ids==0
                     )
+                    ## calibration
+                    self.ece_eval.update(alpha, labels)
+                else:
+                    ## calibration
+                    self.ece_eval.update(probs, labels)
         
         # @@@ END of Epoch
         
@@ -941,22 +964,25 @@ class Trainer:
             self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
             self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         
-            if (not use_mc_sampling) and \
-                    (self.loss_name=="Dirichlet"):
+            if self.use_mc_sampling or self.loss_name=="Dirichlet":
                 self.ua_agg.plot_accuracy_vs_uncertainty_bins(
                     bin_width=0.05, 
                     show_percent_on_bars=True,
-                    title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
+                    title=f"Pixel Accuracy vs Predictive-Uncertainty (epoch {epoch:03d})",
                     save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
                 )
-            elif use_mc_sampling:
-                self.ua_agg.plot_accuracy_vs_uncertainty_bins(
-                    bin_width=0.05, 
-                    show_percent_on_bars=True,
-                    title="Pixel Accuracy vs Predictive-Uncertainty (binned)",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
+                # ECE plot
+                ece_value, _ = self.ece_eval.compute(
+                    save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch:03d}.png"),
+                    title=f"Reliability (epoch {epoch:03d})"
                 )
+                print(f"Epoch {epoch} ECE: {ece_value:.4f}")
+            
+        
+        # Reset Eval Accumulators
+        self.iou_evaluator.reset()
         self.ua_agg.reset()
+        self.ece_eval.reset()
 
         return mIoU
 
