@@ -350,16 +350,15 @@ class Tester:
                 # Predictive entropy norm
                 H_norm = mc_predictive_entropy_norm(probs)
                 
+                # Metric aggregator accumulation
+                ## iou
                 self.iou_evaluator.update(preds, labels)
+                ## H_norm vs accuracy
                 self.ua_agg.update(
                         labels=labels, 
                         preds=preds, 
                         uncertainty=H_norm, 
                         ignore_ids=(0,))
-                
-                # Metric aggregator accumulation
-                ## iou
-                self.iou_evaluator.update(preds, labels)
                 ## calibration
                 self.ece_eval.update(p_bar, labels)
                 ## auroc
