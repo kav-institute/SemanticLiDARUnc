@@ -156,8 +156,7 @@ class Tester:
         if cfg["extras"].get("test_mask", 0):
             self.test_mask = list(cfg["extras"]["test_mask"].values())
         else:
-            self.test_mask = [1] * cfg["extras"]["num_classes"]
-            self.test_mask[0] = 0
+            self.test_mask = [0] + [1] * (cfg["extras"]["num_classes"] - 1)
         
         # ignore index
         self.ignore_idx = 0
