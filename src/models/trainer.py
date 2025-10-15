@@ -385,14 +385,15 @@ class Trainer:
                 num_classes=self.num_classes,
                 ignore_index=self.ignore_idx,
                 eps=get_eps_value(),
-                prior_concentration=2*self.num_classes,
+                prior_concentration=3*self.num_classes,
                 p_moment=1.0,
                 smoothing=self.nll_smoothing_start,
                 kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
                 nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, acts on p_hat)
+                with_acc_classWeights= False, # if True nll_mode="dircat" uses weighted nll to handle imbalance, BUT nll will be not strictly proper anymore
                 comp_gamma = 2.0,
-                comp_tau   = 0.75,    # if you still see confident mistakes, try 0.75 later
-                comp_sigma = 0.10,      # bounded to [0.06, 0.12]
+                comp_tau   = 0.55,    # if you still see confident mistakes, try 0.75 later
+                comp_sigma = 0.12,      # bounded to [0.06, 0.12]
                 comp_normalize = True
             )
 
@@ -424,8 +425,19 @@ class Trainer:
             self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
             
             # target proportions don't necessarily need to be softmaxed
-            self.targets = {"nll": 1.0, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.2} # "ir": 0.0, "kl": 0.0
-            
+            self.targets = {"nll": 0.8, "ls": 0.2, "dce": 0.0, "imax": 0.0, "comp": 0.0}
+            try:
+                if self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0) !=0 and \
+                    isinstance(self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0), dict):
+                        if all([True if (k in self.cfg["model_weights"]["Dirichlet"]["target_shares"]) else False for k in BALANCE_KEYS] ):
+                            self.targets = self.cfg["model_weights"]["Dirichlet"]["target_shares"]
+                        else:
+                            print(f"ERROR in getting target weight shares. Using default {self.targets}")
+                else:
+                    self.targets = {"nll": 0.8, "ls": 0.2, "dce": 0.0, "imax": 0.0, "comp": 0.0} # "ir": 0.0, "kl": 0.0
+            except:
+                print(f"ERROR in getting target weight shares. Using default {self.targets}")
+                
             base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
             targets_for_balancer = {k: self.targets.get(k, 0.0) for k in self.activeKeys_weightBalancer}
 
@@ -437,7 +449,7 @@ class Trainer:
                     min_mult=0.5, 
                     max_mult=2.0)
             # set target kl lambda to the one in config
-            def kl_lambda_schedule(step, max_val=self.base_weights.get("kl", 1e-2), warmup=1000):
+            def kl_lambda_schedule(step, max_val=self.base_weights.get("kl", 1e-2), warmup=1500):
                 x = (step - warmup) / max(1, warmup // 3)
                 # smooth 0 -> max_val
                 return float(max_val) * (0.5 * (1.0 + torch.tanh(torch.tensor(x))).item())
@@ -562,7 +574,8 @@ class Trainer:
                 # get dirichlet losses
                 L_dir_dict={}
                 if step % 10 ==0:    # every 10 iteration update ema class weight accumulator, TODO: currently hard coded
-                    self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
+                    if self.criterion_dirichlet.with_acc_classWeights:
+                        self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
                 
                 loss_dirichlet, L_dir_dict = self.criterion_dirichlet(
                     alpha, labels,
@@ -700,6 +713,16 @@ class Trainer:
                     self.writer.add_scalar("alpha0/median", med_alpha0, self.global_step)
                     self.writer.add_scalar("alpha0/median_per_class", med_alpha0_per_cls, self.global_step)
 
+                    if self.base_weights.get("comp", 0.0) != 0.0:
+                        with torch.no_grad():
+                            py = (alpha/(alpha.sum(1, keepdim=True)+1e-8)).gather(1, labels.unsqueeze(1)).squeeze(1)
+                            w_uncert = (1-py).pow(self.criterion_dirichlet.comp_gamma) * torch.sigmoid((self.criterion_dirichlet.comp_tau - py)/self.criterion_dirichlet.comp_sigma)
+                            frac_below_tau = (py < self.criterion_dirichlet.comp_tau).float().mean().item() # what fraction of pixels your gate considers "uncertain"
+                            mean_gate = w_uncert.mean().item()  # average strength of the comp weight actually applied
+                            #60% of pixels below tau -> comp acts very broadly. 20% uncertain -> comp focuses sparsely (good if you only want it on hard pixels).
+                            self.writer.add_scalar("comp/mean_gate", mean_gate, self.global_step)
+                            self.writer.add_scalar("comp/frac_below_tau", frac_below_tau, self.global_step)
+                    
                     # H_norm coverage
                     self.writer.add_scalar("H_norm/pct_lt_0.1",  (H_norm < 0.10).float().mean().item(), self.global_step)
                     self.writer.add_scalar("H_norm/pct_lt_0.25", (H_norm < 0.25).float().mean().item(), self.global_step)
@@ -943,7 +966,7 @@ class Trainer:
     def __call__(self, train_loader, val_loader):
         self.num_epochs = int(self.cfg["train_params"]["num_epochs"]) + int(self.cfg["train_params"].get("num_warmup_epochs", 0))
         test_every = int(self.cfg["logging_settings"]["test_every_nth_epoch"])
-
+        
         best_mIoU = -1.0
         for epoch in range(self.num_epochs):
             self.train_one_epoch(train_loader, epoch)
