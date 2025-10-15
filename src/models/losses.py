@@ -490,7 +490,7 @@ class DirichletCriterion(nn.Module):
     """
     def __init__(self, num_classes: int, ignore_index: int | None = 0,
                  eps: float = 1e-8, prior_concentration: float = 30.0,
-                 p_moment: float = 2.0, kl_mode: str = "evidence", smoothing=0.25, nll_mode="density",
+                 p_moment: float = 2.0, kl_mode: str = "evidence", smoothing=0.25, nll_mode="density", with_acc_classWeights= False,
                  comp_gamma: float=2.0, comp_tau: float=0.6, comp_sigma: float=0.1, comp_normalize: bool=True, ema_momentum: float=0.99):
         super().__init__()
         assert kl_mode in ("evidence", "symmetric")
@@ -502,6 +502,7 @@ class DirichletCriterion(nn.Module):
         self.kl_mode = kl_mode
         self.smoothing = smoothing
         self.nll_mode = nll_mode # | "density" or "dircat"
+        self.with_acc_classWeights = with_acc_classWeights
         # comp parameters
             # - gamma (default 2.0): power on (1 - p_y). Bigger gamma focuses the penalty on very uncertain pixels (small p_y).
             # - tau (default 0.6): center of the sigmoid gate on p_y. The term ramps up when p_y < tau. 
@@ -563,8 +564,10 @@ class DirichletCriterion(nn.Module):
         
         if w_nll > 0.0:
             if self.nll_mode == "dircat":
-                #val = nll_dirichlet_categorical(alpha, target, self.ignore_index, self.eps)
-                val = nll_dirichlet_categorical_weighted(alpha, target, self.class_weights, ignore_index=self.ignore_index)
+                if self.with_acc_classWeights:
+                    val = nll_dirichlet_categorical_weighted(alpha, target, self.class_weights, ignore_index=self.ignore_index)
+                else:
+                    val = nll_dirichlet_categorical(alpha, target, self.ignore_index, self.eps)
             else:  # "density"
                 val = nll_from_alpha(alpha, target, self.num_classes, self.smoothing,
                                      self.ignore_index, self.eps)
@@ -582,7 +585,7 @@ class DirichletCriterion(nn.Module):
             if self.kl_mode == "evidence":
                 # Mask KL by valid pixels so unlabeled regions do not bias it.
                 val = kl_evidence_from_alpha(alpha, self.prior_concentration, mask=valid, eps=self.eps, 
-                                            with_scaling=True, scaling_force=2.0, one_sided=True, gate_width=0.05)
+                                            with_scaling=True, scaling_force=1.0, one_sided=True, gate_width=0.1)
             else:
                 val = kl_sym_from_alpha(alpha, self.prior_concentration, mask=valid)
             terms["kl"] = val; total = total + w_kl * val
