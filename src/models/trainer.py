@@ -855,6 +855,11 @@ class Trainer:
     # ------------------------------
     @torch.no_grad()
     def test_one_epoch(self, loader, epoch: int):
+        # Reset Eval Accumulators
+        self.iou_evaluator.reset()
+        self.ua_agg.reset()
+        self.ece_eval.reset()
+        
         self.model.eval()
         inference_times = []
 
@@ -977,12 +982,6 @@ class Trainer:
                     title=f"Reliability (epoch {epoch:03d})"
                 )
                 print(f"Epoch {epoch} ECE: {ece_value:.4f}")
-            
-        
-        # Reset Eval Accumulators
-        self.iou_evaluator.reset()
-        self.ua_agg.reset()
-        self.ece_eval.reset()
 
         return mIoU
 
