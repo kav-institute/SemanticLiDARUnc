@@ -824,149 +824,89 @@ def complement_kl_uniform_from_alpha(
     per_pix = w * kl_u                                   # [B,H,W], >= 0
     return (per_pix * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
 
+import math
+import torch
 
-# import math, torch
-# import torch.nn as nn
+def evidence_logspring(alpha: torch.Tensor,
+                       s_per_class: float = 6.0,
+                       window: float = 0.25,
+                       eps: float = 1e-8) -> torch.Tensor:
+    """
+    Piecewise-quadratic spring on log(alpha0) with a dead-zone:
+      a0 = sum_i alpha_i
+      s  = C * s_per_class
+      s_hi = s*(1+window), s_lo = s/(1+window)
+      loss = [max(0, log(a0)-log(s_hi))]^2 + [max(0, log(s_lo)-log(a0))]^2
+    This ONLY touches the scale (alpha0), not p = alpha/alpha0.
+    """
+    B, C, H, W = alpha.shape
+    a0 = alpha.sum(dim=1, keepdim=True) + eps
+    s  = C * float(s_per_class)
+    s_hi = s * (1.0 + window)
+    s_lo = s / (1.0 + window)
 
-# class AdaptiveLogEvidencePenalty(nn.Module):
-#     """
-#     Purpose
-#     -------
-#     Keep log(alpha0) in a narrow band around a moving center mu, but
-#     make the band resist upward drift so it actually pushes back on growth.
+    log_a0 = a0.log()
+    over   = torch.clamp(log_a0 - math.log(s_hi + eps), min=0.0)
+    under  = torch.clamp(math.log(s_lo + eps) - log_a0, min=0.0)
+    return (over**2 + under**2).mean()
 
-#     Key ideas
-#     ---------
-#     - asymmetric EMA for mu: slow when mu would increase, faster when it would decrease
-#     - tighter upper band (d_high) so large alpha0 gets penalized
-#     - optional per-step cap on upward move of mu
-#     - optional stronger weight on "above the band" deviations
-#     """
 
-#     def __init__(self,
-#                 ignore_index=None,
-#                 # band width (multiplicative in alpha0)
-#                 high_mult=1.20,    # was 1.60 -> too wide; try 1.20 first
-#                 low_mult=2.00,     # allow down to 0.5*mu (same as before)
-#                 # EMA behavior
-#                 ema_up=0.997,      # VERY slow when median goes up (resist inflation)
-#                 ema_down=0.95,     # faster when median goes down (allow deflation)
-#                 # optional cap on upward change of mu per step (in log space)
-#                 max_up_step=0.01,  # ~1% alpha0 per step; set None to disable
-#                 # asymmetric weights: punish above-band more than below-band
-#                 w_above=2.0, w_below=1.0,
-#                 # warmup steps (no penalty while learning baseline)
-#                 warmup_steps=300,
-#                 # Huber for stable gradients; set None for pure L2
-#                 huber_delta=0.15,
-#                 # overall scale of this loss
-#                 scale=1.0,
-#                 eps=1e-8):
-#         super().__init__()
-#         self.ignore_index = ignore_index
-#         self.d_high = math.log(float(high_mult))  # log upper factor
-#         self.d_low  = math.log(float(low_mult))   # log lower factor
-#         self.ema_up = float(ema_up)
-#         self.ema_down = float(ema_down)
-#         self.max_up_step = None if max_up_step is None else float(max_up_step)
-#         self.w_above = float(w_above)
-#         self.w_below = float(w_below)
-#         self.warmup = int(warmup_steps)
-#         self.delta = None if huber_delta is None else float(huber_delta)
-#         self.scale = float(scale)
-#         self.eps = float(eps)
+def brier_dirichlet(alpha: torch.Tensor,
+                    target: torch.Tensor,
+                    ignore_index: int | None = None,
+                    eps: float = 1e-12) -> torch.Tensor:
+    """
+    Expected Brier score under a Dirichlet predictive distribution.
 
-#         # buffers move with .to(device)
-#         self.register_buffer("mu_log_a0", torch.tensor(0.0, dtype=torch.float32))
-#         self.register_buffer("initialized", torch.tensor(False))
-#         self.steps = 0
+    Math:
+      For p ~ Dir(alpha), with alpha0 = sum_i alpha_i and p_hat_i = alpha_i / alpha0:
+        E[p_i]   = p_hat_i
+        E[p_i^2] = alpha_i (alpha_i + 1) / (alpha0 (alpha0 + 1))
+                 = (alpha0 * p_hat_i^2 + p_hat_i) / (alpha0 + 1)
 
-#     @torch.no_grad()
-#     def _update_center(self, med: torch.Tensor):
-#         """
-#         Update mu using asymmetric EMA and optional cap on upward move.
-#         med is the batch median of log(alpha0) over valid pixels.
-#         """
-#         if not bool(self.initialized.item()):
-#             self.mu_log_a0.copy_(med)
-#             self.initialized.fill_(True)
-#             return
+      Brier(target=y) = sum_i (p_i - y_i)^2
+      E[Brier] = sum_i E[p_i^2] - 2 E[p_y] + 1
 
-#         mu_old = self.mu_log_a0
-#         # choose momentum depending on direction
-#         m = self.ema_up if med > mu_old else self.ema_down
-#         mu_new = m * mu_old + (1.0 - m) * med
+    Properties:
+      * Proper scoring rule; improves probability calibration.
+      * Very weak dependency on alpha0; does NOT push alpha0 to blow up.
+      * Complements NLL (fit) and comp loss (confident-wrong suppression).
+    """
 
-#         # optional cap on upward movement per step
-#         if (self.max_up_step is not None) and (mu_new > mu_old):
-#             mu_new = torch.minimum(mu_new, mu_old + self.max_up_step)
+    # --- INPUT SHAPES ---------------------------------------------------------
+    # alpha : [B, C, H, W]   Dirichlet concentrations (> 0)
+    # target: [B, H, W] or [B, 1, H, W] with integer labels in {0..C-1}
+    # ignore_index: label value to mask from loss. Use None to disable masking.
 
-#         self.mu_log_a0.copy_(mu_new)
+    # --- NORMALIZE TARGET SHAPE ----------------------------------------------
+    if target.dim() == 4 and target.size(1) == 1:
+        target = target[:, 0]
+    target = target.long()
 
-#     def forward(self, alpha: torch.Tensor, target: torch.Tensor | None = None):
-#         dev = alpha.device
-#         if self.mu_log_a0.device != dev:
-#             self.mu_log_a0 = self.mu_log_a0.to(dev)
-#             self.initialized = self.initialized.to(dev)
+    # --- BUILD VALID MASK -----------------------------------------------------
+    if ignore_index is None:
+        valid = torch.ones_like(target, dtype=torch.bool)
+    else:
+        valid = (target != ignore_index)
+    if valid.sum() == 0:
+        # Return a zero tensor on the right device/dtype if nothing is valid
+        return alpha.sum() * 0.0
 
-#         # alpha0 and its log
-#         a0 = alpha.sum(dim=1).clamp_min(self.eps)     # [B,H,W]
-#         log_a0 = a0.log()
+    # --- COMPUTE p_hat = alpha / alpha0 --------------------------------------
+    a0 = alpha.sum(dim=1, keepdim=True) + eps            # [B,1,H,W]
+    p_hat = alpha / a0                                   # [B,C,H,W]
 
-#         # validity mask from ignore_index
-#         if (self.ignore_index is not None) and (target is not None):
-#             if target.dim() == 4 and target.size(1) == 1:
-#                 target = target[:, 0]
-#             valid = (target.to(dev) != self.ignore_index)
-#         else:
-#             valid = torch.ones_like(log_a0, dtype=torch.bool, device=dev)
+    # --- SUM OF E[p_i^2] OVER CLASSES ----------------------------------------
+    # sum_i E[p_i^2] = (alpha0 * sum_i p_hat_i^2 + 1) / (alpha0 + 1)
+    sum_ep2 = (a0 * (p_hat.pow(2).sum(dim=1, keepdim=True)) + 1.0) / (a0 + 1.0)
 
-#         # update mu with batch median
-#         with torch.no_grad():
-#             if valid.any():
-#                 med = log_a0[valid].median()
-#                 self._update_center(med)
-#         self.steps += 1
+    # --- E[p_y] ---------------------------------------------------------------
+    ep_y = p_hat.gather(1, target.unsqueeze(1))          # [B,1,H,W]
 
-#         # warmup -> no penalty, just report
-#         if (self.steps <= self.warmup) or (not bool(self.initialized.item())):
-#             return alpha.sum()*0.0, {
-#                 "ev_mu":   float(self.mu_log_a0.exp().detach().cpu()),
-#                 "ev_low":  float((self.mu_log_a0 - self.d_low).exp().detach().cpu()),
-#                 "ev_high": float((self.mu_log_a0 + self.d_high).exp().detach().cpu()),
-#                 "ev_frac_out": 0.0,
-#             }
+    # --- EXPECTED BRIER PER PIXEL --------------------------------------------
+    per_pix = (sum_ep2 - 2.0 * ep_y + 1.0).squeeze(1)    # [B,H,W]
 
-#         # distance to band in log space
-#         # below < 0 if below lower band; above > 0 if above upper band
-#         z = log_a0 - self.mu_log_a0
-#         below = (z + self.d_low).clamp_max(0.0)
-#         above = (z - self.d_high).clamp_min(0.0)
-
-#         # robust penalty (Huber) with asymmetric weights
-#         if self.delta is None:
-#             per = 0.5 * (self.w_below * below * below + self.w_above * above * above)
-#         else:
-#             d = self.delta
-#             def huber(x):  # x can be negative (below) or positive (above)
-#                 ax = x.abs()
-#                 return torch.where(ax <= d, 0.5*x*x, d*(ax - 0.5*d))
-#             per = self.w_below * huber(below) + self.w_above * huber(above)
-
-#         w = valid.to(per.dtype)
-#         loss = self.scale * (per * w).sum() / w.sum().clamp_min(1.0)
-
-#         # diagnostics
-#         with torch.no_grad():
-#             out_mask = ((below != 0.0) | (above != 0.0)) & valid
-#             frac_out = float(out_mask.sum().item()) / float(valid.sum().item() + 1e-12)
-
-#         info = {
-#             "ev_mu":   float(self.mu_log_a0.exp().detach().cpu()),
-#             "ev_low":  float((self.mu_log_a0 - self.d_low).exp().detach().cpu()),
-#             "ev_high": float((self.mu_log_a0 + self.d_high).exp().detach().cpu()),
-#             "ev_frac_out": frac_out,
-#         }
-#         return loss, info
-
+    # --- MEAN OVER VALID PIXELS ----------------------------------------------
+    w = valid.float()
+    return (per_pix * w).sum() / w.sum().clamp_min(1.0)
 
