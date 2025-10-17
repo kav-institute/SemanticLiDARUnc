@@ -42,6 +42,7 @@ from utils.viz_panel import (
 
 from metrics.ece import ECEAggregator
 
+from models.losses import brier_dirichlet, evidence_logspring
 # ------------------------------
 # Small helpers
 # ------------------------------
@@ -173,34 +174,23 @@ def grad_norm_wrt(
 
 # ---- helpers you already have ----
 # grad_norm_wrt(loss, ref_params, retain_graph=True)
-
 class ProportionalGradNorm:
-    """
-    Anchored GradNorm with target ratios.
-    Keeps weights near your base priors but nudges them so that per-loss raw grad norms
-    approach the desired proportions.
-    """
-    def __init__(self, targets: dict[str, float], base: dict[str, float],
-                 ema_beta: float = 0.9, power: float = 0.5,
-                 min_mult: float = 0.2, max_mult: float = 5.0):
-        """
-        targets: desired relative strengths, e.g. {'nll':1.0, 'ls':1.0, 'kl':0.3, ...}
-        base:    your prior weights (what you set in cfg), same keys; base[k]=0 disables
-        ema_beta: log-EMA smoothing for measured grad norms. incrase to 0.95-0.98 to reduce jitter.
-        power:   update aggressiveness (0<k<=1). 0.5 is gentle, 1.0 aggressive. redice power to 0.3-0.4 for less jitter.
-        min_mult/max_mult: clamp on multiplicative adjustments a_i around base
-        """
-        self.targets = targets.copy()
-        self.base = base.copy()
-        self.beta = ema_beta
-        self.k = power
-        self.min_mult = min_mult
-        self.max_mult = max_mult
+    def __init__(self, targets, base, ema_beta=0.99, power=0.3,
+                 min_mult=0.5, max_mult=2.0,
+                 use_log_ema=True, ema_floor=1e-8, step_cap=1.25):
+        self.targets   = targets.copy()
+        self.base      = base.copy()
+        self.beta      = float(ema_beta)
+        self.k         = float(power)
+        self.min_mult  = float(min_mult)
+        self.max_mult  = float(max_mult)
+        self.use_log_ema = bool(use_log_ema)
+        self.ema_floor = float(ema_floor)
+        self.step_cap  = float(step_cap)
+        self.ema  = {k: 0.0 for k in targets}   # EMA of g or log g
+        self.mult = {k: 1.0 for k in targets}
 
-        self.ema = {k: 0.0 for k in targets}    # EMA of RAW grad norms
-        self.mult = {k: 1.0 for k in targets}   # learned multiplicative adjustments
-
-    def weights(self) -> dict[str, float]:
+    def weights(self):
         return {k: (self.base[k] * self.mult.get(k, 1.0) if self.base.get(k, 0.0) > 0.0 else 0.0)
                 for k in self.base}
 
@@ -209,37 +199,115 @@ class ProportionalGradNorm:
         if not active:
             return self.weights()
 
-        # --- update EMA of RAW norms ---
+        # --- EMA of raw grads (log-EMA default) ---
         for k in active:
             g = max(0.0, float(raw_g[k]))
-            self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
+            if self.use_log_ema:
+                lg = math.log(g + 1e-12)
+                self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * lg
+            else:
+                self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
 
-        # --- compute current EFFECTIVE norms E_i = w_i * EMA(raw G_i) ---
-        w = {k: self.base[k] * self.mult[k] for k in active}
-        eff = {k: w[k] * self.ema[k] for k in active}
+        sm = {k: (math.exp(self.ema[k]) if self.use_log_ema else self.ema[k]) for k in active}
+        for k in active:
+            sm[k] = max(sm[k], self.ema_floor)
 
-        # normalize target ratios over ACTIVE keys
-        mean_t = sum(self.targets[k] for k in active) / (len(active) + 1e-12)
-        r = {k: self.targets[k] / (mean_t + 1e-12) for k in active}
+        # --- effective norms ---
+        w   = {k: self.base[k] * self.mult[k] for k in active}
+        eff = {k: w[k] * sm[k] for k in active}
 
-        # mean effective norm
-        mean_eff = sum(eff[k] for k in active) / (len(active) + 1e-12)
+        # --- target ratios (safe) ---
+        tot_t = sum(max(0.0, float(self.targets.get(k, 0.0))) for k in active)
+        if tot_t <= 0.0:
+            r = {k: 1.0 for k in active}  # uniform if all zeros
+        else:
+            mean_t = tot_t / len(active)
+            r = {k: float(self.targets[k]) / (mean_t + 1e-12) for k in active}
 
-        # --- update multipliers to match EFFECTIVE targets ---
-        # target E*_i = mean_eff * r_i
+        mean_eff = sum(eff.values()) / (len(active) + 1e-12)
+
+        # --- proportional correction with per-update cap ---
         for k in active:
             Ei = eff[k] + 1e-12
             Ei_star = mean_eff * r[k]
-            scale = (Ei_star / Ei) ** self.k          # proportional correction
+            scale = (Ei_star / Ei) ** self.k
+            scale = float(min(max(scale, 1.0 / self.step_cap), self.step_cap))
             self.mult[k] = float(self.mult[k] * scale)
             self.mult[k] = float(min(max(self.mult[k], self.min_mult), self.max_mult))
 
-        # keep avg multiplier ≈ 1 to avoid drift
+        # keep avg multiplier ≈ 1
         avg_mult = sum(self.mult[k] for k in active) / (len(active) + 1e-12)
         for k in active:
             self.mult[k] /= (avg_mult + 1e-12)
 
         return self.weights()
+
+# class ProportionalGradNorm:
+#     """
+#     Anchored GradNorm with target ratios.
+#     Keeps weights near your base priors but nudges them so that per-loss raw grad norms
+#     approach the desired proportions.
+#     """
+#     def __init__(self, targets: dict[str, float], base: dict[str, float],
+#                  ema_beta: float = 0.9, power: float = 0.5,
+#                  min_mult: float = 0.2, max_mult: float = 5.0):
+#         """
+#         targets: desired relative strengths, e.g. {'nll':1.0, 'ls':1.0, 'kl':0.3, ...}
+#         base:    your prior weights (what you set in cfg), same keys; base[k]=0 disables
+#         ema_beta: log-EMA smoothing for measured grad norms. incrase to 0.95-0.98 to reduce jitter.
+#         power:   update aggressiveness (0<k<=1). 0.5 is gentle, 1.0 aggressive. redice power to 0.3-0.4 for less jitter.
+#         min_mult/max_mult: clamp on multiplicative adjustments a_i around base
+#         """
+#         self.targets = targets.copy()
+#         self.base = base.copy()
+#         self.beta = ema_beta
+#         self.k = power
+#         self.min_mult = min_mult
+#         self.max_mult = max_mult
+
+#         self.ema = {k: 0.0 for k in targets}    # EMA of RAW grad norms
+#         self.mult = {k: 1.0 for k in targets}   # learned multiplicative adjustments
+
+#     def weights(self) -> dict[str, float]:
+#         return {k: (self.base[k] * self.mult.get(k, 1.0) if self.base.get(k, 0.0) > 0.0 else 0.0)
+#                 for k in self.base}
+
+#     def step(self, raw_g: dict[str, float]):
+#         active = [k for k, v in self.base.items() if v > 0.0 and k in raw_g]
+#         if not active:
+#             return self.weights()
+
+#         # --- update EMA of RAW norms ---
+#         for k in active:
+#             g = max(0.0, float(raw_g[k]))
+#             self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
+
+#         # --- compute current EFFECTIVE norms E_i = w_i * EMA(raw G_i) ---
+#         w = {k: self.base[k] * self.mult[k] for k in active}
+#         eff = {k: w[k] * self.ema[k] for k in active}
+
+#         # normalize target ratios over ACTIVE keys
+#         mean_t = sum(self.targets[k] for k in active) / (len(active) + 1e-12)
+#         r = {k: self.targets[k] / (mean_t + 1e-12) for k in active}
+
+#         # mean effective norm
+#         mean_eff = sum(eff[k] for k in active) / (len(active) + 1e-12)
+
+#         # --- update multipliers to match EFFECTIVE targets ---
+#         # target E*_i = mean_eff * r_i
+#         for k in active:
+#             Ei = eff[k] + 1e-12
+#             Ei_star = mean_eff * r[k]
+#             scale = (Ei_star / Ei) ** self.k          # proportional correction
+#             self.mult[k] = float(self.mult[k] * scale)
+#             self.mult[k] = float(min(max(self.mult[k], self.min_mult), self.max_mult))
+
+#         # keep avg multiplier ≈ 1 to avoid drift
+#         avg_mult = sum(self.mult[k] for k in active) / (len(active) + 1e-12)
+#         for k in active:
+#             self.mult[k] /= (avg_mult + 1e-12)
+
+#         return self.weights()
 
 #@torch.no_grad()    # TODO: for debugging only!
 class Trainer:
@@ -302,7 +370,8 @@ class Trainer:
                             n_bins=15,
                             mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
                             ignore_index=self.ignore_idx,        
-                            max_samples=100_000_000       # None or an int cap like 2_000_000 to bound memory
+                            max_samples=100_000_000,       # None or an int cap like 2_000_000 to bound memory
+                            plot_style="classic+hist"
                         )
         # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -392,12 +461,16 @@ class Trainer:
         elif self.loss_name == "Lovasz":
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
         elif self.loss_name == "Dirichlet":
-            self.nll_smoothing_start = 0.25
+            self.nll_smoothing_start = 0.00 # only for density based nll
+            
+            from utils.alpha_evid_prior import solve_alpha0_for_coverage
+            self.prior_concentration, _ = solve_alpha0_for_coverage(p_star=0.90, h=0.05, delta=0.025, K=self.num_classes)     # alpha0/C target
+            self.spring_grad_cap     = 0.25   # allow <=25% of NLL effective grad
             self.criterion_dirichlet = DirichletCriterion(
                 num_classes=self.num_classes,
                 ignore_index=self.ignore_idx,
                 eps=get_eps_value(),
-                prior_concentration=3*self.num_classes,
+                prior_concentration=self.prior_concentration,
                 p_moment=1.0,
                 smoothing=self.nll_smoothing_start,
                 kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
@@ -418,26 +491,28 @@ class Trainer:
                             w_ls=2.5, 
                             w_kl=0.5, 
                             w_ir=0.3,
-                            w_comp=0.2)
+                            w_comp=0.2,
+                            w_brier=0.05)
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
 
             self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
             self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
             self.w_comp = w["w_comp"]
+            self.w_brier = w["w_brier"]
             # define prior/base weights (from cfg)
             self.base_weights = {
                 "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
-                "imax": self.w_imax, "comp": self.w_comp,
+                "imax": self.w_imax, "comp": self.w_comp, "brier": self.w_brier,
                 "ir": self.w_ir, "kl": self.w_kl    # should not be part of the loss weight balancer
             }
             
             # Which losses should be *balanced* by GradNorm (supervised/shape only)
             # Anything *not* in BALANCE_KEYS should be added to the loss with a fixed weight outside GradNorm.
-            BALANCE_KEYS = ("nll", "ls", "imax", "comp", "dce")
+            BALANCE_KEYS = ("nll", "ls", "imax", "comp", "dce", "brier")
             self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
             
             # target proportions don't necessarily need to be softmaxed
-            self.targets = {"nll": 0.8, "ls": 0.2, "dce": 0.0, "imax": 0.0, "comp": 0.0}
+            self.targets = {"nll": 0.90, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.05, "brier": 0.05}
             try:
                 if self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0) !=0 and \
                     isinstance(self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0), dict):
@@ -449,17 +524,28 @@ class Trainer:
                     self.targets = {"nll": 0.8, "ls": 0.2, "dce": 0.0, "imax": 0.0, "comp": 0.0} # "ir": 0.0, "kl": 0.0
             except:
                 print(f"ERROR in getting target weight shares. Using default {self.targets}")
-                
+            
+            print(f"Using base weights: {self.base_weights},\ntarget weights: {self.targets}")
             base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
             targets_for_balancer = {k: self.targets.get(k, 0.0) for k in self.activeKeys_weightBalancer}
 
-            self.loss_w_eq = ProportionalGradNorm(      #ema_beta=0.9, power=0.5, # 0.9, min_mult=0.25, max_mult=4.0
-                    targets=targets_for_balancer, 
-                    base=base_for_balancer, 
-                    ema_beta=0.99,
-                    power=0.3, 
-                    min_mult=0.5, 
-                    max_mult=2.0)
+            # self.loss_w_eq = ProportionalGradNorm(      #ema_beta=0.9, power=0.5, # 0.9, min_mult=0.25, max_mult=4.0
+            #         targets=targets_for_balancer, 
+            #         base=base_for_balancer, 
+            #         ema_beta=0.99,
+            #         power=0.3, 
+            #         min_mult=0.5, 
+            #         max_mult=2.0)
+            self.loss_w_eq = ProportionalGradNorm(
+                targets=targets_for_balancer,
+                base=base_for_balancer,
+                ema_beta=0.97,   # was 0.99
+                power=0.5,       # was 0.3
+                min_mult=0.4,
+                max_mult=3.0,
+                use_log_ema=True,
+                step_cap=1.25     # gentle per-update cap
+            )
             # set target kl lambda to the one in config
             def kl_lambda_schedule(step, max_val=self.base_weights.get("kl", 1e-2), warmup=1500):
                 x = (step - warmup) / max(1, warmup // 3)
@@ -518,7 +604,7 @@ class Trainer:
             do_log = bool(self.logging and self.writer and (step % 20 == 0))
             if not hasattr(self, "update_step"):             # increments after each optimizer.step()
                 self.update_step = 0
-            eq_interval = int(getattr(self, "loss_w_eq_interval", 50))
+            eq_interval = int(getattr(self, "loss_w_eq_interval", 25))
             
             do_eq   = (self.update_step % eq_interval == 0)   # equalizer update cadence
             need_raw = (do_eq or do_log)  
@@ -595,15 +681,17 @@ class Trainer:
                     w_dce=self.w_dce,
                     w_imax=self.w_imax,
                     w_ir=self.w_ir,
-                    w_kl=self.w_kl,        # tune to keep alpha0 in range
+                    w_kl=self.w_kl,        # don't use intern one, was self.w_kl
                     w_comp=self.w_comp
                 )
             
-                # Lovasz on either Dirichlet mean (p_hat) or softmaxed model logits F.softmax(outputs, dim=1). We found on Dirichlet mean yielding better results.
                 alpha0 = alpha.sum(dim=1, keepdim=True) + get_eps_value()
                 p_hat = alpha / alpha0  # debugging: print(p_hat[0,:,32,32],"\n", alpha[0,:,32,32],"\n", alpha0[0,:,32,32]) 
                 
+                # Lovasz on either Dirichlet mean (p_hat) or softmaxed model logits F.softmax(outputs, dim=1). We found on Dirichlet mean yielding better results.
                 loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
+                
+                loss_brier = brier_dirichlet(alpha, labels, ignore_index=self.ignore_idx)
                 
                 # ----------------- PRE-BACKWARD: compute grad norms -----------------
                 raw_g = {}
@@ -615,7 +703,14 @@ class Trainer:
                     # Lovasz is separate
                     if self.base_weights.get("ls", 0.0) > 0.0 and isinstance(loss_ls, torch.Tensor) and loss_ls.requires_grad:
                         raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
-                        
+                    
+                    # NEW: brier & spring grads
+                    if self.base_weights.get("brier", 0.0) > 0.0 and loss_brier.requires_grad:
+                        raw_g["brier"] = grad_norm_wrt(loss_brier, self.model_ref_params, retain_graph=True)
+                    # we always need g_nll for the spring trust-region cap, make sure this loss is set
+                    # g_spring = grad_norm_wrt(loss_spring, self.model_ref_params, retain_graph=True)
+                    # raw_g["spring"] = g_spring
+        
                     # update equalizer only on schedule; else keep current weights
                     if do_eq and raw_g:
                         active_g = {k: raw_g[k] for k in self.activeKeys_weightBalancer if k in raw_g}
@@ -635,6 +730,16 @@ class Trainer:
                     raw_g = getattr(self, "_last_raw_g", {})
                     eff_g = getattr(self, "_last_eff_g", {})
 
+                # ----------------- TRUST-REGION CAP for spring -----------------
+                lam_kl = self.kl_lambda_schedule(self.global_step) if self.base_weights.get("kl", 0.0) > 0.0 else 0.0
+                # cap spring’s effective grad ≤ cap * NLL’s
+                g_nll = float(raw_g.get("nll", 0.0))
+                g_kl = float(raw_g.get("kl", 0.0))
+                spring_cap = self.spring_grad_cap
+                spring_scale = 1.0
+                if lam_kl > 0.0 and g_nll > 0.0 and g_kl > 0.0:
+                    spring_scale = min(1.0, spring_cap * (g_nll / (g_kl + 1e-8)))
+        
                 # ----------------- BUILD TOTAL LOSS -----------------
                 loss = 0.0
                 # balanced terms
@@ -643,16 +748,21 @@ class Trainer:
                 if new_w.get("imax", 0.0) > 0: loss = loss + new_w["imax"] * L_dir_dict.get("imax", 0.0)
                 if new_w.get("comp", 0.0) > 0: loss = loss + new_w["comp"] * L_dir_dict.get("comp", 0.0)
                 if new_w.get("ls", 0.0)   > 0: loss = loss + new_w["ls"]   * loss_ls
-                
+                if new_w.get("brier", 0.0) > 0: loss = loss + new_w["brier"] * loss_brier   # NEW
+
                 # fixed (NOT balanced) regularizers - still included in total and logs
                 if self.base_weights.get("ir", 0.0) > 0.0:
                     loss = loss + self.base_weights["ir"] * L_dir_dict.get("ir", 0.0)
 
                 if self.base_weights.get("kl", 0.0) > 0.0:
                     lam_kl = self.kl_lambda_schedule(self.global_step)
+                    # update kl weight in base_weight dict
                     self.base_weights["kl"] = lam_kl
-                    loss = loss + self.base_weights["kl"] * L_dir_dict.get("kl", 0.0)
-
+                    # get effective kl weight
+                    lam_kl_eff = lam_kl * spring_scale
+                    # total kl loss
+                    loss = loss + lam_kl_eff * L_dir_dict.get("kl", 0.0)
+        
                 # keep a clean, detached copy for viz AFTER losses computed
                 self._alpha_cache = alpha.detach()
                 
@@ -696,9 +806,17 @@ class Trainer:
                     if w_ls_eff != 0.0:
                         self.writer.add_scalar("loss/ls", _to_float(loss_ls) * float(w_ls_eff), self.global_step)
                     
+                    # brier
+                    w_brier_eff = new_w.get("brier", self.base_weights.get("brier", 0.0))
+                    if w_brier_eff != 0.0:
+                        self.writer.add_scalar("loss/brier", _to_float(loss_brier) * float(w_brier_eff), self.global_step)
+                        
                     # KL evidence
                     if self.base_weights.get("kl", 0.0) != 0.0:
-                        self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * self.base_weights["kl"], self.global_step)
+                        self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * lam_kl_eff, self.global_step)
+                        self.writer.add_scalar("spring/lambda", lam_kl, self.global_step)
+                        self.writer.add_scalar("spring/lambda_eff", lam_kl_eff, self.global_step)
+                    #     self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * self.base_weights["kl"], self.global_step)
                     
                     # Information regularization term
                     if self.base_weights.get("ir", 0.0) != 0.0:
@@ -977,11 +1095,11 @@ class Trainer:
                     save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
                 )
                 # ECE plot
-                ece_value, _ = self.ece_eval.compute(
+                (ece, mce), ece_stats = self.ece_eval.compute(
                     save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch:03d}.png"),
                     title=f"Reliability (epoch {epoch:03d})"
                 )
-                print(f"Epoch {epoch} ECE: {ece_value:.4f}")
+                print(f"Epoch {epoch} ECE: {ece:.4f}, Max_ECE: {mce:.4f}")
 
         return mIoU
 
@@ -1006,12 +1124,13 @@ class Trainer:
                     self.scheduler.step(mIoU)
 
                 if self.logging and self.save_path: 
+                    os.makedirs(os.path.join(self.save_path, "weights"), exist_ok=True)
                     if mIoU > best_mIoU: # save best weight
                         best_mIoU = mIoU
-                        ckpt_path = os.path.join(self.save_path, f"best_epoch_{epoch:03d}.pt")
+                        ckpt_path = os.path.join(self.save_path, "weights", f"best_epoch_{epoch:03d}.pt")
                         torch.save(self.model.state_dict(), ckpt_path)
                     else:   # save weights regardless but not labeled as "best"                       
-                        ckpt_path = os.path.join(self.save_path, f"epoch_{epoch:03d}.pt")
+                        ckpt_path = os.path.join(self.save_path, "weights", f"epoch_{epoch:03d}.pt")
                         torch.save(self.model.state_dict(), ckpt_path)
 
         # final eval & save
