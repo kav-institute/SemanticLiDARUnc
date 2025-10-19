@@ -42,7 +42,9 @@ from utils.viz_panel import (
 
 from metrics.ece import ECEAggregator
 
-from models.losses import brier_dirichlet, evidence_logspring
+from losses.dirichlet_losses import _valid_mask
+
+#from models.losses import brier_dirichlet, evidence_logspring
 # ------------------------------
 # Small helpers
 # ------------------------------
@@ -342,6 +344,7 @@ class Trainer:
         self.use_mc_sampling = bool(self.cfg["model_settings"].get("use_mc_sampling", 0))
         
         self.logging = logging
+        self.num_epochs = int(self.cfg["train_params"]["num_epochs"]) + int(self.cfg["train_params"].get("num_warmup_epochs", 0))
 
         # data / task meta
         self.num_classes = int(cfg["extras"]["num_classes"])
@@ -355,7 +358,7 @@ class Trainer:
 
         # Evaluator inits
         ## ignore index for training, e.g. unlabeled class; else None
-        self.ignore_idx: int| None = 0
+        self.ignore_index: int| None = 0
         
         self.iou_evaluator = IoUEvaluator(self.num_classes)
         if cfg["extras"].get("test_mask", 0):
@@ -369,7 +372,7 @@ class Trainer:
         self.ece_eval = ECEAggregator(
                             n_bins=15,
                             mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
-                            ignore_index=self.ignore_idx,        
+                            ignore_index=self.ignore_index,        
                             max_samples=100_000_000,       # None or an int cap like 2_000_000 to bound memory
                             plot_style="classic+hist"
                         )
@@ -449,41 +452,39 @@ class Trainer:
             return w
 
         if self.loss_name == "Tversky":
-            self.criterion_ce = CrossEntropyLoss(ignore_index=self.ignore_idx)
-            self.criterion_tversky = TverskyLoss(ignore_index=self.ignore_idx)
+            self.criterion_ce = CrossEntropyLoss(ignore_index=self.ignore_index)
+            self.criterion_tversky = TverskyLoss(ignore_index=self.ignore_index)
             
             # loss weights
             defaults = dict(w_ce=1.0, w_tversky=1.0)
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
             self.w_ce, self.w_tversky = w["w_ce"], w["w_tversky"]
         elif self.loss_name == "CE":
-            self.criterion_ce = CrossEntropyLoss(ignore_index=self.ignore_idx)
+            self.criterion_ce = CrossEntropyLoss(ignore_index=self.ignore_index)
         elif self.loss_name == "Lovasz":
-            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
+            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
         elif self.loss_name == "Dirichlet":
-            self.nll_smoothing_start = 0.00 # only for density based nll
-            
+            # build prior concentration from desired credible interval coverage   
             from utils.alpha_evid_prior import solve_alpha0_for_coverage
-            self.prior_concentration, _ = solve_alpha0_for_coverage(p_star=0.90, h=0.05, delta=0.025, K=self.num_classes)     # alpha0/C target
-            self.spring_grad_cap     = 0.25   # allow <=25% of NLL effective grad
-            self.criterion_dirichlet = DirichletCriterion(
-                num_classes=self.num_classes,
-                ignore_index=self.ignore_idx,
-                eps=get_eps_value(),
-                prior_concentration=self.prior_concentration,
-                p_moment=1.0,
-                smoothing=self.nll_smoothing_start,
-                kl_mode="evidence", # "evidence" keeps mean p_hat, pins alpha0 to your target so certainty stays calibrated; "symmetric" pulls toward uniform
-                nll_mode="dircat",   # "density" | "dircat" (stabilizes class ranking, acts on p_hat)
-                with_acc_classWeights= False, # if True nll_mode="dircat" uses weighted nll to handle imbalance, BUT nll will be not strictly proper anymore
-                comp_gamma = 2.0,
-                comp_tau   = 0.55,    # if you still see confident mistakes, try 0.75 later
-                comp_sigma = 0.12,      # bounded to [0.06, 0.12]
-                comp_normalize = True
-            )
-
-            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
+            # h=0.05 -> (95% central mass in [0.85, 0.95]), # delta=0.025 -> 95% central mass (1 - 2*delta)
+            self.prior_concentration, self.prior_concentration_per_class = solve_alpha0_for_coverage(p_star=0.90, h=0.05, delta=0.025, K=self.num_classes)     # alpha0, alpha0/C target
+            print(f"Dirichlet prior concentration set to {self.prior_concentration:.3f} (uniform base)")
             
+            from utils.alpha_evid_prior import logit_threshold_for_alpha_cap
+            # margin: how much over the target s_total you will tolerate before the hinge wakes up, m: assume up to m "active" classes per pixel
+            z_thr, a_thr = logit_threshold_for_alpha_cap(self.prior_concentration, K=self.num_classes, m=3, margin=0.1, T=get_alpha_temperature())
+            from losses.dirichlet_losses import (
+                NLLDirichletCategorical,
+                BrierDirichlet,
+                ComplementKLUniform
+            )
+            self.crit_nll_dircat = NLLDirichletCategorical(ignore_index=self.ignore_index)
+            self.crit_brier = BrierDirichlet(ignore_index=self.ignore_index, s_ref=self.prior_concentration)  # set s_ref=None if you want the standard version
+            self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=2.0, tau=0.55, sigma=0.12,
+                                    s_target=None, normalize=True)
+
+            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
+
             # loss weights
             defaults = dict(w_nll=0.0, 
                             w_imax=3.0, 
@@ -492,23 +493,35 @@ class Trainer:
                             w_kl=0.5, 
                             w_ir=0.3,
                             w_comp=0.2,
-                            w_brier=0.05)
+                            w_brier=0.05,
+                            w_evid_reg=2e-3,
+                            w_logit_reg=1e-4)
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
 
             self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
             self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
             self.w_comp = w["w_comp"]
             self.w_brier = w["w_brier"]
+            self.w_evid_reg = w["w_evid_reg"]
+            self.w_logit_reg = w["w_logit_reg"]
             # define prior/base weights (from cfg)
             self.base_weights = {
                 "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
                 "imax": self.w_imax, "comp": self.w_comp, "brier": self.w_brier,
-                "ir": self.w_ir, "kl": self.w_kl    # should not be part of the loss weight balancer
+                "ir": self.w_ir, "kl": self.w_kl, 
+                "evid_reg": self.w_evid_reg, "logit_reg": self.w_logit_reg
             }
             
+            from losses.regularizers import EvidenceReg, LogitRegularizer, EvidenceRegBand
+            # choose mode: "one_sided" (penalize only over-confidence) or "log_squared" (penalize both under- and over-confidence)
+            self.evidence_reg = EvidenceReg(s_target=self.prior_concentration, mode="log_squared", margin=0.1)
+            #self.evidence_reg = EvidenceRegBand(s_target=self.prior_concentration, band=0.1)  
+            self.logit_reg = LogitRegularizer(threshold=z_thr)
+
+
             # Which losses should be *balanced* by GradNorm (supervised/shape only)
             # Anything *not* in BALANCE_KEYS should be added to the loss with a fixed weight outside GradNorm.
-            BALANCE_KEYS = ("nll", "ls", "imax", "comp", "dce", "brier")
+            BALANCE_KEYS = ("nll", "ls", "comp", "brier")
             self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
             
             # target proportions don't necessarily need to be softmaxed
@@ -529,13 +542,6 @@ class Trainer:
             base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
             targets_for_balancer = {k: self.targets.get(k, 0.0) for k in self.activeKeys_weightBalancer}
 
-            # self.loss_w_eq = ProportionalGradNorm(      #ema_beta=0.9, power=0.5, # 0.9, min_mult=0.25, max_mult=4.0
-            #         targets=targets_for_balancer, 
-            #         base=base_for_balancer, 
-            #         ema_beta=0.99,
-            #         power=0.3, 
-            #         min_mult=0.5, 
-            #         max_mult=2.0)
             self.loss_w_eq = ProportionalGradNorm(
                 targets=targets_for_balancer,
                 base=base_for_balancer,
@@ -546,16 +552,10 @@ class Trainer:
                 use_log_ema=True,
                 step_cap=1.25     # gentle per-update cap
             )
-            # set target kl lambda to the one in config
-            def kl_lambda_schedule(step, max_val=self.base_weights.get("kl", 1e-2), warmup=1500):
-                x = (step - warmup) / max(1, warmup // 3)
-                # smooth 0 -> max_val
-                return float(max_val) * (0.5 * (1.0 + torch.tanh(torch.tensor(x))).item())
-            self.kl_lambda_schedule = kl_lambda_schedule
 
         elif self.loss_name == "SalsaNext":
-            self.criterion_nll = torch.nn.NLLLoss()#CrossEntropyLoss(ignore_index=self.ignore_idx)
-            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_idx)
+            self.criterion_nll = torch.nn.NLLLoss()#CrossEntropyLoss(ignore_index=self.ignore_index)
+            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
             
             # loss weights
             defaults = dict(w_nll=1.0, w_ls=1.0)
@@ -668,53 +668,54 @@ class Trainer:
                 
             elif self.loss_name == "Dirichlet":
                 alpha = to_alpha_concentrations(outputs)
-                
-                # get dirichlet losses
-                L_dir_dict={}
-                if step % 10 ==0:    # every 10 iteration update ema class weight accumulator, TODO: currently hard coded
-                    if self.criterion_dirichlet.with_acc_classWeights:
-                        self.criterion_dirichlet.update_class_weights(labels, method="effective_num", beta=0.999)   # access with self.criterion_dirichlet.class_weights  
-                
-                loss_dirichlet, L_dir_dict = self.criterion_dirichlet(
-                    alpha, labels,
-                    w_nll=self.w_nll,
-                    w_dce=self.w_dce,
-                    w_imax=self.w_imax,
-                    w_ir=self.w_ir,
-                    w_kl=self.w_kl,        # don't use intern one, was self.w_kl
-                    w_comp=self.w_comp
-                )
-            
+                self._alpha_logits = outputs.detach()  # optional; used only for the precond metric
+
+                # Terms computed with your new split loss classes
+                L_terms = {}
+
+                # nll (dirichlet-categorical)
+                if self.base_weights.get("nll", 0.0) > 0.0:
+                    loss_nll_dircat = self.crit_nll_dircat(alpha, labels)
+                    L_terms["nll"] = loss_nll_dircat
+
+                # Lovasz on Dirichlet mean
                 alpha0 = alpha.sum(dim=1, keepdim=True) + get_eps_value()
-                p_hat = alpha / alpha0  # debugging: print(p_hat[0,:,32,32],"\n", alpha[0,:,32,32],"\n", alpha0[0,:,32,32]) 
-                
-                # Lovasz on either Dirichlet mean (p_hat) or softmaxed model logits F.softmax(outputs, dim=1). We found on Dirichlet mean yielding better results.
-                loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
-                
-                loss_brier = brier_dirichlet(alpha, labels, ignore_index=self.ignore_idx)
-                
+                p_hat = alpha / alpha0
+                if self.base_weights.get("ls", 0.0) > 0.0:
+                    loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
+                    L_terms["ls"] = loss_ls
+
+                # Complement KL to uniform on off-classes (if enabled)
+                if self.base_weights.get("comp", 0.0) > 0.0:
+                    loss_comp = self.crit_comp(alpha, labels)
+                    L_terms["comp"] = loss_comp
+
+                # Dirichlet Brier (expected)
+                if self.base_weights.get("brier", 0.0) > 0.0:
+                    loss_brier = self.crit_brier(alpha, labels)
+                    L_terms["brier"] = loss_brier
+
+                # Add regularization terms
+                if self.base_weights.get("evid_reg", 0.0) > 0.0:
+                    loss_evid_reg = self.evidence_reg(alpha)
+                    L_terms["evid_reg"] = loss_evid_reg
+                    
+                if self.base_weights.get("logit_reg", 0.0) > 0.0:
+                    loss_logit_reg = self.logit_reg(outputs)
+                    L_terms["logit_reg"] = loss_logit_reg
+                    
                 # ----------------- PRE-BACKWARD: compute grad norms -----------------
                 raw_g = {}
                 if need_raw:
-                    # Measure raw grad norms (for ALL losses you want to see)
-                    for name, val in L_dir_dict.items():
+                    # measure grad norms for active terms
+                    for name, val in L_terms.items():
                         if self.base_weights.get(name, 0.0) > 0.0 and isinstance(val, torch.Tensor) and val.requires_grad:
                             raw_g[name] = grad_norm_wrt(val, self.model_ref_params, retain_graph=True)
-                    # Lovasz is separate
-                    if self.base_weights.get("ls", 0.0) > 0.0 and isinstance(loss_ls, torch.Tensor) and loss_ls.requires_grad:
-                        raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
-                    
-                    # NEW: brier & spring grads
-                    if self.base_weights.get("brier", 0.0) > 0.0 and loss_brier.requires_grad:
-                        raw_g["brier"] = grad_norm_wrt(loss_brier, self.model_ref_params, retain_graph=True)
-                    # we always need g_nll for the spring trust-region cap, make sure this loss is set
-                    # g_spring = grad_norm_wrt(loss_spring, self.model_ref_params, retain_graph=True)
-                    # raw_g["spring"] = g_spring
-        
+
                     # update equalizer only on schedule; else keep current weights
                     if do_eq and raw_g:
                         active_g = {k: raw_g[k] for k in self.activeKeys_weightBalancer if k in raw_g}
-                        new_w = self.loss_w_eq.step(active_g)       # uses EFFECTIVE-norm control internally
+                        new_w = self.loss_w_eq.step(active_g)
                     else:
                         new_w = self.loss_w_eq.weights()
 
@@ -730,50 +731,47 @@ class Trainer:
                     raw_g = getattr(self, "_last_raw_g", {})
                     eff_g = getattr(self, "_last_eff_g", {})
 
-                # ----------------- TRUST-REGION CAP for spring -----------------
-                lam_kl = self.kl_lambda_schedule(self.global_step) if self.base_weights.get("kl", 0.0) > 0.0 else 0.0
-                # cap spring’s effective grad ≤ cap * NLL’s
-                g_nll = float(raw_g.get("nll", 0.0))
-                g_kl = float(raw_g.get("kl", 0.0))
-                spring_cap = self.spring_grad_cap
-                spring_scale = 1.0
-                if lam_kl > 0.0 and g_nll > 0.0 and g_kl > 0.0:
-                    spring_scale = min(1.0, spring_cap * (g_nll / (g_kl + 1e-8)))
-        
                 # ----------------- BUILD TOTAL LOSS -----------------
                 loss = 0.0
                 # balanced terms
-                if new_w.get("dce", 0.0)  > 0: loss = loss + new_w["dce"]  * L_dir_dict.get("dce",  0.0)
-                if new_w.get("nll", 0.0)  > 0: loss = loss + new_w["nll"]  * L_dir_dict.get("nll",  0.0)
-                if new_w.get("imax", 0.0) > 0: loss = loss + new_w["imax"] * L_dir_dict.get("imax", 0.0)
-                if new_w.get("comp", 0.0) > 0: loss = loss + new_w["comp"] * L_dir_dict.get("comp", 0.0)
-                if new_w.get("ls", 0.0)   > 0: loss = loss + new_w["ls"]   * loss_ls
-                if new_w.get("brier", 0.0) > 0: loss = loss + new_w["brier"] * loss_brier   # NEW
+                if new_w.get("nll", 0.0)   > 0: loss = loss + new_w["nll"]   * L_terms.get("nll", 0.0)
+                if new_w.get("ls", 0.0)    > 0: loss = loss + new_w["ls"]    * L_terms.get("ls", 0.0)
+                if new_w.get("comp", 0.0)  > 0: loss = loss + new_w["comp"]  * L_terms.get("comp", 0.0)
+                if new_w.get("brier", 0.0) > 0: loss = loss + new_w["brier"] * L_terms.get("brier", 0.0)
 
-                # fixed (NOT balanced) regularizers - still included in total and logs
-                if self.base_weights.get("ir", 0.0) > 0.0:
-                    loss = loss + self.base_weights["ir"] * L_dir_dict.get("ir", 0.0)
+                # fixed-weight terms
+                if self.base_weights.get("evid_reg", 0.0) > 0.0: 
+                    #self.evid_reg_scheduler.update(epoch)         
+                    #new_w["evid_reg"] = self.evid_reg_scheduler.get_weight()
+                    new_w["evid_reg"] = self.base_weights["evid_reg"]
+                    loss = loss + new_w["evid_reg"] * L_terms.get("evid_reg", 0.0)
+                if self.base_weights.get("logit_reg", 0.0) > 0.0:
+                    with torch.no_grad():
+                        # compute gating based on alpha0 vs prior concentration
+                        s = float(self.prior_concentration)
+                        band = 0.10                         # same convention as your "margin" in EvidenceReg
+                        a0  = alpha.sum(dim=1, keepdim=False) + get_eps_value()
 
-                if self.base_weights.get("kl", 0.0) > 0.0:
-                    lam_kl = self.kl_lambda_schedule(self.global_step)
-                    # update kl weight in base_weight dict
-                    self.base_weights["kl"] = lam_kl
-                    # get effective kl weight
-                    lam_kl_eff = lam_kl * spring_scale
-                    # total kl loss
-                    loss = loss + lam_kl_eff * L_dir_dict.get("kl", 0.0)
-        
+                        valid = _valid_mask(labels, self.ignore_index)
+                        # smooth gate in [0,1] for "how much we are above the band"
+                        z = ((a0 / s) - 1.0) / band        # 0 at s, ~1 at s*(1+band)
+                        r_pos = torch.clamp(z, min=0.0)
+                        gate_over_raw = (r_pos / (1.0 + r_pos))
+                        gate_over_valid = (gate_over_raw[valid] if valid.any() else gate_over_raw.view(-1))
+                        gate_over = gate_over_valid.quantile(0.5).item() 
+                        gate_over = max(0.0, min(1.0, gate_over))        # safety clamp
+                    # effective weights
+                    w_logit_eff = self.base_weights["logit_reg"] * gate_over            
+                    new_w["logit_reg"] = w_logit_eff
+                    loss = loss + new_w["logit_reg"] * L_terms.get("logit_reg", 0.0)
                 # keep a clean, detached copy for viz AFTER losses computed
                 self._alpha_cache = alpha.detach()
-                
-            else:
-                raise RuntimeError("unreachable")
 
-            # @@@ After loss calculaltion @@@
-            total_loss += float(loss.item())
+
             # Backprop
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            
             self.optimizer.step()
             self.scheduler.step()
 
@@ -796,78 +794,53 @@ class Trainer:
                 self.writer.add_scalar("LR/iter", self.optimizer.param_groups[0]['lr'], self.global_step)
                 if self.loss_name == "Dirichlet":
                     # weighted loss terms that exist (log with CURRENT weights)
-                    for name, val in L_dir_dict.items():
+                    for name, val in L_terms.items():
                         w_cur = new_w.get(name, 0.0)
                         if w_cur != 0.0:
                             self.writer.add_scalar(f"loss/{name}", _to_float(val) * w_cur, self.global_step)
 
-                    # Lovasz (same effective weight logic; new_w should have it, but fallback is fine)
-                    w_ls_eff = new_w.get("ls", self.base_weights.get("ls", 0.0))
-                    if w_ls_eff != 0.0:
-                        self.writer.add_scalar("loss/ls", _to_float(loss_ls) * float(w_ls_eff), self.global_step)
-                    
-                    # brier
-                    w_brier_eff = new_w.get("brier", self.base_weights.get("brier", 0.0))
-                    if w_brier_eff != 0.0:
-                        self.writer.add_scalar("loss/brier", _to_float(loss_brier) * float(w_brier_eff), self.global_step)
-                        
-                    # KL evidence
-                    if self.base_weights.get("kl", 0.0) != 0.0:
-                        self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * lam_kl_eff, self.global_step)
-                        self.writer.add_scalar("spring/lambda", lam_kl, self.global_step)
-                        self.writer.add_scalar("spring/lambda_eff", lam_kl_eff, self.global_step)
-                    #     self.writer.add_scalar("loss/kl", _to_float(L_dir_dict.get("kl", 0.0)) * self.base_weights["kl"], self.global_step)
-                    
-                    # Information regularization term
-                    if self.base_weights.get("ir", 0.0) != 0.0:
-                        self.writer.add_scalar("loss/ir", _to_float(L_dir_dict.get("ir", 0.0)) * self.base_weights["ir"], self.global_step)
+                # Lovasz
+                w_ls_eff = new_w.get("ls", self.base_weights.get("ls", 0.0))
+                if w_ls_eff != 0.0:
+                    self.writer.add_scalar("loss/ls", _to_float(loss_ls) * float(w_ls_eff), self.global_step)
 
-                    # grad norms raw / eff already prepared (eff_g uses effective weights for all keys)
-                    if raw_g:
-                        for name, g in raw_g.items():
-                            self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
-                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5
-                        self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
+                # grad norms raw / eff
+                if raw_g:
+                    for name, g in raw_g.items():
+                        self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
+                rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5
+                self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
 
-                    if eff_g:
-                        for name, g in eff_g.items():
-                            self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
-                        rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
-                        self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
-                    
-                    # alpha0 stats (use cached alpha)
+                if eff_g:
+                    for name, g in eff_g.items():
+                        self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
+                rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
+                self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
+
+                # alpha0 stats (use cached alpha)
+                with torch.no_grad():
+                    a0_hw = self._alpha_cache.sum(dim=1)              # [B,H,W]
+                    med_alpha0 = a0_hw.median().item()
+                    med_alpha0_per_cls = (a0_hw / float(alpha.shape[1])).median().item()
+                self.writer.add_scalar("alpha0/median", med_alpha0, self.global_step)
+                self.writer.add_scalar("alpha0/median_per_class", med_alpha0_per_cls, self.global_step)
+
+                # comp gate diagnostics (if comp enabled)
+                if self.base_weights.get("comp", 0.0) != 0.0:
                     with torch.no_grad():
-                        a0_hw = self._alpha_cache.sum(dim=1)              # [B,H,W]
-                        med_alpha0 = a0_hw.median().item()
-                        med_alpha0_per_cls = (a0_hw / float(alpha.shape[1])).median().item()
-                    self.writer.add_scalar("alpha0/median", med_alpha0, self.global_step)
-                    self.writer.add_scalar("alpha0/median_per_class", med_alpha0_per_cls, self.global_step)
+                        py = (alpha/(alpha.sum(1, keepdim=True)+1e-8)).gather(1, labels.unsqueeze(1)).squeeze(1)
+                        mean_gate = ((1 - py).pow(self.crit_comp.gamma) *
+                                     torch.sigmoid((self.crit_comp.tau - py)/self.crit_comp.sigma)).mean().item()
+                        frac_below_tau = (py < self.crit_comp.tau).float().mean().item()
+                        self.writer.add_scalar("comp/mean_gate", mean_gate, self.global_step)
+                        self.writer.add_scalar("comp/frac_below_tau", frac_below_tau, self.global_step)
 
-                    if self.base_weights.get("comp", 0.0) != 0.0:
-                        with torch.no_grad():
-                            py = (alpha/(alpha.sum(1, keepdim=True)+1e-8)).gather(1, labels.unsqueeze(1)).squeeze(1)
-                            w_uncert = (1-py).pow(self.criterion_dirichlet.comp_gamma) * torch.sigmoid((self.criterion_dirichlet.comp_tau - py)/self.criterion_dirichlet.comp_sigma)
-                            frac_below_tau = (py < self.criterion_dirichlet.comp_tau).float().mean().item() # what fraction of pixels your gate considers "uncertain"
-                            mean_gate = w_uncert.mean().item()  # average strength of the comp weight actually applied
-                            #60% of pixels below tau -> comp acts very broadly. 20% uncertain -> comp focuses sparsely (good if you only want it on hard pixels).
-                            self.writer.add_scalar("comp/mean_gate", mean_gate, self.global_step)
-                            self.writer.add_scalar("comp/frac_below_tau", frac_below_tau, self.global_step)
-                    
-                    # H_norm coverage
-                    self.writer.add_scalar("H_norm/pct_lt_0.1",  (H_norm < 0.10).float().mean().item(), self.global_step)
-                    self.writer.add_scalar("H_norm/pct_lt_0.25", (H_norm < 0.25).float().mean().item(), self.global_step)
-                    self.writer.add_scalar("H_norm/pct_gt_0.5",  (H_norm > 0.50).float().mean().item(), self.global_step)
-                    self.writer.add_scalar("H_norm/pct_gt_0.75", (H_norm > 0.75).float().mean().item(), self.global_step)
-                elif self.loss_name=="SalsaNext" and self.baseline=="SalsaNext":
-                    self.writer.add_scalar('loss/loss_nll', loss_nll.item(), self.global_step)
-                    self.writer.add_scalar('loss/loss_ls', loss_ls.item(), self.global_step)
-
-                    if raw_g:
-                        for name, g in raw_g.items():
-                            self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
-                        # rss raw
-                        rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5 if raw_g else 0.0
-                        self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
+                # H_norm coverage
+                self.writer.add_scalar("H_norm/pct_lt_0.1",  (H_norm < 0.10).float().mean().item(), self.global_step)
+                self.writer.add_scalar("H_norm/pct_lt_0.25", (H_norm < 0.25).float().mean().item(), self.global_step)
+                self.writer.add_scalar("H_norm/pct_gt_0.5",  (H_norm > 0.50).float().mean().item(), self.global_step)
+                self.writer.add_scalar("H_norm/pct_gt_0.75", (H_norm > 0.75).float().mean().item(), self.global_step)
+            
             # Interactive visualization (cheap, reusing computed items)
             if self.visualize:
                 idx0 = 0
@@ -875,8 +848,8 @@ class Trainer:
                 
                 # -> GT class
                 semantics_gt = labels[idx0].detach().cpu().numpy()  # [H, W]
-                if self.ignore_idx is not None:
-                    mask = np.argwhere(semantics_gt==self.ignore_idx)
+                if self.ignore_index is not None:
+                    mask = np.argwhere(semantics_gt==self.ignore_index)
                 else:
                     mask = None
                 
@@ -884,8 +857,8 @@ class Trainer:
                 outputs_cpu = outputs[idx0].detach().cpu().numpy()  # [B, C, H, W] -> [C, H, W]
                 semantics_pred = np.argmax(outputs_cpu, axis=0)     # [H, W]
                     # apply mask for ignored index
-                if self.ignore_idx is not None:
-                    semantics_pred[mask[:, 0], mask[:, 1]] = self.ignore_idx
+                if self.ignore_index is not None:
+                    semantics_pred[mask[:, 0], mask[:, 1]] = self.ignore_index
                     
                 # -> Reflectivity
                 reflectivity_img = reflectivity[idx0].permute(1, 2, 0).detach().cpu().numpy()
@@ -947,7 +920,7 @@ class Trainer:
         mIoU, result_dict = self.iou_evaluator.compute(
             class_names=self.class_names,
             test_mask=[0] + [1] * (self.num_classes - 1),
-            ignore_gt=[self.ignore_idx],
+            ignore_gt=[self.ignore_index],
             reduce="mean",
             ignore_th=None
         )
@@ -1073,7 +1046,7 @@ class Trainer:
         mIoU, result_dict = self.iou_evaluator.compute(
             class_names=self.class_names,
             test_mask=self.test_mask,
-            ignore_gt=[self.ignore_idx],
+            ignore_gt=[self.ignore_index],
             reduce="mean",
             ignore_th=None
         )
@@ -1107,7 +1080,6 @@ class Trainer:
     # main loop
     # ------------------------------
     def __call__(self, train_loader, val_loader):
-        self.num_epochs = int(self.cfg["train_params"]["num_epochs"]) + int(self.cfg["train_params"].get("num_warmup_epochs", 0))
         test_every = int(self.cfg["logging_settings"]["test_every_nth_epoch"])
         
         best_mIoU = -1.0
