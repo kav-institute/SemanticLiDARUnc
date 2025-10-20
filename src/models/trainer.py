@@ -195,13 +195,13 @@ class ProportionalGradNorm:
     def weights(self):
         return {k: (self.base[k] * self.mult.get(k, 1.0) if self.base.get(k, 0.0) > 0.0 else 0.0)
                 for k in self.base}
-
+    
     def step(self, raw_g: dict[str, float]):
         active = [k for k, v in self.base.items() if v > 0.0 and k in raw_g]
         if not active:
             return self.weights()
 
-        # --- EMA of raw grads (log-EMA default) ---
+        # --- log-EMA grads (same as you do) ---
         for k in active:
             g = max(0.0, float(raw_g[k]))
             if self.use_log_ema:
@@ -210,39 +210,123 @@ class ProportionalGradNorm:
             else:
                 self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
 
-        sm = {k: (math.exp(self.ema[k]) if self.use_log_ema else self.ema[k]) for k in active}
+        g_ema = {k: (math.exp(self.ema[k]) if self.use_log_ema else self.ema[k]) for k in active}
         for k in active:
-            sm[k] = max(sm[k], self.ema_floor)
+            g_ema[k] = max(g_ema[k], self.ema_floor)
 
-        # --- effective norms ---
-        w   = {k: self.base[k] * self.mult[k] for k in active}
-        eff = {k: w[k] * sm[k] for k in active}
+        # --- normalize target shares over *active* keys (sum=1) ---
+        tot_t = sum(max(0.0, float(self.targets.get(k, 0.0))) for k in active) + 1e-12
+        share = {k: float(self.targets.get(k, 0.0)) / tot_t for k in active}
 
-        # --- target ratios (safe) ---
-        tot_t = sum(max(0.0, float(self.targets.get(k, 0.0))) for k in active)
-        if tot_t <= 0.0:
-            r = {k: 1.0 for k in active}  # uniform if all zeros
-        else:
-            mean_t = tot_t / len(active)
-            r = {k: float(self.targets[k]) / (mean_t + 1e-12) for k in active}
+        # --- closed-form desired multipliers (inverse-grad, base-aware) ---
+        raw = {k: share[k] / (g_ema[k] * self.base[k] + 1e-12) for k in active}
+        # geometric mean normalization so avg multiplier stays ~1
+        gm = math.exp(sum(math.log(max(v, 1e-12)) for v in raw.values()) / len(active))
+        m_des = {k: raw[k] / gm for k in active}
 
-        mean_eff = sum(eff.values()) / (len(active) + 1e-12)
-
-        # --- proportional correction with per-update cap ---
+        # --- smooth move toward m_des with per-step cap ---
         for k in active:
-            Ei = eff[k] + 1e-12
-            Ei_star = mean_eff * r[k]
-            scale = (Ei_star / Ei) ** self.k
-            scale = float(min(max(scale, 1.0 / self.step_cap), self.step_cap))
-            self.mult[k] = float(self.mult[k] * scale)
+            ratio = (m_des[k] / (self.mult[k] + 1e-12)) ** self.k
+            ratio = float(min(max(ratio, 1.0 / self.step_cap), self.step_cap))
+            self.mult[k] = float(self.mult[k] * ratio)
             self.mult[k] = float(min(max(self.mult[k], self.min_mult), self.max_mult))
 
-        # keep avg multiplier ≈ 1
+        # re-center to keep average ~1
         avg_mult = sum(self.mult[k] for k in active) / (len(active) + 1e-12)
         for k in active:
             self.mult[k] /= (avg_mult + 1e-12)
 
         return self.weights()
+
+    # def step(self, raw_g: dict[str, float]):
+    #     active = [k for k, v in self.base.items() if v > 0.0 and k in raw_g]
+    #     if not active:
+    #         return self.weights()
+
+    #     # --- EMA of raw grads (log-EMA by default) ---
+    #     for k in active:
+    #         g = max(0.0, float(raw_g[k]))
+    #         if self.use_log_ema:
+    #             lg = math.log(g + 1e-12)
+    #             self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * lg
+    #         else:
+    #             self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
+
+    #     g_ema = {k: (math.exp(self.ema[k]) if self.use_log_ema else self.ema[k]) for k in active}
+    #     for k in active:
+    #         g_ema[k] = max(g_ema[k], self.ema_floor)
+
+    #     # --- effective norms using smoothed grads ---
+    #     w    = {k: self.base[k] * self.mult[k] for k in active}
+    #     eff  = {k: w[k] * g_ema[k] for k in active}
+    #     tot_eff = sum(eff.values()) + 1e-12
+
+    #     # --- normalize target shares to sum to 1 over the *active* set ---
+    #     tot_t = sum(max(0.0, float(self.targets.get(k, 0.0))) for k in active) + 1e-12
+    #     share = {k: float(self.targets.get(k, 0.0)) / tot_t for k in active}    # normalize to sum=1
+
+    #     # --- proportional update to hit Ei* = tot_eff * share[k] ---
+    #     for k in active:
+    #         Ei      = eff[k] + 1e-12
+    #         Ei_star = tot_eff * share[k]    # target effective norm by share
+    #         scale   = (Ei_star / Ei) ** self.k
+    #         scale   = float(min(max(scale, 1.0 / self.step_cap), self.step_cap))
+    #         self.mult[k] = float(self.mult[k] * scale)
+    #         self.mult[k] = float(min(max(self.mult[k], self.min_mult), self.max_mult))
+
+    #     # keep average multiplier ~ 1 to avoid drift of global loss scale
+    #     avg_mult = sum(self.mult[k] for k in active) / (len(active) + 1e-12)
+    #     for k in active:
+    #         self.mult[k] /= (avg_mult + 1e-12)
+
+        return self.weights()
+    # def step(self, raw_g: dict[str, float]):
+    #     active = [k for k, v in self.base.items() if v > 0.0 and k in raw_g]
+    #     if not active:
+    #         return self.weights()
+
+    #     # --- EMA of raw grads (log-EMA default) ---
+    #     for k in active:
+    #         g = max(0.0, float(raw_g[k]))
+    #         if self.use_log_ema:
+    #             lg = math.log(g + 1e-12)
+    #             self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * lg
+    #         else:
+    #             self.ema[k] = self.beta * self.ema[k] + (1 - self.beta) * g
+
+    #     sm = {k: (math.exp(self.ema[k]) if self.use_log_ema else self.ema[k]) for k in active}
+    #     for k in active:
+    #         sm[k] = max(sm[k], self.ema_floor)
+
+    #     # --- effective norms ---
+    #     w   = {k: self.base[k] * self.mult[k] for k in active}
+    #     eff = {k: w[k] * sm[k] for k in active}
+
+    #     # --- target ratios (safe) ---
+    #     tot_t = sum(max(0.0, float(self.targets.get(k, 0.0))) for k in active)
+    #     if tot_t <= 0.0:
+    #         r = {k: 1.0 for k in active}  # uniform if all zeros
+    #     else:
+    #         mean_t = tot_t / len(active)
+    #         r = {k: float(self.targets[k]) / (mean_t + 1e-12) for k in active}
+
+    #     mean_eff = sum(eff.values()) / (len(active) + 1e-12)
+
+    #     # --- proportional correction with per-update cap ---
+    #     for k in active:
+    #         Ei = eff[k] + 1e-12
+    #         Ei_star = mean_eff * r[k]
+    #         scale = (Ei_star / Ei) ** self.k
+    #         scale = float(min(max(scale, 1.0 / self.step_cap), self.step_cap))
+    #         self.mult[k] = float(self.mult[k] * scale)
+    #         self.mult[k] = float(min(max(self.mult[k], self.min_mult), self.max_mult))
+
+    #     # keep avg multiplier ≈ 1
+    #     avg_mult = sum(self.mult[k] for k in active) / (len(active) + 1e-12)
+    #     for k in active:
+    #         self.mult[k] /= (avg_mult + 1e-12)
+
+    #     return self.weights()
 
 # class ProportionalGradNorm:
 #     """
@@ -472,7 +556,7 @@ class Trainer:
             
             from utils.alpha_evid_prior import logit_threshold_for_alpha_cap
             # margin: how much over the target s_total you will tolerate before the hinge wakes up, m: assume up to m "active" classes per pixel
-            z_thr, a_thr = logit_threshold_for_alpha_cap(self.prior_concentration, K=self.num_classes, m=3, margin=0.1, T=get_alpha_temperature())
+            z_thr, a_thr = logit_threshold_for_alpha_cap(self.prior_concentration, K=self.num_classes, m=1, margin=0.1, T=get_alpha_temperature())
             from losses.dirichlet_losses import (
                 NLLDirichletCategorical,
                 BrierDirichlet,
@@ -513,10 +597,11 @@ class Trainer:
             }
             
             from losses.regularizers import EvidenceReg, LogitRegularizer, EvidenceRegBand
-            # choose mode: "one_sided" (penalize only over-confidence) or "log_squared" (penalize both under- and over-confidence)
-            self.evidence_reg = EvidenceReg(s_target=self.prior_concentration, mode="log_squared", margin=0.1)
-            #self.evidence_reg = EvidenceRegBand(s_target=self.prior_concentration, band=0.1)  
-            self.logit_reg = LogitRegularizer(threshold=z_thr)
+            # EvidenceReg: scale controller. penalizes mismatch between a0 and target s, while leaving class proportions alone.
+                # choose mode: "one_sided" (penalize only over-confidence) or "log_squared" (penalize both under- and over-confidence)
+            self.evidence_reg = EvidenceReg(s_target=self.prior_concentration, mode="log_squared", ignore_index=self.ignore_index, scale_correct=True, margin=0.1)
+            # LogitRegularizer: hard guardrail on the pre-activation z. Stopping runaway growth early and everywhere.
+            self.logit_reg = LogitRegularizer(threshold=z_thr, ignore_index=None)   
 
 
             # Which losses should be *balanced* by GradNorm (supervised/shape only)
@@ -545,14 +630,14 @@ class Trainer:
             self.loss_w_eq = ProportionalGradNorm(
                 targets=targets_for_balancer,
                 base=base_for_balancer,
-                ema_beta=0.97,   # was 0.99
-                power=0.5,       # was 0.3
-                min_mult=0.4,
-                max_mult=3.0,
+                ema_beta=0.92,   # was 0.99, 0.97
+                power=0.7,       # was 0.3, 0.5
+                min_mult=0.05,
+                max_mult=10.0,
                 use_log_ema=True,
-                step_cap=1.25     # gentle per-update cap
+                step_cap=2.0     # gentle per-update cap, 1.25
             )
-
+            self.loss_w_eq_interval = 10
         elif self.loss_name == "SalsaNext":
             self.criterion_nll = torch.nn.NLLLoss()#CrossEntropyLoss(ignore_index=self.ignore_index)
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
@@ -740,28 +825,71 @@ class Trainer:
                 if new_w.get("brier", 0.0) > 0: loss = loss + new_w["brier"] * L_terms.get("brier", 0.0)
 
                 # fixed-weight terms
-                if self.base_weights.get("evid_reg", 0.0) > 0.0: 
-                    #self.evid_reg_scheduler.update(epoch)         
-                    #new_w["evid_reg"] = self.evid_reg_scheduler.get_weight()
-                    new_w["evid_reg"] = self.base_weights["evid_reg"]
+                if self.base_weights.get("evid_reg", 0.0) > 0.0 or self.base_weights.get("logit_reg", 0.0) > 0.0:
+                    with torch.no_grad():
+                        s    = float(self.prior_concentration)
+                        band = 0.10                       # tolerance for α0 overshoot (10% is a good starting point)
+                        a0   = alpha.sum(dim=1) + get_eps_value()   # [B,H,W]
+
+                        valid = _valid_mask(labels, self.ignore_index)
+                            
+                if self.base_weights.get("evid_reg", 0.0) > 0.0:
+                    with torch.no_grad():  
+                        # absolute log error from target, per pixel
+                        log_err_target = torch.abs(torch.log(a0 / s))
+                        # band in log space; ~0.095 for band=0.10
+                        band_log = float(torch.log(torch.tensor(1.0 + band)))
+                        log_err_target = log_err_target[valid] if valid.any() else log_err_target.reshape(-1)
+
+                        if log_err_target.numel() == 0:
+                            gate_evid = 0.0
+                        else:
+                            # in [0,1]: near 0 inside band, rises smoothly outside
+                            gate_evid = float((log_err_target / (log_err_target + band_log)).clamp(0, 1).median())
+
+                    w_evid_eff = float(self.base_weights["evid_reg"]) * gate_evid
+                    new_w["evid_reg"] = w_evid_eff
                     loss = loss + new_w["evid_reg"] * L_terms.get("evid_reg", 0.0)
                 if self.base_weights.get("logit_reg", 0.0) > 0.0:
                     with torch.no_grad():
-                        # compute gating based on alpha0 vs prior concentration
-                        s = float(self.prior_concentration)
-                        band = 0.10                         # same convention as your "margin" in EvidenceReg
-                        a0  = alpha.sum(dim=1, keepdim=False) + get_eps_value()
+                        # overshoot ratio per pixel:
+                        # r = 0 when a0 <= s; r > 0 measures how far above target we are (in relative terms)
+                        r = ((a0 / s) - 1.0).clamp_min(0.0)
+                        r = r[valid] if valid.any() else r.reshape(-1)
 
-                        valid = _valid_mask(labels, self.ignore_index)
-                        # smooth gate in [0,1] for "how much we are above the band"
-                        z = ((a0 / s) - 1.0) / band        # 0 at s, ~1 at s*(1+band)
-                        r_pos = torch.clamp(z, min=0.0)
-                        gate_over_raw = (r_pos / (1.0 + r_pos))
-                        gate_over_valid = (gate_over_raw[valid] if valid.any() else gate_over_raw.view(-1))
-                        gate_over = gate_over_valid.quantile(0.5).item() 
-                        gate_over = max(0.0, min(1.0, gate_over))        # safety clamp
-                    # effective weights
-                    w_logit_eff = self.base_weights["logit_reg"] * gate_over            
+                        if r.numel() == 0:
+                            frac = torch.tensor(0.0, device=a0.device)
+                            over_p50 = over_p90 = over_p99 = torch.tensor(0.0, device=a0.device)
+                        else:
+                            # how widespread is the overshoot? (0..1)
+                            frac = (r > 0).float().mean()
+                            
+                            over_p50 = r.quantile(0.50)                       # median overshoot of the tail
+                            over_p90 = r.quantile(0.90)                       # tail overshoot
+                            over_p99 = r.quantile(0.99)                       # extreme overshoot
+                            
+                        # tail magnitude: use a high quantile so single outliers do not jerk the gate
+                            # typical choices: 0.90 (robust), 0.95 (stricter)
+                        # magnitude gate in [0,1]: near 0 if over_p90 << band, -> 1 as over_p90 >> band
+                        gate_mag = over_p90 / (over_p90 + band + 1e-8)
+
+                        # spread amplifier (tunable)
+                            # gamma = 0.0 => spread = 1.0 (no spread effect; recommended default)
+                            # gamma = 1.0 => spread = frac (linear effect)
+                            # gamma < 1.0 => concave boost: amplifies small frac (e.g., sqrt when gamma=0.5)
+                            # gamma > 1.0 => suppresses small frac: needs large coverage to matter
+                        gamma_spread = getattr(self, "logit_spread_gamma", 0.0)  # start at 0.0 (disabled)
+                        spread = (frac.clamp_min(1e-6)) ** gamma_spread
+
+                        # small always-on floor so we keep a tiny guardrail even when below s
+                        gate_floor = 0.10
+
+                        # final gate in [0,1]
+                        gate = float(gate_floor + (1.0 - gate_floor) * (gate_mag * spread))
+                        gate = max(0.0, min(1.0, gate))
+
+                    # effective weights: weight scales with gate; also cap the amplification
+                    w_logit_eff = float(self.base_weights["logit_reg"]) * gate       
                     new_w["logit_reg"] = w_logit_eff
                     loss = loss + new_w["logit_reg"] * L_terms.get("logit_reg", 0.0)
                 # keep a clean, detached copy for viz AFTER losses computed
@@ -774,6 +902,8 @@ class Trainer:
             
             self.optimizer.step()
             self.scheduler.step()
+
+            total_loss += float(loss.item())
 
             self.update_step += 1
             # ----------------- POST-STEP: logging -----------------
@@ -812,11 +942,38 @@ class Trainer:
                 self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
 
                 if eff_g:
+                    eff_sum = sum(eff_g.values()) + 1e-12
                     for name, g in eff_g.items():
                         self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
+                        self.writer.add_scalar(f"weight_share/all/{name}", eff_g[name]/eff_sum, self.global_step)
+                    
+                    active = [k for k in self.activeKeys_weightBalancer if k in raw_g and self.base_weights.get(k,0)>0]
+                    # reconstruct g_ema, eff, shares as in step()
+                    # then log:
+                    eff_sum = sum(eff_g[k] for k in active) + 1e-12
+                    eff_share = {k: eff_g[k]/eff_sum for k in active}
+                    for k,v in eff_share.items():
+                        self.writer.add_scalar(f"weight_share/balancedKeys/{k}", v, self.global_step)
+                    
+                    eff_sum = sum(eff_g.values()) + 1e-12
+                    for name, g in eff_g.items():
+                        self.writer.add_scalar(f"weight_share/all/{name}", eff_g[name]/eff_sum, self.global_step)
+
                 rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
                 self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
+                
+                if self.base_weights.get("logit_reg", 0.0) > 0.0: 
+                    self.writer.add_scalar("logit_gate/frac_overshoot", float(frac.item()), self.global_step)
+                    self.writer.add_scalar("logit_gate/over_p50", float(over_p50.item()), self.global_step)
+                    self.writer.add_scalar("logit_gate/over_p90", float(over_p90.item()), self.global_step)
+                    self.writer.add_scalar("logit_gate/over_p99", float(over_p99.item()), self.global_step)
+                    self.writer.add_scalar("logit_gate/gate_mag", float(gate_mag.item()), self.global_step)
+                    self.writer.add_scalar("logit_gate/gate", float(gate), self.global_step)
 
+                    # Optional histogram to see the distribution of overshoot r
+                    # if r.numel() > 0:
+                    #     self.writer.add_histogram("logit_gate/r_hist", r.detach().cpu(), self.global_step)
+        
                 # alpha0 stats (use cached alpha)
                 with torch.no_grad():
                     a0_hw = self._alpha_cache.sum(dim=1)              # [B,H,W]
