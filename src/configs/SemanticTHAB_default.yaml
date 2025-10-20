@@ -49,10 +49,13 @@ model_weights: {
     w_nll:   1.0,  # Dirichlet-categorical NLL or density based
     w_imax:  0.0,   # 2.0
     w_dce:   0.0,   # 1.0
-    w_kl:    0.01,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_kl:    0.0,  # KL evidence term governs alpha0, keeps near prior_concentration
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  5.0,    # shapes uncertainty on unsure pixels, 5.0
-    target_shares: {"nll": 0.9, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.1}
+    w_comp:  1.0,    # shapes uncertainty on unsure pixels, 5.0
+    w_brier: 0.5,  # 0.05
+    w_evid_reg: 0.75,  # 1.e-1 for log_squared, 1.e-5 for one_sided
+    w_logit_reg: 3.e-4, # 1.e-4, 5.e-5
+    target_shares: {"nll": 0.85, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.05, "brier": 0.10}
   },
   SalsaNext: {
     w_nll:   1.0, 
