@@ -152,13 +152,15 @@ class ECEAggregator:
         if stats.empty or stats["n"].sum() == 0:
             return (float("nan"), float("nan")), stats
 
-        w   = stats["n"].to_numpy().astype(np.float64)
-        w   = w / max(1, w.sum())
-        acc = np.nan_to_num(stats["acc"].to_numpy(), nan=0.0)
-        conf= np.nan_to_num(stats["conf"].to_numpy(), nan=0.0)
-        gap = np.abs(acc - conf)
-        ece = float(np.sum(w * gap))
-        mce = float(np.max(gap))
+        w    = stats["n"].to_numpy().astype(np.float64)
+        acc  = np.nan_to_num(stats["acc"].to_numpy(),  nan=0.0)
+        conf = np.nan_to_num(stats["conf"].to_numpy(), nan=0.0)
+
+        gap   = np.abs(acc - conf)
+        ece   = float(np.sum((w / max(1, w.sum())) * gap))
+
+        nonempty = w > 0
+        mce = float(np.max(gap[nonempty])) if np.any(nonempty) else float("nan")
 
         if save_plot_path is not None:
             fig, ax = plt.subplots(figsize=(6.8, 5.0), dpi=dpi)
