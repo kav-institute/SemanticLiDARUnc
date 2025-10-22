@@ -160,21 +160,28 @@ class BrierDirichlet(nn.Module):
         return (per * w).sum() / w.sum().clamp_min(1.0)
 
 
-# ---------------------------
-# 3) Complement KL to Uniform on off-classes (uncertainty spread).
-#    Scale-invariant in alpha; optional evidence gate uses a0.detach().
-# ---------------------------
+# # ---------------------------
+# # 3) Complement KL to Uniform on off-classes (uncertainty spread).
+# #    Scale-invariant in alpha; optional evidence gate uses a0.detach().
+# # ---------------------------
 
 class ComplementKLUniform(nn.Module):
     """
-    Encourages off-class conditional distribution to approach uniform
-    when the model is uncertain (low p_y).
+    Encourage off-class conditional distribution to be high-entropy when uncertain.
 
     Per-pixel:
-        tilde = p_off / (1 - p_y)
-        KL(tilde || U) in [0, log(C-1)], normalized to [0,1] if normalize=True.
-        Weighted by w_uncert(p_y) and optional w_evid(a0).
-    Optional evidence gate uses a0.detach() so it does not push alpha0.
+      p      = alpha / sum(alpha)                  # predictive mean
+      py     = p_y                                 # prob of GT class
+      tilde  = p_off / (1 - py)                    # conditional over non-GT classes
+      L_comp = KL(tilde || U), U_j = 1/(C-1)       # normalized to [0,1] if normalize=True
+
+    Weighting:
+      w_uncert(py) up-weights ambiguous pixels, but we DETACH py in the gate so
+      the model cannot reduce the loss weight by changing py itself.
+
+    Notes:
+      - s_target is optional; if provided we use ONLY a detached a0 gate.
+      - Scale-invariant in alpha; pairs well with shape+scale parametrization.
     """
     def __init__(self,
                  ignore_index: Optional[int] = 0,
@@ -183,22 +190,20 @@ class ComplementKLUniform(nn.Module):
                  sigma: float = 0.12,
                  s_target: Optional[float] = None,
                  normalize: bool = True,
-                 eps: float = 1e-8):
+                 eps: float = 1e-8,
+                 detach_uncert: bool = True):
         super().__init__()
         self.ignore_index = ignore_index
         self.gamma = float(gamma)
         self.tau = float(tau)
         self.sigma = float(sigma)
-        self.s_target = s_target           # if not None, only used for gating; alpha0 is detached
+        self.s_target = s_target
         self.normalize = bool(normalize)
         self.eps = eps
+        self.detach_uncert = bool(detach_uncert)
 
     def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        alpha : [B,C,H,W], alpha_i > 0
-        target: [B,H,W] or [B,1,H,W]
-        returns scalar mean over valid pixels
-        """
+        # shapes
         if target.dim() == 4 and target.size(1) == 1:
             target = target[:, 0]
         target = target.long()
@@ -211,36 +216,120 @@ class ComplementKLUniform(nn.Module):
         if C <= 2:
             return alpha.sum() * 0.0
 
-        a0 = alpha.sum(dim=1, keepdim=True) + self.eps        # [B,1,H,W]
-        p = alpha / a0                                        # [B,C,H,W]
+        # predictive mean
+        a0 = alpha.sum(dim=1, keepdim=True) + self.eps           # [B,1,H,W]
+        p  = alpha / a0                                          # [B,C,H,W]
 
+        # gather py at GT labels (guard invalid with zeros)
         tgt_safe = torch.where(valid, target, torch.zeros_like(target))
-        py = p.gather(1, tgt_safe.unsqueeze(1)).clamp_min(self.eps)  # [B,1,H,W]
+        py = p.gather(1, tgt_safe.unsqueeze(1)).clamp_min(self.eps)    # [B,1,H,W]
 
-        # mask out GT channel and build conditional off-class probs
-        oh = torch.zeros((B, C, H, W), device=p.device, dtype=torch.bool)
-        oh.scatter_(1, tgt_safe.unsqueeze(1), True)
-        p_off = p.masked_fill(oh, 0.0)
-        S = (1.0 - py).clamp_min(self.eps)
-        tilde = p_off / S
+        # build p_off by zeroing the GT channel
+        p_off = p.clone()
+        p_off.scatter_(1, tgt_safe.unsqueeze(1), 0.0)            # zero GT prob
+        denom = (1.0 - py).clamp_min(self.eps)
+        tilde = p_off / denom                                    # conditional off-class
 
-        # KL(tilde || U), U_j = 1/(C-1)
+        # KL(tilde || U)
         log_tilde = (tilde.clamp_min(self.eps)).log()
         kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)  # [B,H,W]
         if self.normalize:
             kl_u = kl_u / math.log(C - 1)
 
-        # Uncertainty gate
-        w_uncert = ((1.0 - py).pow(self.gamma) *
-                    torch.sigmoid((self.tau - py) / self.sigma)).squeeze(1)  # [B,H,W]
+        # uncertainty gate (DETACHED py to avoid gaming the weight)
+        py_gate = py.detach() if self.detach_uncert else py
+        w_uncert = ((1.0 - py_gate).pow(self.gamma) *
+                    torch.sigmoid((self.tau - py_gate) / self.sigma)).squeeze(1)  # [B,H,W]
 
-        # Optional evidence gate (detach a0 to avoid pushing alpha0)
+        # optional evidence gate on a0, detached to avoid pushing alpha0
         if self.s_target is not None:
             s_val = float(self.s_target)
-            w_evid = s_val / (a0.detach().squeeze(1) + s_val)
+            w_evid = s_val / (a0.detach().squeeze(1) + s_val)   # [B,H,W]
             w = w_uncert * w_evid
         else:
             w = w_uncert
 
         per = w * kl_u
-        return (per * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        wmask = valid.float()
+        return (per * wmask).sum() / wmask.sum().clamp_min(1.0)
+
+
+# class ComplementKLUniform(nn.Module):
+#     """
+#     Encourages off-class conditional distribution to approach uniform
+#     when the model is uncertain (low p_y).
+
+#     Per-pixel:
+#         tilde = p_off / (1 - p_y)
+#         KL(tilde || U) in [0, log(C-1)], normalized to [0,1] if normalize=True.
+#         Weighted by w_uncert(p_y) and optional w_evid(a0).
+#     Optional evidence gate uses a0.detach() so it does not push alpha0.
+#     """
+#     def __init__(self,
+#                  ignore_index: Optional[int] = 0,
+#                  gamma: float = 2.0,
+#                  tau: float = 0.55,
+#                  sigma: float = 0.12,
+#                  s_target: Optional[float] = None,
+#                  normalize: bool = True,
+#                  eps: float = 1e-8):
+#         super().__init__()
+#         self.ignore_index = ignore_index
+#         self.gamma = float(gamma)
+#         self.tau = float(tau)
+#         self.sigma = float(sigma)
+#         self.s_target = s_target           # if not None, only used for gating; alpha0 is detached
+#         self.normalize = bool(normalize)
+#         self.eps = eps
+
+#     def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+#         """
+#         alpha : [B,C,H,W], alpha_i > 0
+#         target: [B,H,W] or [B,1,H,W]
+#         returns scalar mean over valid pixels
+#         """
+#         if target.dim() == 4 and target.size(1) == 1:
+#             target = target[:, 0]
+#         target = target.long()
+
+#         valid = _valid_mask(target, self.ignore_index)
+#         if valid.sum() == 0:
+#             return alpha.sum() * 0.0
+
+#         B, C, H, W = alpha.shape
+#         if C <= 2:
+#             return alpha.sum() * 0.0
+
+#         a0 = alpha.sum(dim=1, keepdim=True) + self.eps        # [B,1,H,W]
+#         p = alpha / a0                                        # [B,C,H,W]
+
+#         tgt_safe = torch.where(valid, target, torch.zeros_like(target))
+#         py = p.gather(1, tgt_safe.unsqueeze(1)).clamp_min(self.eps)  # [B,1,H,W]
+
+#         # mask out GT channel and build conditional off-class probs
+#         oh = torch.zeros((B, C, H, W), device=p.device, dtype=torch.bool)
+#         oh.scatter_(1, tgt_safe.unsqueeze(1), True)
+#         p_off = p.masked_fill(oh, 0.0)
+#         S = (1.0 - py).clamp_min(self.eps)
+#         tilde = p_off / S
+
+#         # KL(tilde || U), U_j = 1/(C-1)
+#         log_tilde = (tilde.clamp_min(self.eps)).log()
+#         kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)  # [B,H,W]
+#         if self.normalize:
+#             kl_u = kl_u / math.log(C - 1)
+
+#         # Uncertainty gate
+#         w_uncert = ((1.0 - py).pow(self.gamma) *
+#                     torch.sigmoid((self.tau - py) / self.sigma)).squeeze(1)  # [B,H,W]
+
+#         # Optional evidence gate (detach a0 to avoid pushing alpha0)
+#         if self.s_target is not None:
+#             s_val = float(self.s_target)
+#             w_evid = s_val / (a0.detach().squeeze(1) + s_val)
+#             w = w_uncert * w_evid
+#         else:
+#             w = w_uncert
+
+#         per = w * kl_u
+#         return (per * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
