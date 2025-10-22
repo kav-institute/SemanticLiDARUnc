@@ -133,6 +133,24 @@ def to_alpha_concentrations(predicted_logits: torch.Tensor, T: float | None = No
         eps = get_eps_value()
     return torch.nn.functional.softplus(predicted_logits / T) + 1.0 + eps
 
+def to_alpha_concentrations_from_shape_and_scale(shape_logits: torch.Tensor, scale_logits: torch.Tensor, T: float | None = None, eps: float | None = None) -> torch.Tensor:
+    """
+    Inputs:
+        shape_logits: [B, C, H, W]  -> softmax -> p (sum_k p_k = 1)
+        scale_logits: [B, 1, H, W]  -> softplus -> s >= 0
+
+    Output:
+      alpha = 1 + s * p  (so alpha0 = K + s exactly)
+    """
+    if T is None:
+        T = get_alpha_temperature()
+    if eps is None:
+        eps = get_eps_value()
+    alpha_scale = torch.nn.functional.softplus(scale_logits / T)    # non-negative scale
+    alpha_shape = torch.nn.functional.softmax(shape_logits, dim=1)  # proportions on simplex
+    alpha = 1.0 + alpha_scale * alpha_shape + eps
+    return alpha
+
 def alphas_to_Dirichlet(alpha: torch.Tensor) -> torch.distributions.Dirichlet:
     return torch.distributions.Dirichlet(alpha.permute(0, 2, 3, 1))
 

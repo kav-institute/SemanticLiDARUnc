@@ -53,6 +53,8 @@ def main(args):
     cfg["extras"]["use_reflectivity"] = True
     cfg["extras"]["num_classes"] = 21 if (cfg['dataset_name']=="SemanticSTF" or cfg['dataset_name']=="SemanticWADS") \
                                     and not cfg.get('remap_adverse_label', 0)  else 20
+    if cfg["model_settings"].get("loss_function", None)=="Dirichlet":
+        cfg["extras"]["num_classes"] +=1   # add one class for Dirichlet "unknown" class
     cfg["extras"]["class_names"] = class_names
     cfg["extras"]["class_colors"] = color_map
     #cfg["extras"]["loss_function"] = "Tversky"    # Tversky | Dirichlet
@@ -91,8 +93,8 @@ def main(args):
         case _: raise KeyError("in yaml config parameter dataset_name is invalid")
     
     # TODO: Debugging only, tiny dset
-    # data_path_train=data_path_train[:10]
-    #data_path_test=data_path_test[:1000]
+    # data_path_train=data_path_train[:30]
+    # data_path_test=data_path_test[:10]
     
     depth_dataset_train = SemanticDataset(
                             data_path=data_path_train, 
@@ -339,7 +341,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg_path', 
                         #action='store_true',
                         type=str, 
-                        default="/home/devuser/workspace/src/configs/SemanticTHAB_default.yaml",
+                        default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
                         help='Path to the config file used for training')
     parser.add_argument('--mode', 
                         #action='store_true',
