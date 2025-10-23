@@ -209,3 +209,82 @@ class EvidenceReg(nn.Module):
         else:  # "l2"
             per = (a0 - s).pow(2)
             return _mean_over_valid(per, mask)
+
+
+import math
+import torch
+import torch.nn as nn
+
+class WrongLowEvidence(nn.Module):
+    """
+    Trim total evidence a0 = C + s *only* on WRONG predictions (argmax != y).
+
+    Per-pixel:
+        wrong = 1[argmax(p) != y]                    (no grad)
+        m = p_pred - p_y                             (confidence margin, no grad)
+        gate_m = 1  (or sigmoid((m - margin)/k))
+        L = wrong * gate_m * relu(log(a0) - log(C + s_low))^2
+
+    Notes:
+      - Works in log-space to be scale-stable.
+      - Affects *only* the scale head: a0 = C + s, and d a0 / d(shape logits) = 0.
+      - Set s_low=0 to pull wrongs toward the uniform-prior evidence (a0 ≈ C).
+    """
+    def __init__(self,
+                 ignore_index=None,
+                 s_low: float = 0.0,
+                 margin: float = 0.05,      # require a bit of confidence gap
+                 soft_margin_k: float = 0.08,  # 0 => hard gate; >0 => smooth
+                 eps: float = 1e-8):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.s_low = float(s_low)
+        self.margin = float(margin)
+        self.k = float(soft_margin_k)
+        self.eps = float(eps)
+
+    def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # normalize target to [B,H,W]
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        target = target.long()
+
+        valid = _valid_mask(target, self.ignore_index)
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
+
+        B, C, H, W = alpha.shape
+        a0 = alpha.sum(dim=1, keepdim=True).clamp_min(self.eps)      # [B,1,H,W]
+        p  = (alpha / a0)                                            # [B,C,H,W]
+
+        # ---- gates computed on detached probs (no grad) ----
+        with torch.no_grad():
+            p_det = p.detach()
+            # hard error mask via argmax
+            pred = p_det.argmax(dim=1)                               # [B,H,W]
+            wrong_mask = (pred != target)                            # bool
+            # confidence margin m = p_pred - p_y
+            py   = p_det.gather(1, target.unsqueeze(1)).clamp_min(self.eps)  # [B,1,H,W]
+            pmax = p_det.max(dim=1, keepdim=True).values.clamp_min(self.eps) # [B,1,H,W]
+            m = (pmax - py).squeeze(1)                                       # [B,H,W] >=0 if wrong
+
+            # margin gate
+            if self.margin > 0.0:
+                if self.k > 0.0:
+                    gate_m = torch.sigmoid((m - self.margin) / self.k)
+                else:
+                    gate_m = (m > self.margin).float()
+            else:
+                gate_m = torch.ones_like(m, dtype=p.dtype)
+
+            gate_wrong = wrong_mask.float() * gate_m * valid.float()         # [B,H,W]
+
+        # ---- squared hinge in log(a0) above log(C + s_low) ----
+        C = alpha.shape[1]  # Number of classes
+        a0_log = a0.log().squeeze(1)                                   # [B,H,W]
+        target_log = math.log(C + self.s_low + self.eps)
+        per = torch.relu(a0_log - target_log).pow(2) * gate_wrong
+
+        denom = gate_wrong.sum().clamp_min(1.0)  # average over active wrong pixels
+        return per.sum() / denom
+
