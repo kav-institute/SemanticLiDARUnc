@@ -444,3 +444,136 @@ class ProportionalGradNorm:
             self.mult[k] /= (avg_mult + 1e-12)
 
         return self.weights()
+    
+    
+class _CapState:
+    # holds persistent per-loss state
+    def __init__(self):
+        self.ema_g_ref = None    # EMA of reference grad-norm
+        self.ema_g_cur = None    # EMA of current loss grad-norm
+        self.w_prev    = None    # last applied weight for this loss
+        self.bind_ctr  = 0       # consecutive steps with applied > cap
+
+_CAP_STATES = {}  # keyed by `name`
+
+def _apply_share_cap_vs_reference(
+    w_scheduled: float,        # schedule weight for this step
+    g_current_raw: float,      # raw grad-norm of this loss
+    g_reference_raw: float,    # raw grad-norm of reference loss
+    w_ref: float,              # current effective weight on reference loss
+    cap_ratio: float,          # max allowed eff_current <= cap_ratio * eff_ref
+    name: str = "loss",
+    *,
+    # ema smoothing for grad norms
+    ema_beta: float = 0.95, # smoothing for grad norms -> higher = smoother
+    grad_floor: float = 1e-9,
+    # per-step multiplicative limits
+    ratio_cap_up: float = 1.12,    # at most +12% per step
+    ratio_cap_dn: float = 0.92,    # at most -8%  per step
+    # adaptive down after sustained binding
+    adaptive_tighten_after: int = 5,
+    adaptive_ratio_cap_dn: float = 0.85,  # at most -15% per step
+    # emergency brake when applied >> limit and persistent
+    emergency_patience: int = 2,    # need >= this many bound steps
+    emergency_violation: float = 1.5,  # applied_eff > 1.5 * limit
+    emergency_factor: float = 0.75, # multiply target by 0.75 (25% cut)
+    # let emergency also loosen the per-step down cap (optional)
+    emergency_loosen_down_cap: bool = True
+) -> float:
+    # -------------------------------------------------------------------------
+    # 0) get per-loss state
+    # -------------------------------------------------------------------------
+    st = _CAP_STATES.setdefault(name, _CapState())
+
+    # -------------------------------------------------------------------------
+    # 1) EMA grad norms
+    # -------------------------------------------------------------------------
+    if st.ema_g_ref is None:
+        st.ema_g_ref = float(g_reference_raw)
+        st.ema_g_cur = float(g_current_raw)
+    else:
+        st.ema_g_ref = float(ema_beta * st.ema_g_ref + (1.0 - ema_beta) * g_reference_raw)
+        st.ema_g_cur = float(ema_beta * st.ema_g_cur + (1.0 - ema_beta) * g_current_raw)
+
+    g_ref = max(st.ema_g_ref, grad_floor)
+    g_cur = max(st.ema_g_cur, grad_floor)
+
+    # -------------------------------------------------------------------------
+    # 2) effective gradients and cap limit
+    # -------------------------------------------------------------------------
+    eff_ref = float(w_ref) * g_ref
+    limit   = cap_ratio * max(eff_ref, grad_floor)
+
+    if st.w_prev is None:
+        st.w_prev = float(w_scheduled)  # initialize on first call
+
+    eff_applied = float(st.w_prev)   * g_cur   # last step actually used
+    eff_sched   = float(w_scheduled) * g_cur   # what schedule wants now
+
+    # -------------------------------------------------------------------------
+    # 3) detect violations
+    # -------------------------------------------------------------------------
+    applied_viol   = (eff_applied > limit)     # only this advances bind_ctr
+    scheduled_viol = (eff_sched   > limit)
+
+    # -------------------------------------------------------------------------
+    # 4) compute raw target weight for this step
+    #     - if schedule exceeds cap: solve w_target so eff_current == limit
+    #     - else: follow schedule
+    # -------------------------------------------------------------------------
+    if scheduled_viol and limit > 0.0:
+        w_target = float(limit / g_cur)
+        w_target = min(w_target, float(w_scheduled))
+    else:
+        w_target = float(w_scheduled)
+
+    # -------------------------------------------------------------------------
+    # 5) emergency: only when applied is big over the limit and persistent
+    #     - shrink target weight multiplicatively
+    #     - optionally loosen down cap so we can realize the cut in one step
+    # -------------------------------------------------------------------------
+    local_ratio_cap_dn = ratio_cap_dn
+    if applied_viol:
+        st.bind_ctr += 1
+        if st.bind_ctr >= emergency_patience and eff_applied > emergency_violation * limit:
+            w_target = max(grad_floor, w_target * emergency_factor)
+            if emergency_loosen_down_cap:
+                # allow the per-step drop to be at least as large as emergency_factor
+                local_ratio_cap_dn = min(local_ratio_cap_dn, float(emergency_factor))
+    else:
+        st.bind_ctr = 0
+
+    # -------------------------------------------------------------------------
+    # 6) adaptive tightening after sustained binding (faster descent)
+    # -------------------------------------------------------------------------
+    if st.bind_ctr >= adaptive_tighten_after:
+        local_ratio_cap_dn = min(local_ratio_cap_dn, adaptive_ratio_cap_dn)
+
+    # -------------------------------------------------------------------------
+    # 7) multiplicative move from previous weight with asymmetric caps
+    # -------------------------------------------------------------------------
+    ratio = float(w_target / max(st.w_prev, grad_floor))
+
+    # NaN/Inf guard
+    if not (0.0 < ratio < float("inf")):
+        ratio = 1.0
+
+    if ratio >= 1.0:
+        ratio = min(ratio, ratio_cap_up)      # slow up moves
+    else:
+        ratio = max(ratio, local_ratio_cap_dn)  # limit down moves
+
+    w_new = float(st.w_prev * ratio)
+
+    # -------------------------------------------------------------------------
+    # 8) final safety bounds
+    # -------------------------------------------------------------------------
+    if w_scheduled > 0.0:
+        w_new = min(w_new, 2.0 * float(w_scheduled))  # never exceed 2x schedule
+    w_new = max(w_new, grad_floor)
+
+    # -------------------------------------------------------------------------
+    # 9) persist and return
+    # -------------------------------------------------------------------------
+    st.w_prev = w_new
+    return w_new
