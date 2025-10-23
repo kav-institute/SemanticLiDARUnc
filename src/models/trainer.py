@@ -44,7 +44,13 @@ from utils.viz_panel import (
 from metrics.ece import ECEAggregator
 
 from losses.dirichlet_losses import _valid_mask
-from utils.grad_norm import grad_norm_wrt, AdaptiveLossBalancer, select_ref_params, discover_shared_params_from_losses
+from utils.grad_norm import (
+    grad_norm_wrt, 
+    AdaptiveLossBalancer, 
+    select_ref_params, 
+    discover_shared_params_from_losses,
+    _apply_share_cap_vs_reference
+)
 
 #from models.losses import brier_dirichlet, evidence_logspring
 # ------------------------------
@@ -95,6 +101,54 @@ def _to_logits(out: torch.Tensor, kind: str) -> torch.Tensor:
     if kind == 'log_probs':
         return out
     raise ValueError(f"Unknown output kind: {kind}")
+
+import math
+
+
+# --- Unified weight ramp schedule (used for both comp and wle) ---
+def _cosine_weight_ramp(step: int, total: int,
+                       w0: float, w_peak: float, w_end: float,
+                       warm_frac: float, hold_frac: float) -> float:
+    """
+    Generic cosine ramp: warmup -> hold -> cosine decay.
+    Used for both comp and wle with different parameter sets.
+    """
+    s = step / max(1, total)
+    if s <= warm_frac:
+        return w0 + (w_peak - w0) * (s / warm_frac)
+    if s <= hold_frac:
+        return w_peak
+    t = (s - hold_frac) / (1.0 - hold_frac)
+    return w_end + 0.5 * (w_peak - w_end) * (1.0 + math.cos(math.pi * min(t, 1.0)))
+
+# --- Unified share cap schedule (used for both comp and wle) ---
+def _cosine_share_cap(step: int, total: int,
+                     cap_start: float, cap_end: float, hold_frac: float) -> float:
+    """
+    Generic cosine cap decay: hold -> cosine decay.
+    Represents % of reference loss's effective gradient.
+    """
+    s = step / max(1, total)
+    if s <= hold_frac:
+        return cap_start
+    t = (s - hold_frac) / (1.0 - hold_frac)
+    return cap_end + 0.5 * (cap_start - cap_end) * (1.0 + math.cos(math.pi * min(t, 1.0)))
+
+# --- update balancer target shares at milestones (works for mode="share" and "hybrid" warmup)
+def _set_target_share_for(bal, new_share: dict[str, float]):
+    # normalize over the balancer's names
+    s = sum(max(0.0, float(new_share.get(k, 0.0))) for k in bal.names) + 1e-12
+    bal.share = {k: float(new_share.get(k, 0.0)) / s for k in bal.names}
+
+# piecewise share schedule for {nll, brier}
+def nb_share_schedule(step: int, total: int) -> dict[str, float]:
+    r = step / max(1, total)
+    if r < 0.15:
+        return {"nll": 0.75, "brier": 0.25}
+    elif r < 0.40:
+        return {"nll": 0.60, "brier": 0.40}
+    else:
+        return {"nll": 0.55, "brier": 0.45}
 
 
 #@torch.no_grad()    # TODO: for debugging only!
@@ -267,8 +321,8 @@ class Trainer:
                 ComplementKLUniform
             )
             self.crit_nll_dircat = NLLDirichletCategorical(ignore_index=self.ignore_index)
-            self.crit_brier = BrierDirichlet(ignore_index=self.ignore_index, s_ref=None)  # set s_ref=None if you want the standard version or self.prior_concentration
-            self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=2.0, tau=0.55, sigma=0.12,
+            self.crit_brier = BrierDirichlet(ignore_index=self.ignore_index, s_ref=float(self.num_classes+20))  # set s_ref=None if you want the standard version or self.prior_concentration
+            self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=1.25, tau=0.65, sigma=0.15,   # gamma=2.0, tau=0.55, sigma=0.12
                                     s_target=None, normalize=True)
 
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
@@ -282,6 +336,7 @@ class Trainer:
                             w_ir=0.3,
                             w_comp=0.2,
                             w_brier=0.05,
+                            w_wle=0.05,          # Add default weight for WLE
                             w_evid_reg=2e-3,
                             w_logit_reg=1e-4)
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
@@ -290,67 +345,67 @@ class Trainer:
             self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
             self.w_comp = w["w_comp"]
             self.w_brier = w["w_brier"]
+            self.w_wle = w["w_wle"]            # Add this line to extract the wle weight
             self.w_evid_reg = w["w_evid_reg"]
             self.w_logit_reg = w["w_logit_reg"]
+
             # define prior/base weights (from cfg)
             self.base_weights = {
                 "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
                 "imax": self.w_imax, "comp": self.w_comp, "brier": self.w_brier,
                 "ir": self.w_ir, "kl": self.w_kl, 
+                "wle": self.w_wle,              # Add this line to include wle in base_weights
                 "evid_reg": self.w_evid_reg, "logit_reg": self.w_logit_reg
             }
             
-            from losses.regularizers import EvidenceReg, LogitRegularizer, EvidenceRegBand
+            from losses.regularizers import EvidenceReg, LogitRegularizer, WrongLowEvidence
             # EvidenceReg: scale controller. penalizes mismatch between a0 and target s, while leaving class proportions alone.
                 # choose mode: "one_sided" (penalize only over-confidence) or "log_squared" (penalize both under- and over-confidence)
             self.evidence_reg = EvidenceReg(s_target=self.prior_concentration, mode="log_squared", ignore_index=self.ignore_index, scale_correct=True, margin=0.1)
             # LogitRegularizer: hard guardrail on the pre-activation z. Stopping runaway growth early and everywhere.
             self.logit_reg = LogitRegularizer(threshold=z_thr, ignore_index=None)   
 
+            self.crit_wle = WrongLowEvidence(
+                ignore_index=self.ignore_index,
+                s_low=0.0,            # pull wrongs toward a0 = C
+                margin=0.05,          # require some confidence gap to trigger
+                soft_margin_k=0.08    # soft transition
+            )
+
 
             # Which losses should be *balanced* by GradNorm (supervised/shape only)
             # Anything *not* in BALANCE_KEYS should be added to the loss with a fixed weight outside GradNorm.
-            BALANCE_KEYS = ("nll", "ls", "comp", "brier")
+            BALANCE_KEYS = ("nll", "ls", "brier")  # removed "comp"
             self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
             
-            # target proportions don't necessarily need to be softmaxed
-            self.targets = {"nll": 0.75, "ls": 0.15, "dce": 0.0, "imax": 0.0, "comp": 0.00, "brier": 0.10}
+            # target proportions for balanced losses only
+            self.targets = {"nll": 0.75, "ls": 0.20, "brier": 0.05}
             try:
-                if self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0) !=0 and \
+                if self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0) != 0 and \
                     isinstance(self.cfg["model_weights"]["Dirichlet"].get("target_shares", 0), dict):
-                        if all([True if (k in self.cfg["model_weights"]["Dirichlet"]["target_shares"]) else False for k in BALANCE_KEYS] ):
-                            self.targets = self.cfg["model_weights"]["Dirichlet"]["target_shares"]
+                        ts = self.cfg["model_weights"]["Dirichlet"]["target_shares"]
+                        # only use keys that are in BALANCE_KEYS
+                        if all(k in ts for k in BALANCE_KEYS):
+                            self.targets = {k: ts[k] for k in BALANCE_KEYS}
                         else:
-                            print(f"ERROR in getting target weight shares. Using default {self.targets}")
-                else:
-                    self.targets = {"nll": 0.8, "ls": 0.2, "dce": 0.0, "imax": 0.0, "comp": 0.0} # "ir": 0.0, "kl": 0.0
+                            print(f"ERROR in target_shares; using default {self.targets}")
             except:
                 print(f"ERROR in getting target weight shares. Using default {self.targets}")
-            
+
             print(f"Using base weights: {self.base_weights},\ntarget weights: {self.targets}")
-            base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
+            #base_for_balancer    = {k: self.base_weights[k] for k in self.activeKeys_weightBalancer}
             targets_for_balancer = {k: self.targets.get(k, 0.0) for k in self.activeKeys_weightBalancer}
 
-            # self.loss_w_eq = ProportionalGradNorm(
-            #     targets=targets_for_balancer,
-            #     base=base_for_balancer,
-            #     ema_beta=0.92,   # was 0.99, 0.97
-            #     power=0.7,       # was 0.3, 0.5
-            #     min_mult=0.05,
-            #     max_mult=10.0,
-            #     use_log_ema=True,
-            #     step_cap=2.0     # gentle per-update cap, 1.25
-            # )
             self.loss_w_eq_interval = 10
             self.loss_w_eq = AdaptiveLossBalancer(
                 names=list(targets_for_balancer.keys()),
-                mode="share",                   # warmup on shares, then GradNorm. options: "gradnorm", "share", "hybrid"
+                mode="gradnorm",   # in "gradnorm" | "share" | "hybrid"
                 target_share=targets_for_balancer,
-                start_step_gradnorm=5000,        # e.g., after warmup
-                alpha=0.5,                       # GradNorm exponent
-                lr_mult=1.0,                     # multiplicative strength
-                ema_beta_g=0.97, ema_beta_L=0.95,   # if testing every step use ema_beta_g=0.95, ema_beta_L=0.90
-                step_cap=1.5, min_w=0.05, max_w=10.0, inactive_frac_of_median=0.05
+                start_step_gradnorm=5000,
+                alpha=0.5,
+                lr_mult=1.0,
+                ema_beta_g=0.97, ema_beta_L=0.95,
+                step_cap=2.0, min_w=0.05, max_w=10.0, inactive_frac_of_median=0.05
             )
         elif self.loss_name == "SalsaNext":
             self.criterion_nll = torch.nn.NLLLoss()#CrossEntropyLoss(ignore_index=self.ignore_index)
@@ -454,7 +509,7 @@ class Trainer:
                     if self.w_nll > 0.0 and loss_ls.requires_grad:
                         raw_g["ls"] = grad_norm_wrt(loss_ls, self.model_ref_params, retain_graph=True)
                     # nll grad_norm
-                    if self.w_nll > 0.0 and loss_ls.requires_grad:
+                    if self.w_nll > 0.0 and loss_nll.requires_grad:
                         raw_g["nll"] = grad_norm_wrt(loss_nll, self.model_ref_params, retain_graph=True)
 
                     # cache latest norms for later logging steps that don't measure
@@ -466,8 +521,6 @@ class Trainer:
                 shape_logits = outputs[:, :self.num_classes, ...]
                 scale_logits = outputs[:, self.num_classes:self.num_classes+1, ...] 
                 alpha = to_alpha_concentrations_from_shape_and_scale(shape_logits, scale_logits)
-                #alpha = to_alpha_concentrations(scale_logits)
-                #self._alpha_logits = outputs.detach()  # optional; used only for the precond metric
 
                 alpha0 = alpha.sum(dim=1, keepdim=True) + get_eps_value()
                 p_hat = alpha / alpha0
@@ -485,7 +538,7 @@ class Trainer:
                     loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
                     L_terms["ls"] = loss_ls
 
-                # Complement KL to uniform on off-classes (if enabled)
+                # Complement KL to uniform on off-classes (FIXED WEIGHT with scheduling)
                 if self.base_weights.get("comp", 0.0) > 0.0:
                     loss_comp = self.crit_comp(alpha, labels)
                     L_terms["comp"] = loss_comp
@@ -495,148 +548,195 @@ class Trainer:
                     loss_brier = self.crit_brier(alpha, labels)
                     L_terms["brier"] = loss_brier
 
+                # Incorrect low-evidence penalty
+                if self.base_weights.get("wle", 0.0) > 0.0:
+                    L_terms["wle"] = self.crit_wle(alpha, labels)
+
                 # Add regularization terms
                 if self.base_weights.get("evid_reg", 0.0) > 0.0:
-                    loss_evid_reg = self.evidence_reg(alpha)
+                    loss_evid_reg = self.evidence_reg(alpha, target=labels)
                     L_terms["evid_reg"] = loss_evid_reg
                     
                 if self.base_weights.get("logit_reg", 0.0) > 0.0:
-                    loss_logit_reg = self.logit_reg(outputs)
+                    loss_logit_reg = self.logit_reg(outputs, target=labels)
                     L_terms["logit_reg"] = loss_logit_reg
 
-                # Discover shared params for all losses, overwrite previous if any
+                assert all(k in L_terms for k in self.base_weights if self.base_weights[k] > 0.0), f"Missing loss terms for base weights"
+                
+                # Discover shared params for all losses (once)
                 if getattr(self, "model_ref_params", None) is None:
                     if len(self.activeKeys_weightBalancer) >= 2:
                         self.model_ref_params = discover_shared_params_from_losses(L_terms, self.model, min_losses=2)
-                        #self.model_ref_params = select_ref_params(self.model, strategy="all", exclude_bias_norm=True)
+                    else:
+                        self.model_ref_params = discover_shared_params_from_losses(L_terms, self.model, min_losses=1)
 
-                # ----------------- PRE-BACKWARD: compute grad norms -----------------
-                # keys the balancer should control this step (intersection of: active list, base>0, and present in L_terms)
-                keys = [k for k in self.activeKeys_weightBalancer
-                        if self.base_weights.get(k, 0.0) > 0.0 and (k in L_terms)]
+                # ----------------- PRE-BACKWARD: compute grad norms ONCE -----------------
+                # Keys the balancer controls
+                balanced_keys = [k for k in self.activeKeys_weightBalancer
+                                 if self.base_weights.get(k, 0.0) > 0.0 and (k in L_terms)]
 
-                # --- get/update weights ---
-                if do_eq and keys:
-                    # Update balancer state and get fresh weights (balancer computes grads internally)
-                    # Pass only the relevant losses to avoid touching unrelated ones
-                    new_w = self.loss_w_eq.step({k: L_terms[k] for k in keys}, self.model_ref_params, global_step=self.global_step)
-                else:
-                    # Don't update; just use current normalized weights (avg=1) for the selected keys
-                    new_w = self.loss_w_eq.get_weights(keys, global_step=self.global_step)
+                # Optional: dynamically adjust target shares for balanced_keys during training
+                if do_eq and balanced_keys and self.loss_w_eq.mode in ("share", "hybrid"):
+                    new_share = nb_share_schedule(self.global_step, self.total_train_steps)
+                    # Only update if the schedule changed
+                    if new_share != getattr(self, "_last_share_sched", None):
+                        _set_target_share_for(self.loss_w_eq, new_share)
+                        self._last_share_sched = new_share
 
-                # Fallback to base weight if a key somehow lacks a balancer weight (defensive)
-                for k in keys:
-                    if k not in new_w:
-                        new_w[k] = float(self.base_weights.get(k, 0.0))
-
-                # --- logging raw / effective gradient norms ---
-                if need_raw and keys:
-                    # Prefer what the balancer already measured this step
-                    raw_g = getattr(self.loss_w_eq, "last_g_raw", None)
-                    eff_g = getattr(self.loss_w_eq, "last_eff_g", None)
-
-                    # If weights were NOT updated this step (do_eq=False), the balancer didn't measure grads.
-                    # Compute once for logging only (retain_graph=True keeps backprop possible later).
-                    if (raw_g is None or not raw_g) or (eff_g is None or not eff_g):
-                        raw_g = {k: grad_norm_wrt(L_terms[k], self.model_ref_params, retain_graph=True) for k in keys}
-                        eff_g = {k: float(new_w[k]) * float(raw_g[k]) for k in raw_g}
-
+                # --- Update balancer and retrieve measured grads ---
+                if do_eq and balanced_keys:
+                    # Balancer measures grads internally
+                    new_w = self.loss_w_eq.step(
+                        {k: L_terms[k] for k in balanced_keys}, 
+                        self.model_ref_params, 
+                        global_step=self.global_step
+                    )
+                    
+                    # REUSE the grads the balancer just computed
+                    raw_g = dict(getattr(self.loss_w_eq, "last_g_raw", {}))
+                    
+                    # Compute grads for NON-balanced terms (comp, regularizers) ONCE per update
+                    for name in L_terms:
+                        if name not in raw_g:   # raw_g already has balanced keys
+                            g = grad_norm_wrt(L_terms[name], self.model_ref_params, retain_graph=True)
+                            raw_g[name] = g
+                    
+                    # Cache ALL grads for non-update steps
                     self._last_raw_g = raw_g
-                    self._last_eff_g = eff_g
+                    self._last_new_w = new_w
+                    
+                    self._last_eff_g = dict()   # effective grads are built later
+
+
+                    assert all(k in self._last_new_w for k in balanced_keys), "Balancer failed to return new weights for all balanced keys."
+                    assert all(k in self._last_raw_g for k in L_terms), "Failed to compute raw grads for all loss terms."
                 else:
-                    raw_g = getattr(self, "_last_raw_g", {})
-                    eff_g = getattr(self, "_last_eff_g", {})
+                    # Not an update step: reuse cached 
+                        # weights self._last_new_w
+                        # grads self._last_raw_g    
+                    pass
+                
+                # --- Get NLL's effective gradient as reference ---
+                g_ref_raw = 0.0
+                if "nll" in balanced_keys:  # with asserts above raw_g and new_w must exist
+                    g_ref_raw = float(self._last_raw_g["nll"])
+                    w_ref_eff = float(self._last_new_w["nll"])
+                    self._last_eff_g["nll"] = g_ref_raw * w_ref_eff # cache
 
-                # --- build total loss (balanced terms only) ---
+                # --- Schedule comp weight with cap relative to NLL ---
+                if "comp" in L_terms:
+                    base_w_comp = float(self.base_weights["comp"])
+                    
+                    # Get scheduled weight using unified helper
+                    w_comp_scheduled = _cosine_weight_ramp(
+                        self.global_step, 
+                        self.total_train_steps,
+                        w0=0.001 * base_w_comp,
+                        w_peak=base_w_comp * 0.5,
+                        w_end=base_w_comp * 0.2,
+                        warm_frac=0.12,
+                        hold_frac=0.35
+                    )
+                    
+                    # Apply cap relative to NLL using unified helper
+                    if g_ref_raw > 0.0:
+                        comp_cap_ratio = _cosine_share_cap(
+                            self.global_step,
+                            self.total_train_steps,
+                            cap_start=0.05,
+                            cap_end=0.03,
+                            hold_frac=0.3
+                        )
+
+                        w_comp_final = _apply_share_cap_vs_reference(
+                            w_scheduled=w_comp_scheduled,
+                            g_current_raw=float(self._last_raw_g["comp"]),
+                            g_reference_raw=g_ref_raw,
+                            w_ref=w_ref_eff,  # Use effective balanced weight of reference
+                            cap_ratio=comp_cap_ratio,
+                            name="comp"
+                        )
+                        #w_prev = float(self._last_new_w["comp"])    # get last eff weight
+                        # w_comp_final = _apply_share_cap_vs_reference(
+                        #     w_comp_scheduled,
+                        #     float(self._last_raw_g["comp"]),
+                        #     g_nll_ref,
+                        #     comp_cap_ratio,
+                        #     w_prev,
+                        #     name="comp"
+                        # )
+                    else:
+                        w_comp_final = w_comp_scheduled
+                    
+                    self._last_new_w["comp"] = w_comp_final
+                
+                # --- Schedule wle weight with cap relative to NLL ---
+                if "wle" in L_terms:
+                    base_w_wle = float(self.base_weights["wle"])
+                    
+                    # Get scheduled weight using unified helper
+                    w_wle_scheduled = _cosine_weight_ramp(
+                        self.global_step,
+                        self.total_train_steps,
+                        w0=0.5*base_w_wle,   # 0.5 * base_w_wle
+                        w_peak=base_w_wle,
+                        w_end=base_w_wle * 0.25,
+                        warm_frac=0.1,
+                        hold_frac=0.3
+                    )
+                    
+                    if g_ref_raw > 0.0:
+                        wle_cap_ratio = _cosine_share_cap(
+                            self.global_step,
+                            self.total_train_steps,
+                            cap_start=0.2,
+                            cap_end=0.15,
+                            hold_frac=0.3
+                        )
+
+                        w_wle_final = _apply_share_cap_vs_reference(
+                            w_scheduled=w_wle_scheduled,
+                            g_current_raw=float(self._last_raw_g["wle"]),
+                            g_reference_raw=g_ref_raw,
+                            w_ref=w_ref_eff,  # Use NLL's effective balanced weight
+                            cap_ratio=wle_cap_ratio,
+                            name="wle"
+                        )
+                        # w_prev = float(self._last_new_w["wle"]) # get last eff weight
+                        # w_wle_final = _apply_share_cap_vs_reference(
+                        #     w_wle_scheduled,
+                        #     float(raw_g["wle"]),
+                        #     g_eff_ref,
+                        #     wle_cap_ratio,
+                        #     w_prev,
+                        #     name="wle"
+                        # )
+                    else:
+                        w_wle_final = w_wle_scheduled
+                    
+                    self._last_new_w["wle"] = w_wle_final
+
+                # --- Build last effective gradients for all terms ---
+                for k in L_terms:
+                    if k not in self._last_new_w:
+                        self._last_new_w[k] = float(self.base_weights.get(k, 0.0))
+                    
+                    if k not in self._last_eff_g:
+                        self._last_eff_g[k] = float(self._last_new_w[k]) * float(self._last_raw_g.get(k, 0.0))
+
+                assert len(L_terms) == len(self._last_new_w) == len(self._last_raw_g) == len(self._last_eff_g), "Mismatch in tracked loss term counts."
+
+                # --- Build total loss ---
                 loss = 0.0
-                for k in keys:
-                    wk = float(new_w.get(k, 0.0))
+                
+                # Add balanced terms to loss
+                L_terms_eff = dict()
+                for k in L_terms:
+                    wk = float(self._last_new_w.get(k, 0.0))
                     if wk > 0.0:
-                        loss = loss + wk * L_terms.get(k, 0.0)
-
-                # (optional) if you also have fixed-weight terms not managed by the balancer:
-                # for name, base_w in self.base_weights.items():
-                #     if name not in keys and base_w > 0.0:
-                #         loss = loss + float(base_w) * L_terms.get(name, 0.0)
-
-                # fixed-weight terms
-                if self.base_weights.get("evid_reg", 0.0) > 0.0 or self.base_weights.get("logit_reg", 0.0) > 0.0:
-                    with torch.no_grad():
-                        s    = float(self.prior_concentration)
-                        band = 0.05                       # tolerance for a0 overshoot (5% is a good starting point)
-                        a0   = alpha.sum(dim=1) + get_eps_value()   # [B,H,W]
-
-                        valid = _valid_mask(labels, self.ignore_index)
-                            
-                if self.base_weights.get("evid_reg", 0.0) > 0.0:
-                    with torch.no_grad():  
-                        # absolute log error from target, per pixel
-                        log_err_target = torch.abs(torch.log(a0 / s))
-                        # band in log space; ~0.095 for band=0.10
-                        band_log = float(torch.log(torch.tensor(1.0 + band)))
-                        log_err_target = log_err_target[valid] if valid.any() else log_err_target.reshape(-1)
-
-                        if log_err_target.numel() == 0:
-                            gate_evid = 0.0
-                        else:
-                            # in [0,1]: near 0 inside band, rises smoothly outside
-                            gate_evid = float((log_err_target / (log_err_target + band_log)).clamp(0, 1).median())
-
-                    w_evid_eff = float(self.base_weights["evid_reg"]) * gate_evid
-                    new_w["evid_reg"] = w_evid_eff
-                    loss = loss + new_w["evid_reg"] * L_terms.get("evid_reg", 0.0)
-                if self.base_weights.get("logit_reg", 0.0) > 0.0:
-                    with torch.no_grad():
-                        # overshoot ratio per pixel:
-                        # r = 0 when a0 <= s; r > 0 measures how far above target we are (in relative terms)
-                        r = ((a0 / s) - 1.0).clamp_min(0.0)
-                        r = r[valid] if valid.any() else r.reshape(-1)
-
-                        if r.numel() == 0:
-                            frac = torch.tensor(0.0, device=a0.device)
-                            over_p50 = over_p90 = over_p99 = torch.tensor(0.0, device=a0.device)
-                        else:
-                            # how widespread is the overshoot? (0..1)
-                            frac = (r > 0).float().mean()
-                            
-                            over_p50 = r.quantile(0.50)                       # median overshoot of the tail
-                            over_p90 = r.quantile(0.90)                       # tail overshoot
-                            over_p99 = r.quantile(0.99)                       # extreme overshoot
-                            
-                        # tail magnitude: use a high quantile so single outliers do not jerk the gate
-                            # typical choices: 0.90 (robust), 0.95 (stricter)
-                        # magnitude gate in [0,1]: near 0 if over_p90 << band, -> 1 as over_p90 >> band
-                        gate_mag = over_p90 / (over_p90 + band + 1e-8)
-
-                        # spread amplifier (tunable)
-                            # gamma = 0.0 => spread = 1.0 (no spread effect; recommended default)
-                            # gamma = 1.0 => spread = frac (linear effect)
-                            # gamma < 1.0 => concave boost: amplifies small frac (e.g., sqrt when gamma=0.5)
-                            # gamma > 1.0 => suppresses small frac: needs large coverage to matter
-                        gamma_spread = getattr(self, "logit_spread_gamma", 0.0)  # start at 0.0 (disabled)
-                        spread = (frac.clamp_min(1e-6)) ** gamma_spread
-
-                        # small always-on floor so we keep a tiny guardrail even when below s
-                        gate_floor = 0.05
-
-                        # final gate in [0,1]
-                        gate_raw = float(gate_floor + (1.0 - gate_floor) * (gate_mag * spread))
-                        gate_raw = max(0.0, min(1.0, gate_raw))
-                        
-                        # smooth with EMA to avoid sudden jumps
-                        beta = getattr(self, "logit_gate_beta", 0.90)
-                        if not hasattr(self, "_gate_logit_ema"):
-                            # on the first step, start EMA at the observed value
-                            self._gate_logit_ema = float(gate_raw)
-
-                        gate = beta * float(self._gate_logit_ema) + (1.0 - beta) * float(gate_raw)
-                        gate = max(0.0, min(1.0, gate))
-                        self._gate_logit_ema = gate  # persist state
-
-                    # effective weights: weight scales with gate; also cap the amplification
-                    w_logit_eff = float(self.base_weights["logit_reg"]) * gate       
-                    new_w["logit_reg"] = w_logit_eff
-                    loss = loss + new_w["logit_reg"] * L_terms.get("logit_reg", 0.0)
+                        L_terms_eff[k] = wk * L_terms.get(k, 0.0)
+                        loss = loss + L_terms_eff[k]
+                                
                 # keep a clean, detached copy for viz AFTER losses computed
                 self._alpha_cache = alpha.detach()
 
@@ -668,86 +768,148 @@ class Trainer:
             if do_log:
                 self.writer.add_scalar("loss/iter", loss.item(), self.global_step)
                 self.writer.add_scalar("LR/iter", self.optimizer.param_groups[0]['lr'], self.global_step)
-                if self.loss_name == "Dirichlet":
-                    # weighted loss terms that exist (log with CURRENT weights)
-                    for name, val in L_terms.items():
-                        w_cur = new_w.get(name, 0.0)
-                        if w_cur != 0.0:
-                            self.writer.add_scalar(f"loss/{name}", _to_float(val) * w_cur, self.global_step)
-
-                # Lovasz
-                w_ls_eff = new_w.get("ls", self.base_weights.get("ls", 0.0))
-                if w_ls_eff != 0.0:
-                    self.writer.add_scalar("loss/ls", _to_float(loss_ls) * float(w_ls_eff), self.global_step)
-
-                # grad norms raw / eff
-                if raw_g:
-                    for name, g in raw_g.items():
-                        self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
-                rss_raw = (sum(float(g)**2 for g in raw_g.values())) ** 0.5
-                self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw, self.global_step)
-
-                if eff_g:
-                    eff_sum = sum(eff_g.values()) + 1e-12
-                    for name, g in eff_g.items():
-                        self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
-                        self.writer.add_scalar(f"weight_share/all/{name}", eff_g[name]/eff_sum, self.global_step)
-                    
-                    active = [k for k in self.activeKeys_weightBalancer if k in raw_g and self.base_weights.get(k,0)>0]
-                    # reconstruct g_ema, eff, shares as in step()
-                    # then log:
-                    eff_sum = sum(eff_g[k] for k in active) + 1e-12
-                    eff_share = {k: eff_g[k]/eff_sum for k in active}
-                    for k,v in eff_share.items():
-                        self.writer.add_scalar(f"weight_share/balancedKeys/{k}", v, self.global_step)
-                    
-                    eff_sum = sum(eff_g.values()) + 1e-12
-                    for name, g in eff_g.items():
-                        self.writer.add_scalar(f"weight_share/all/{name}", eff_g[name]/eff_sum, self.global_step)
-
-                rss_eff = (sum(float(g)**2 for g in eff_g.values())) ** 0.5
-                self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
                 
-                if self.base_weights.get("logit_reg", 0.0) > 0.0: 
-                    self.writer.add_scalar("logit_gate/frac_overshoot", float(frac.item()), self.global_step)
-                    self.writer.add_scalar("logit_gate/over_p50", float(over_p50.item()), self.global_step)
-                    self.writer.add_scalar("logit_gate/over_p90", float(over_p90.item()), self.global_step)
-                    self.writer.add_scalar("logit_gate/over_p99", float(over_p99.item()), self.global_step)
-                    self.writer.add_scalar("logit_gate/gate_mag", float(gate_mag.item()), self.global_step)
-                    self.writer.add_scalar("logit_gate/gate", float(gate), self.global_step)
-                    # fraction of logits over threshold (if threshold exists)
-                    if getattr(self.logit_reg, "threshold", None) is not None:
-                        thr = float(self.logit_reg.threshold)
-                        frac_z_over = (outputs.detach() > thr).float().mean().item()
-                        self.writer.add_scalar("logit_gate/frac_logits_over_thr", float(frac_z_over), self.global_step)
+                if self.loss_name == "Dirichlet":
+                    # Log weighted loss terms
+                    for name, val in L_terms_eff.items():
+                        self.writer.add_scalar(f"loss/{name}", _to_float(val), self.global_step)
 
-                    # Optional histogram to see the distribution of overshoot r
-                    # if r.numel() > 0:
-                    #     self.writer.add_histogram("logit_gate/r_hist", r.detach().cpu(), self.global_step)
-        
-                # alpha0 stats (use cached alpha)
-                with torch.no_grad():
-                    a0_hw = self._alpha_cache.sum(dim=1)              # [B,H,W]
-                    med_alpha0 = a0_hw.median().item()
-                    med_alpha0_per_cls = (a0_hw / float(alpha.shape[1])).median().item()
-                self.writer.add_scalar("alpha0/median", med_alpha0, self.global_step)
-                self.writer.add_scalar("alpha0/median_per_class", med_alpha0_per_cls, self.global_step)
+                    # Log scheduled weights
+                    for name, w in self._last_new_w.items():
+                        self.writer.add_scalar(f"scheduled_weights/{name}", float(w), self.global_step)
 
-                # comp gate diagnostics (if comp enabled)
-                if self.base_weights.get("comp", 0.0) != 0.0:
+                    # Log raw gradient norms for ALL losses
+                    rss_raw = 0.0
+                    for name, g in self._last_raw_g.items():
+                        self.writer.add_scalar(f"grad_norm/params/raw/{name}", float(g), self.global_step)
+                        rss_raw += float(g)**2
+                    
+                    #rss_raw = (sum(float(g)**2 for g in self._last_raw_g.values())) ** 0.5
+                    self.writer.add_scalar("grad_norm/params/rss_raw", rss_raw**0.5, self.global_step)
+
+                    # Log effective gradient norms for ALL losses and their relative shares
+                    eff_sum_all = sum(self._last_eff_g.values()) + 1e-12
+                    for name, g in self._last_eff_g.items():
+                        self.writer.add_scalar(f"grad_norm/params/eff/{name}", float(g), self.global_step)
+                        self.writer.add_scalar(f"eff_grad_shares/all/{name}", float(g)/eff_sum_all, self.global_step)
+
+                    # Separate view: shares among balanced keys only
+                    if balanced_keys:
+                        balanced_eff_sum = sum(float(self._last_eff_g[k]) for k in balanced_keys if k in self._last_eff_g) + 1e-12
+                        for k in balanced_keys:
+                            self.writer.add_scalar(
+                                f"eff_grad_shares/balancedKeys/{k}", 
+                                float(self._last_eff_g[k])/balanced_eff_sum, 
+                                self.global_step
+                            )
+
+                    rss_eff = (sum(float(g)**2 for g in self._last_eff_g.values())) ** 0.5
+                    self.writer.add_scalar("grad_norm/params/rss_eff", rss_eff, self.global_step)
+
+                    # ---------------- alpha0 + concentration split stats ----------------
                     with torch.no_grad():
-                        py = (alpha/(alpha.sum(1, keepdim=True)+1e-8)).gather(1, labels.unsqueeze(1)).squeeze(1)
-                        mean_gate = ((1 - py).pow(self.crit_comp.gamma) *
-                                     torch.sigmoid((self.crit_comp.tau - py)/self.crit_comp.sigma)).mean().item()
-                        frac_below_tau = (py < self.crit_comp.tau).float().mean().item()
-                        self.writer.add_scalar("comp/mean_gate", mean_gate, self.global_step)
-                        self.writer.add_scalar("comp/frac_below_tau", frac_below_tau, self.global_step)
+                        eps = 1e-12
+                        alpha_cached = self._alpha_cache                     # [B,C,H,W]
+                        B, C, H, W = alpha_cached.shape
 
-                # H_norm coverage
-                self.writer.add_scalar("H_norm/pct_lt_0.1",  (H_norm < 0.10).float().mean().item(), self.global_step)
-                self.writer.add_scalar("H_norm/pct_lt_0.25", (H_norm < 0.25).float().mean().item(), self.global_step)
-                self.writer.add_scalar("H_norm/pct_gt_0.5",  (H_norm > 0.50).float().mean().item(), self.global_step)
-                self.writer.add_scalar("H_norm/pct_gt_0.75", (H_norm > 0.75).float().mean().item(), self.global_step)
+                        a0_hw = alpha_cached.sum(dim=1)                      # [B,H,W]  (alpha0 per pixel)
+                        s_hw  = a0_hw - float(C)                             # evidence scale s when alpha = 1 + s p
+
+                        # --- percentiles helper (torch >= 1.7 has torch.quantile) ---
+                        def _quantiles(x_flat: torch.Tensor, qs):
+                            x_flat = x_flat.to(dtype=torch.float32)
+                            q = torch.tensor(qs, device=x_flat.device, dtype=torch.float32)
+                            try:
+                                return torch.quantile(x_flat, q, interpolation="linear")
+                            except TypeError:  # older PyTorch uses 'method'
+                                return torch.quantile(x_flat, q, method="linear")
+
+                        # flatten over spatial & batch
+                        a0_vec = a0_hw.reshape(-1)
+
+                        # Outer percentiles you asked for
+                        qs = [0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99]
+                        a0_q = _quantiles(a0_vec, qs)
+
+                        qnames = ["p01","p05","p25","p50","p75","p95","p99"]
+                        for name, val in zip(qnames, a0_q.tolist()):
+                            self.writer.add_scalar(f"alpha0/percentile_{name}", val, self.global_step)
+
+                        # --- how much proportion of alpha0 sits on the most likely class ---
+                        # top-1 alpha share = alpha_max / alpha0  (equals p_hat_max)
+                        alpha_max_hw, _ = alpha_cached.max(dim=1)            # [B,H,W]
+                        top1_share_hw = alpha_max_hw / (a0_hw + eps)         # in [0,1]
+
+                        share_vec = top1_share_hw.reshape(-1)
+                        share_q   = _quantiles(share_vec, qs)
+                        for name, val in zip(qnames, share_q.tolist()):
+                            self.writer.add_scalar(f"alpha0/top1_share_percentile_{name}", val, self.global_step)
+
+                        # helpful summary scalars
+                        self.writer.add_scalar("alpha0/mean",  float(a0_vec.mean().item()),  self.global_step)
+                        self.writer.add_scalar("alpha0/median",float(a0_q[3].item()),         self.global_step)  # p50
+                        self.writer.add_scalar("alpha0/median_per_class", float((a0_vec/float(C)).median().item()), self.global_step)
+
+                        self.writer.add_scalar("alpha0/top1_share_mean",   float(share_vec.mean().item()), self.global_step)
+                        self.writer.add_scalar("alpha0/top1_share_p95",    float(share_q[5].item()),       self.global_step)
+                        self.writer.add_scalar("alpha0/top1_share_p99",    float(share_q[6].item()),       self.global_step)
+
+                        # thresholds: how concentrated is top-1?
+                        for th in (0.5, 0.7, 0.9, 0.95, 0.99):
+                            frac = float((share_vec >= th).float().mean().item())
+                            self.writer.add_scalar(f"alpha0/top1_share_frac_ge_{th:.2f}", frac, self.global_step)
+                    # ---------------- end of alpha0 stats ----------------
+                    
+                    # Log wle-specific scheduling info
+                    if "wle" in L_terms:
+                        # Add WLE activation rate logging
+                        with torch.no_grad():
+                            # Calculate the wrong prediction mask
+                            wrong_mask = (preds != labels) & (labels != self.ignore_index)
+                            
+                            # Calculate the activation based on margin
+                            alpha0 = self._alpha_cache.sum(dim=1, keepdim=True)
+                            C = alpha.shape[1]  # Number of classes
+                            target_log = math.log(C + self.crit_wle.s_low + 1e-8)
+                            a0_log = alpha0.log().squeeze(1)
+                            
+                            # Calculate delta between log(alpha0) and target log value
+                            delta = (a0_log - target_log).detach()
+                            
+                            # Get actual margin after adjustment for confidently wrong predictions
+                            pred_class = preds.unsqueeze(1)
+                            correct_class = labels.unsqueeze(1)
+                            pred_alpha = alpha.gather(1, pred_class).squeeze(1)
+                            correct_alpha = alpha.gather(1, correct_class).squeeze(1)
+                            margin_factor = ((pred_alpha / (correct_alpha + 1e-8)) - 1.0).clamp_min(0.0)
+                            effective_margin = self.crit_wle.margin * (1.0 + self.crit_wle.k * margin_factor)
+                            
+                            # Calculate activation rate - what percentage of wrong predictions activated the loss
+                            active_wrong = (delta > effective_margin) & wrong_mask
+                            
+                            # Log activation stats
+                            if wrong_mask.any():
+                                activation_rate = active_wrong.float().sum() / wrong_mask.float().sum()
+                                self.writer.add_scalar("wle/activation_rate", activation_rate.item(), self.global_step)
+                                self.writer.add_scalar("wle/wrong_pixel_rate", wrong_mask.float().mean().item(), self.global_step)
+                    
+                    # comp gate diagnostics (if comp enabled)
+                    if "comp" in L_terms:
+                        with torch.no_grad():
+                            py = (self._alpha_cache/(self._alpha_cache.sum(1, keepdim=True)+1e-8)).gather(1, labels.unsqueeze(1)).squeeze(1)
+                            mean_gate = ((1 - py).pow(self.crit_comp.gamma) *
+                                        torch.sigmoid((self.crit_comp.tau - py)/self.crit_comp.sigma)).mean().item()
+                            frac_below_tau = (py < self.crit_comp.tau).float().mean().item()
+                            self.writer.add_scalar("comp/mean_gate", mean_gate, self.global_step)
+                            self.writer.add_scalar("comp/frac_below_tau", frac_below_tau, self.global_step)
+
+                    # H_norm coverage
+                    self.writer.add_scalar("H_norm/pct_lt_0.1",  (H_norm < 0.10).float().mean().item(), self.global_step)
+                    self.writer.add_scalar("H_norm/pct_lt_0.25", (H_norm < 0.25).float().mean().item(), self.global_step)
+                    self.writer.add_scalar("H_norm/pct_gt_0.5",  (H_norm > 0.50).float().mean().item(), self.global_step)
+                    self.writer.add_scalar("H_norm/pct_gt_0.75", (H_norm > 0.75).float().mean().item(), self.global_step)
+                # End of Dirichlet logging
+            # End of logging
             
             # Interactive visualization (cheap, reusing computed items)
             if self.visualize:
@@ -1001,7 +1163,7 @@ class Trainer:
         self.total_train_steps = len(train_loader) * self.num_epochs
         if getattr(self, "loss_w_eq", None):
             if hasattr(self.loss_w_eq, "switch_step"):
-                self.loss_w_eq.switch_step = self.total_train_steps // 10  # first 10% steps warmup
+                self.loss_w_eq.switch_step = self.total_train_steps // 25  # first 25% steps warmup
 
         best_mIoU = -1.0
         for epoch in range(self.num_epochs):
