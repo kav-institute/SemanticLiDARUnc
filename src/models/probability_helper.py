@@ -36,14 +36,6 @@ def set_alpha_temperature(T: float):
 def get_alpha_temperature() -> float:
     return _T
 
-# def set_alpha_activation(alpha_act: str) -> None:
-#     """Set default activation used to map logits -> alpha."""
-#     global _ALPHA_ACT
-#     _ALPHA_ACT = str(alpha_act).lower()
-# def get_alpha_activation() -> str:
-#     """Get default activation used to map logits -> alpha."""
-#     return _ALPHA_ACT
-
 # --------- pyplot loader (safe, no GUI) ---------
 
 def _get_pyplot(backend: str = "Agg"):
@@ -86,45 +78,6 @@ def smooth_one_hot(targets: torch.Tensor, num_classes: int, smoothing: float = 0
     return one_hot
 
 # ---------------- Logits -> Dirichlet ----------------
-# def to_alpha_concentrations(
-#     predicted_logits: torch.Tensor,
-#     T: float | None = None,
-#     eps: float | None = None,
-#     alpha_act: str | None = None,
-# ) -> torch.Tensor:
-#     # -------------------------------------------------------------
-#     # predicted_logits : [B,C,H,W]
-#     # T                : temperature (smaller -> sharper, larger -> flatter)
-#     # eps              : tiny positive to avoid exact 1.0 and log(0)
-#     # alpha_act        : 'softplus' or 'exp' (default comes from get_alpha_activation())
-#     #
-#     # Map logits -> Dirichlet concentrations alpha_j >= 1.
-#     #   - 'exp':   alpha / alpha0 ≈ softmax(z/T) with a uniform +1 pseudo-count
-#     #   - 'softplus': smoother growth of evidence (alpha_j ~ log(1+e^{z/T}) + 1)
-#     # For 'exp', subtract per-pixel max for numerical stability before exp.
-#     # -------------------------------------------------------------
-#     if alpha_act is None:
-#         alpha_act = get_alpha_activation()
-#     alpha_act = str(alpha_act).lower()
-
-#     if T is None:
-#         T = get_alpha_temperature()
-#     if eps is None:
-#         eps = get_eps_value()
-#     assert T > 0.0, "Temperature T must be > 0."
-
-#     z = predicted_logits / T
-
-#     if alpha_act == "exp":
-#         z = z - z.amax(dim=1, keepdim=True)         # stability for exp
-#         alpha = torch.exp(z) + 1.0 + eps            # alpha_j >= 1
-#     elif alpha_act == "softplus":
-#         alpha = torch.nn.functional.softplus(z) + 1.0 + eps
-#     else:
-#         raise ValueError(f"Unknown alpha_act={alpha_act!r}; use 'softplus' or 'exp'.")
-
-#     return alpha
-
 def to_alpha_concentrations(predicted_logits: torch.Tensor, T: float | None = None, eps: float | None = None) -> torch.Tensor:
     """Convert logits [B,C,H,W] -> alpha > 0 via softplus + 1; temperature T damps evidence."""
     if T is None:
