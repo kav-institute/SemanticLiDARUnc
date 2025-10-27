@@ -318,17 +318,23 @@ class Trainer:
             from losses.dirichlet_losses import (
                 NLLDirichletCategorical,
                 BrierDirichlet,
-                ComplementKLUniform
+                ComplementKLUniform,
+                DirichletMSELoss,
+                DigammaDirichletCE
             )
             self.crit_nll_dircat = NLLDirichletCategorical(ignore_index=self.ignore_index)
             self.crit_brier = BrierDirichlet(ignore_index=self.ignore_index, s_ref=float(self.num_classes+20))  # set s_ref=None if you want the standard version or self.prior_concentration
             self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=1.25, tau=0.65, sigma=0.15,   # gamma=2.0, tau=0.55, sigma=0.12
                                     s_target=None, normalize=True)
 
-            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
+            self.crit_mse_dir = DirichletMSELoss(ignore_index=self.ignore_index)
 
+            self.crit_digamma_ce = DigammaDirichletCE(ignore_index=self.ignore_index)
+
+            
+            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
             # loss weights
-            defaults = dict(w_nll=0.0, 
+            defaults = dict(w_nll=1.0, 
                             w_imax=3.0, 
                             w_dce=1.0, 
                             w_ls=2.5, 
@@ -337,8 +343,9 @@ class Trainer:
                             w_comp=0.2,
                             w_brier=0.05,
                             w_wle=0.05,          # Add default weight for WLE
-                            w_evid_reg=2e-3,
-                            w_logit_reg=1e-4)
+                            w_mse=1.0,
+                            w_digamma_ce=1.0,   
+            )
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
 
             self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
@@ -346,24 +353,19 @@ class Trainer:
             self.w_comp = w["w_comp"]
             self.w_brier = w["w_brier"]
             self.w_wle = w["w_wle"]            # Add this line to extract the wle weight
-            self.w_evid_reg = w["w_evid_reg"]
-            self.w_logit_reg = w["w_logit_reg"]
-
+            self.w_mse = w["w_mse"]
+            self.w_digamma_ce = w["w_digamma_ce"]
             # define prior/base weights (from cfg)
             self.base_weights = {
                 "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
                 "imax": self.w_imax, "comp": self.w_comp, "brier": self.w_brier,
                 "ir": self.w_ir, "kl": self.w_kl, 
-                "wle": self.w_wle,              # Add this line to include wle in base_weights
-                "evid_reg": self.w_evid_reg, "logit_reg": self.w_logit_reg
+                "wle": self.w_wle,      
+                "mse": self.w_mse,
+                "digamma_ce": self.w_digamma_ce
             }
             
-            from losses.regularizers import EvidenceReg, LogitRegularizer, WrongLowEvidence
-            # EvidenceReg: scale controller. penalizes mismatch between a0 and target s, while leaving class proportions alone.
-                # choose mode: "one_sided" (penalize only over-confidence) or "log_squared" (penalize both under- and over-confidence)
-            self.evidence_reg = EvidenceReg(s_target=self.prior_concentration, mode="log_squared", ignore_index=self.ignore_index, scale_correct=True, margin=0.1)
-            # LogitRegularizer: hard guardrail on the pre-activation z. Stopping runaway growth early and everywhere.
-            self.logit_reg = LogitRegularizer(threshold=z_thr, ignore_index=None)   
+            from losses.regularizers import WrongLowEvidence
 
             self.crit_wle = WrongLowEvidence(
                 ignore_index=self.ignore_index,
@@ -372,11 +374,15 @@ class Trainer:
                 soft_margin_k=0.08    # soft transition
             )
 
-
             # Which losses should be *balanced* by GradNorm (supervised/shape only)
             # Anything *not* in BALANCE_KEYS should be added to the loss with a fixed weight outside GradNorm.
-            BALANCE_KEYS = ("nll", "ls", "brier")  # removed "comp"
+            BALANCE_KEYS = ("nll", "ls", "brier", 'mse', 'digamma_ce')  # removed "comp"
             self.activeKeys_weightBalancer = [k for k in BALANCE_KEYS if self.base_weights.get(k, 0.0) > 0.0]
+            
+            self.reference_loss_term="mse"  # use selected reference loss for GradNorm
+            assert hasattr(self, "reference_loss_term") and self.reference_loss_term in self.activeKeys_weightBalancer, \
+                f"Reference loss term '{self.reference_loss_term}' not found in active keys."
+            print(f"Using reference loss term for GradNorm: {self.reference_loss_term}")
             
             # target proportions for balanced losses only
             self.targets = {"nll": 0.75, "ls": 0.20, "brier": 0.05}
@@ -533,6 +539,15 @@ class Trainer:
                     loss_nll_dircat = self.crit_nll_dircat(alpha, labels)
                     L_terms["nll"] = loss_nll_dircat
 
+                # Dirichlet MSE (accuracy-focused + add. variance term)
+                if self.base_weights.get("mse", 0.0) > 0.0:
+                    loss_mse_dir = self.crit_mse_dir(alpha, labels)
+                    L_terms["mse"] = loss_mse_dir
+                
+                if self.base_weights.get("digamma_ce", 0.0) > 0.0:
+                    loss_digamma_ce = self.crit_digamma_ce(alpha, labels)
+                    L_terms["digamma_ce"] = loss_digamma_ce
+
                 # Lovasz on Dirichlet mean
                 if self.base_weights.get("ls", 0.0) > 0.0:
                     loss_ls = self.criterion_lovasz(p_hat, labels.long(), model_act="probs")
@@ -552,14 +567,6 @@ class Trainer:
                 if self.base_weights.get("wle", 0.0) > 0.0:
                     L_terms["wle"] = self.crit_wle(alpha, labels)
 
-                # Add regularization terms
-                if self.base_weights.get("evid_reg", 0.0) > 0.0:
-                    loss_evid_reg = self.evidence_reg(alpha, target=labels)
-                    L_terms["evid_reg"] = loss_evid_reg
-                    
-                if self.base_weights.get("logit_reg", 0.0) > 0.0:
-                    loss_logit_reg = self.logit_reg(outputs, target=labels)
-                    L_terms["logit_reg"] = loss_logit_reg
 
                 assert all(k in L_terms for k in self.base_weights if self.base_weights[k] > 0.0), f"Missing loss terms for base weights"
                 
@@ -616,14 +623,14 @@ class Trainer:
                         # grads self._last_raw_g    
                     pass
                 
-                # --- Get NLL's effective gradient as reference ---
+                # --- Get effective gradient of reference loss ---
                 g_ref_raw = 0.0
-                if "nll" in balanced_keys:  # with asserts above raw_g and new_w must exist
-                    g_ref_raw = float(self._last_raw_g["nll"])
-                    w_ref_eff = float(self._last_new_w["nll"])
-                    self._last_eff_g["nll"] = g_ref_raw * w_ref_eff # cache
+                if self.reference_loss_term in balanced_keys:    # with asserts above raw_g and new_w must exist
+                    g_ref_raw = float(self._last_raw_g[self.reference_loss_term])
+                    w_ref_eff = float(self._last_new_w[self.reference_loss_term])
+                    self._last_eff_g[self.reference_loss_term] = g_ref_raw * w_ref_eff   # cache
 
-                # --- Schedule comp weight with cap relative to NLL ---
+                # --- Schedule comp weight with cap relative to ref loss ---
                 if "comp" in L_terms:
                     base_w_comp = float(self.base_weights["comp"])
                     

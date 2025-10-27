@@ -70,47 +70,107 @@ def _valid_mask(
     raise TypeError("ignore_index must be None, int, Iterable[int], or bool Tensor")
 
 
-
-# ---------------------------
-# 1) Dirichlet-categorical NLL: -log E[p_y] = -log(alpha_y / alpha0)
-#    Scale-invariant in alpha (no push on alpha0).
-# ---------------------------
-
 class NLLDirichletCategorical(nn.Module):
     """
     Dirichlet-categorical marginal NLL for a one-hot label.
-    Loss per pixel: -(log(alpha_y) - log(alpha0)).
-    Scale-invariant in alpha (no pressure on alpha0).
+
+    This is -log E[p_y] where E[p_y] = alpha_y / alpha0.
+    So:
+        loss = -( log(alpha_y) - log(alpha0) )
+
+    This loss is scale-invariant in alpha:
+    if you multiply all alpha_k by c>0, alpha0 also multiplies by c,
+    alpha_y / alpha0 stays the same, and the loss is unchanged.
+    That means there is no direct gradient incentive to blow up alpha0.
+
+    alpha  : Dirichlet params > 0, shape [B,C,H,W]
+    target : class ids, shape [B,H,W] or [B,1,H,W]
     """
-    def __init__(self, ignore_index: Optional[int] = 0, eps: float = 1e-12):
+
+    def __init__(self,
+                 ignore_index: Optional[int] = None,
+                 eps: float = 1e-12):
         super().__init__()
         self.ignore_index = ignore_index
         self.eps = eps
 
-    def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        alpha : [B,C,H,W], alpha_i > 0
-        target: [B,H,W] or [B,1,H,W]
-        returns scalar mean over valid pixels
-        """
+    def forward(self,
+                alpha: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor:
+
         if target.dim() == 4 and target.size(1) == 1:
             target = target[:, 0]
-        valid = _valid_mask(target, self.ignore_index)
+        target = target.long()
+
+        valid = _valid_mask(target, self.ignore_index)  # [B,H,W] bool
         if valid.sum() == 0:
             return alpha.sum() * 0.0
 
-        a0 = alpha.sum(dim=1)                              # [B,H,W]
+        # alpha0 = sum_k alpha_k
+        a0 = alpha.sum(dim=1)  # [B,H,W]
+
+        # alpha_y = alpha for the ground truth class
         ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1)  # [B,H,W]
 
-        per = -(torch.log(ay + self.eps) - torch.log(a0 + self.eps))
-        return (per * valid.float()).sum() / valid.sum().clamp_min(1.0)
+        # per-pixel nll = -(log ay - log a0)
+        per_pix = -(torch.log(ay + self.eps) - torch.log(a0 + self.eps))  # [B,H,W]
+
+        w = valid.float()
+        return (per_pix * w).sum() / w.sum().clamp_min(1.0)
+
+
+class DigammaDirichletCE(nn.Module):
+    """
+    Expected cross-entropy under Dirichlet (Eq. 4 in Sensoy et al).
+
+    L = psi(alpha0) - psi(alpha_y)
+
+    where psi is the digamma function, psi(x) = d/dx log Gamma(x).
+
+    This is E[-log p_y] for p ~ Dir(alpha).
+    This loss is NOT scale-invariant in alpha: increasing alpha0
+    (especially alpha_y) keeps lowering the loss.
+
+    alpha  : Dirichlet params > 0, shape [B,C,H,W]
+    target : class ids, shape [B,H,W] or [B,1,H,W]
+    """
+
+    def __init__(self,
+                 ignore_index: Optional[int] = None,
+                 eps: float = 1e-12):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.eps = eps  # not heavily used here but good to have
+
+    def forward(self,
+                alpha: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor:
+
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        target = target.long()
+
+        valid = _valid_mask(target, self.ignore_index)  # [B,H,W] bool
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
+
+        # alpha0 = sum_k alpha_k
+        a0 = alpha.sum(dim=1)  # [B,H,W]
+
+        # alpha_y = alpha for gt class
+        ay = alpha.gather(1, target.unsqueeze(1)).squeeze(1)  # [B,H,W]
+
+        # per-pixel CE risk = psi(alpha0) - psi(alpha_y)
+        per_pix = torch.digamma(a0) - torch.digamma(ay)  # [B,H,W]
+
+        w = valid.float()
+        return (per_pix * w).sum() / w.sum().clamp_min(1.0)
 
 
 # ---------------------------
-# 2) Dirichlet Brier (expected).
-#    Optionally scale-free via s_ref (replaces alpha0 by constant).
+#   Dirichlet Brier (expected).
+#   Optionally scale-free via s_ref (replaces alpha0 by constant).
 # ---------------------------
-
 class BrierDirichlet(nn.Module):
     """
     Expected Brier score under Dirichlet predictive distribution.
@@ -254,82 +314,72 @@ class ComplementKLUniform(nn.Module):
         return (per * wmask).sum() / wmask.sum().clamp_min(1.0)
 
 
-# class ComplementKLUniform(nn.Module):
-#     """
-#     Encourages off-class conditional distribution to approach uniform
-#     when the model is uncertain (low p_y).
+class DirichletMSELoss(nn.Module):
+    """
+    The expected square error (Brier-style Bayes risk) under a Dirichlet,
+        Reference equation (5) in Sensoy et al 2018.
+        This is the data fit term.
+    """
+    def __init__(self,
+                 ignore_index: Optional[int] = None,
+                 eps: float = 1e-8):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.eps = eps
+        
+    def forward(self,
+                alpha: torch.Tensor,
+                target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        alpha: [B,C,H,W]
+        target: [B,H,W] or [B,1,H,W]
+        epoch_num: current epoch index
+        anneal_step: anneal denominator for lambda_t
 
-#     Per-pixel:
-#         tilde = p_off / (1 - p_y)
-#         KL(tilde || U) in [0, log(C-1)], normalized to [0,1] if normalize=True.
-#         Weighted by w_uncert(p_y) and optional w_evid(a0).
-#     Optional evidence gate uses a0.detach() so it does not push alpha0.
-#     """
-#     def __init__(self,
-#                  ignore_index: Optional[int] = 0,
-#                  gamma: float = 2.0,
-#                  tau: float = 0.55,
-#                  sigma: float = 0.12,
-#                  s_target: Optional[float] = None,
-#                  normalize: bool = True,
-#                  eps: float = 1e-8):
-#         super().__init__()
-#         self.ignore_index = ignore_index
-#         self.gamma = float(gamma)
-#         self.tau = float(tau)
-#         self.sigma = float(sigma)
-#         self.s_target = s_target           # if not None, only used for gating; alpha0 is detached
-#         self.normalize = bool(normalize)
-#         self.eps = eps
+        returns scalar loss
+        """
 
-#     def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-#         """
-#         alpha : [B,C,H,W], alpha_i > 0
-#         target: [B,H,W] or [B,1,H,W]
-#         returns scalar mean over valid pixels
-#         """
-#         if target.dim() == 4 and target.size(1) == 1:
-#             target = target[:, 0]
-#         target = target.long()
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        target = target.long()
 
-#         valid = _valid_mask(target, self.ignore_index)
-#         if valid.sum() == 0:
-#             return alpha.sum() * 0.0
+        valid = _valid_mask(target, self.ignore_index)
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
 
-#         B, C, H, W = alpha.shape
-#         if C <= 2:
-#             return alpha.sum() * 0.0
+        B, C, H, W = alpha.shape
+        if C <= 2:
+            return alpha.sum() * 0.0
 
-#         a0 = alpha.sum(dim=1, keepdim=True) + self.eps        # [B,1,H,W]
-#         p = alpha / a0                                        # [B,C,H,W]
+        # ------------------------------------------------------------------
+        # Data fit term (expected squared error under Dirichlet)
+        # ------------------------------------------------------------------
 
-#         tgt_safe = torch.where(valid, target, torch.zeros_like(target))
-#         py = p.gather(1, tgt_safe.unsqueeze(1)).clamp_min(self.eps)  # [B,1,H,W]
+        # alpha0 = sum_k alpha_k
+        alpha0 = alpha.sum(dim=1, keepdim=True)        # [B,1,H,W]
 
-#         # mask out GT channel and build conditional off-class probs
-#         oh = torch.zeros((B, C, H, W), device=p.device, dtype=torch.bool)
-#         oh.scatter_(1, tgt_safe.unsqueeze(1), True)
-#         p_off = p.masked_fill(oh, 0.0)
-#         S = (1.0 - py).clamp_min(self.eps)
-#         tilde = p_off / S
+        # p_hat = E[p] = alpha / alpha0
+        p_hat = alpha / (alpha0 + self.eps)            # [B,C,H,W]
 
-#         # KL(tilde || U), U_j = 1/(C-1)
-#         log_tilde = (tilde.clamp_min(self.eps)).log()
-#         kl_u = (tilde * log_tilde).sum(dim=1) + math.log(C - 1)  # [B,H,W]
-#         if self.normalize:
-#             kl_u = kl_u / math.log(C - 1)
+        # one-hot targets y_onehot: [B,C,H,W]
+        # we only build for valid pixels to save memory if you want to,
+        # but for clarity we just build full then mask at the end.
+        y_onehot = torch.zeros_like(alpha)             # [B,C,H,W]
+        y_onehot.scatter_(1, target.unsqueeze(1), 1.0)
 
-#         # Uncertainty gate
-#         w_uncert = ((1.0 - py).pow(self.gamma) *
-#                     torch.sigmoid((self.tau - py) / self.sigma)).squeeze(1)  # [B,H,W]
+        # squared error term: (y - p_hat)^2
+        sq_err = (y_onehot - p_hat) ** 2               # [B,C,H,W]
 
-#         # Optional evidence gate (detach a0 to avoid pushing alpha0)
-#         if self.s_target is not None:
-#             s_val = float(self.s_target)
-#             w_evid = s_val / (a0.detach().squeeze(1) + s_val)
-#             w = w_uncert * w_evid
-#         else:
-#             w = w_uncert
+        # Dirichlet predictive variance term:
+        # var = alpha * (alpha0 - alpha) / (alpha0^2 * (alpha0 + 1))
+        var = alpha * (alpha0 - alpha) / (
+            (alpha0 * alpha0 + self.eps) * (alpha0 + 1.0)
+        )                                              # [B,C,H,W]
 
-#         per = w * kl_u
-#         return (per * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        # per-pixel mse_like = sum_c [ sq_err + var ]
+        mse_like = (sq_err + var).sum(dim=1)           # [B,H,W]
+        
+        # mean mse_like over valid pixels
+        mse_mean = (mse_like * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        return mse_mean
