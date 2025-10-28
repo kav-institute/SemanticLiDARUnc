@@ -121,7 +121,7 @@ class NLLDirichletCategorical(nn.Module):
 
 class DigammaDirichletCE(nn.Module):
     """
-    Expected cross-entropy under Dirichlet (Eq. 4 in Sensoy et al).
+    Expected cross-entropy under Dirichlet.
 
     L = psi(alpha0) - psi(alpha_y)
 
@@ -137,7 +137,7 @@ class DigammaDirichletCE(nn.Module):
 
     def __init__(self,
                  ignore_index: Optional[int] = None,
-                 eps: float = 1e-12):
+                 eps: float = 1e-8):
         super().__init__()
         self.ignore_index = ignore_index
         self.eps = eps  # not heavily used here but good to have

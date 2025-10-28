@@ -288,3 +288,77 @@ class WrongLowEvidence(nn.Module):
         denom = gate_wrong.sum().clamp_min(1.0)  # average over active wrong pixels
         return per.sum() / denom
 
+class KL_offClasses_to_uniform(nn.Module):
+    """ 
+    KL divergence term that penalizes evidence for the
+    non-true classes, pushing alpha for wrong classes toward 1.
+    """
+    
+    def __init__(self,
+                 ignore_index: Optional[int] = None,
+                 eps: float=1e-8):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.eps = eps
+    
+    @staticmethod
+    def _dirichlet_kl_to_uniform(alpha_tilde: torch.Tensor,
+                             eps: float = 1e-12) -> torch.Tensor:
+        """
+        KL( Dir(alpha_tilde) || Dir(1,...,1) ), per sample / per pixel.
+        alpha_tilde: [N,C] with all entries > 0
+
+        We drop constant terms that do not depend on alpha_tilde. This is fine for
+        training because constants have zero gradient.
+
+        Formula:
+        KL = logGamma(sum_k a_k) - sum_k logGamma(a_k)
+            + sum_k (a_k - 1) * (digamma(a_k) - digamma(sum_k a_k))
+
+        returns kl_per_sample: [N]
+        """
+        # shape
+        a = alpha_tilde.clamp_min(eps)           # [N,C]
+        sum_a = a.sum(dim=1, keepdim=True)       # [N,1]
+
+        term1 = torch.lgamma(sum_a) - torch.lgamma(a).sum(dim=1, keepdim=True)
+        term2 = ((a - 1.0) *
+                (torch.digamma(a) - torch.digamma(sum_a))).sum(dim=1, keepdim=True)
+
+        kl = term1 + term2                       # [N,1]
+        return kl.squeeze(1)                     # [N]
+    
+    def forward(self, alpha: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if target.dim() == 4 and target.size(1) == 1:
+            target = target[:, 0]
+        target = target.long()
+
+        valid = _valid_mask(target, self.ignore_index)
+        if valid.sum() == 0:
+            return alpha.sum() * 0.0
+        
+        # one-hot targets y_onehot: [B,C,H,W]
+        # we only build for valid pixels to save memory if you want to,
+        # but for clarity we just build full then mask at the end.
+        y_onehot = torch.zeros_like(alpha)             # [B,C,H,W]
+        y_onehot.scatter_(1, target.unsqueeze(1), 1.0)
+        
+        # alpha_tilde = y + (1 - y) * alpha
+        # This "removes" evidence for the true class so KL only punishes
+        # spurious evidence for non-true classes.
+        alpha_tilde = y_onehot + (1.0 - y_onehot) * alpha  # [B,C,H,W]
+
+        # flatten valid pixels so we compute KL only there
+        # shape after view: [N_valid, C]
+        B, C, H, W = alpha.shape
+        valid_flat = valid.view(B, -1)                     # [B,H*W]
+        alpha_tilde_flat = alpha_tilde.permute(0, 2, 3, 1).reshape(-1, C)   # make class layer last and flatten on elements
+        alpha_tilde_flat = alpha_tilde_flat[valid_flat.reshape(-1)]
+
+        assert alpha_tilde_flat.numel() != 0, "no off classes present?! Check KL function"
+        
+        kl_each = self._dirichlet_kl_to_uniform(alpha_tilde_flat,
+                                            eps=self.eps)  # [N_valid]
+        kl_mean = kl_each.mean()                          # scalar
+
+        return kl_mean

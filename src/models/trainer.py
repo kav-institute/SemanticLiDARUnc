@@ -324,22 +324,21 @@ class Trainer:
             )
             self.crit_nll_dircat = NLLDirichletCategorical(ignore_index=self.ignore_index)
             self.crit_brier = BrierDirichlet(ignore_index=self.ignore_index, s_ref=float(self.num_classes+20))  # set s_ref=None if you want the standard version or self.prior_concentration
+            self.crit_mse_dir = DirichletMSELoss(ignore_index=self.ignore_index)
+            self.crit_digamma_ce = DigammaDirichletCE(ignore_index=self.ignore_index)
+            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
+            
+            # Regualarizers
+            from losses.regularizers import KL_offClasses_to_uniform
+            self.crit_kl = KL_offClasses_to_uniform(ignore_index=self.ignore_index)
             self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=1.25, tau=0.65, sigma=0.15,   # gamma=2.0, tau=0.55, sigma=0.12
                                     s_target=None, normalize=True)
-
-            self.crit_mse_dir = DirichletMSELoss(ignore_index=self.ignore_index)
-
-            self.crit_digamma_ce = DigammaDirichletCE(ignore_index=self.ignore_index)
-
             
-            self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
+            
             # loss weights
             defaults = dict(w_nll=1.0, 
-                            w_imax=3.0, 
-                            w_dce=1.0, 
                             w_ls=2.5, 
                             w_kl=0.5, 
-                            w_ir=0.3,
                             w_comp=0.2,
                             w_brier=0.05,
                             w_wle=0.05,          # Add default weight for WLE
@@ -348,8 +347,9 @@ class Trainer:
             )
             w = load_loss_weights(self.cfg, self.loss_name, defaults)
 
-            self.w_nll, self.w_imax, self.w_dce = w["w_nll"], w["w_imax"], w["w_dce"]
-            self.w_ls,  self.w_kl,   self.w_ir  = w["w_ls"],  w["w_kl"],  w["w_ir"]
+            self.w_nll = w["w_nll"]
+            self.w_ls = w["w_ls"]
+            self.w_kl = w["w_kl"]
             self.w_comp = w["w_comp"]
             self.w_brier = w["w_brier"]
             self.w_wle = w["w_wle"]            # Add this line to extract the wle weight
@@ -357,9 +357,11 @@ class Trainer:
             self.w_digamma_ce = w["w_digamma_ce"]
             # define prior/base weights (from cfg)
             self.base_weights = {
-                "nll": self.w_nll, "ls": self.w_ls, "dce": self.w_dce,
-                "imax": self.w_imax, "comp": self.w_comp, "brier": self.w_brier,
-                "ir": self.w_ir, "kl": self.w_kl, 
+                "nll": self.w_nll, 
+                "ls": self.w_ls, 
+                "comp": self.w_comp, 
+                "brier": self.w_brier,
+                "kl": self.w_kl, 
                 "wle": self.w_wle,      
                 "mse": self.w_mse,
                 "digamma_ce": self.w_digamma_ce
@@ -566,6 +568,10 @@ class Trainer:
                 # Incorrect low-evidence penalty
                 if self.base_weights.get("wle", 0.0) > 0.0:
                     L_terms["wle"] = self.crit_wle(alpha, labels)
+                    
+                if self.base_weights.get("kl", 0.0) > 0.0:
+                    loss_kl = self.crit_kl(alpha, labels)
+                    L_terms["kl"] = loss_kl 
 
 
                 assert all(k in L_terms for k in self.base_weights if self.base_weights[k] > 0.0), f"Missing loss terms for base weights"
@@ -630,7 +636,7 @@ class Trainer:
                     w_ref_eff = float(self._last_new_w[self.reference_loss_term])
                     self._last_eff_g[self.reference_loss_term] = g_ref_raw * w_ref_eff   # cache
 
-                # --- Schedule comp weight with cap relative to ref loss ---
+                # --- Schedule comp weight with cap relative to reference loss ---
                 if "comp" in L_terms:
                     base_w_comp = float(self.base_weights["comp"])
                     
@@ -663,21 +669,12 @@ class Trainer:
                             cap_ratio=comp_cap_ratio,
                             name="comp"
                         )
-                        #w_prev = float(self._last_new_w["comp"])    # get last eff weight
-                        # w_comp_final = _apply_share_cap_vs_reference(
-                        #     w_comp_scheduled,
-                        #     float(self._last_raw_g["comp"]),
-                        #     g_nll_ref,
-                        #     comp_cap_ratio,
-                        #     w_prev,
-                        #     name="comp"
-                        # )
                     else:
                         w_comp_final = w_comp_scheduled
                     
                     self._last_new_w["comp"] = w_comp_final
                 
-                # --- Schedule wle weight with cap relative to NLL ---
+                # --- Schedule wle weight with cap relative to reference loss ---
                 if "wle" in L_terms:
                     base_w_wle = float(self.base_weights["wle"])
                     
@@ -709,19 +706,49 @@ class Trainer:
                             cap_ratio=wle_cap_ratio,
                             name="wle"
                         )
-                        # w_prev = float(self._last_new_w["wle"]) # get last eff weight
-                        # w_wle_final = _apply_share_cap_vs_reference(
-                        #     w_wle_scheduled,
-                        #     float(raw_g["wle"]),
-                        #     g_eff_ref,
-                        #     wle_cap_ratio,
-                        #     w_prev,
-                        #     name="wle"
-                        # )
                     else:
                         w_wle_final = w_wle_scheduled
                     
                     self._last_new_w["wle"] = w_wle_final
+
+                # --- Schedule kl weight with cap relative to reference loss ---
+                if "kl" in L_terms:
+                    base_w_kl = float(self.base_weights["kl"])
+
+                    # Get scheduled weight using unified helper
+                    w_kl_scheduled = _cosine_weight_ramp(
+                        self.global_step, 
+                        self.total_train_steps,
+                        w0=0.01 * base_w_kl,
+                        w_peak=base_w_kl,
+                        w_end=base_w_kl,
+                        warm_frac=0.1,  # 10% of total train steps is warmup
+                        hold_frac=1.00   # hold at peak until end
+                    )
+                    
+                    # Apply cap relative to NLL using unified helper
+                    if g_ref_raw > 0.0:
+                        # make permenant cap at 15% of reference
+                        kl_cap_ratio = _cosine_share_cap(
+                            self.global_step,
+                            self.total_train_steps,
+                            cap_start=0.15,
+                            cap_end=0.15,
+                            hold_frac=0.15
+                        )
+
+                        w_kl_final = _apply_share_cap_vs_reference(
+                            w_scheduled=w_kl_scheduled,
+                            g_current_raw=float(self._last_raw_g["kl"]),
+                            g_reference_raw=g_ref_raw,
+                            w_ref=w_ref_eff,  # Use effective balanced weight of reference
+                            cap_ratio=kl_cap_ratio,
+                            name="kl"
+                        )
+                    else:
+                        w_kl_final = w_kl_scheduled
+
+                    self._last_new_w["kl"] = w_kl_final
 
                 # --- Build last effective gradients for all terms ---
                 for k in L_terms:
@@ -1015,7 +1042,7 @@ class Trainer:
             self.writer.add_scalar('mIoU_Train', mIoU*100, epoch)
             if self.loss_name == "Dirichlet":
                 H_norm_epoch = get_predictive_entropy_norm.mean(reset=True)
-                self.writer.add_scalar('unc_tot/epoch', H_norm_epoch, self.global_step)
+                self.writer.add_scalar('Calibration/entropy_tot/epoch', H_norm_epoch, self.global_step)
                 #self.balancer.end_epoch(epoch)
 
     # ------------------------------
@@ -1146,17 +1173,27 @@ class Trainer:
             self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         
             if self.use_mc_sampling or self.loss_name=="Dirichlet":
-                self.ua_agg.plot_accuracy_vs_uncertainty_bins(
+                fig_ua_agg, ax_ua_agg = self.ua_agg.plot_accuracy_vs_uncertainty_bins(
                     bin_width=0.05, 
                     show_percent_on_bars=True,
                     title=f"Pixel Accuracy vs Predictive-Uncertainty (epoch {epoch:03d})",
                     save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
                 )
                 # ECE plot
-                (ece, mce), ece_stats = self.ece_eval.compute(
+                (ece, mce), ece_stats, fig_ece = self.ece_eval.compute(
                     save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch:03d}.png"),
                     title=f"Reliability (epoch {epoch:03d})"
                 )
+                self.writer.add_scalar('Calibration/ECE', ece, epoch)
+                self.writer.add_scalar('Calibration/Max_ECE', mce, epoch)
+                
+                # now mutate fig for TB
+                fig_ece.set_size_inches(4, 3)   # shrink physical size
+                fig_ece.set_dpi(100)            # lower dpi so final pixel dims ~600x450
+                fig_ua_agg.set_size_inches(4, 3)   # shrink physical size
+                fig_ua_agg.set_dpi(100)            # lower dpi so final pixel dims ~600x450
+                self.writer.add_figure('Calibration/ECE_Plot', fig_ece, epoch, close=True)
+                self.writer.add_figure('Calibration/Accuracy_vs_Entropy', fig_ua_agg, epoch, close=True)
                 print(f"Epoch {epoch} ECE: {ece:.4f}, Max_ECE: {mce:.4f}")
 
         return mIoU
