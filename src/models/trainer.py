@@ -252,7 +252,7 @@ class Trainer:
                     "alpha0", "AU_frac", "EU_frac", "EU_minus_AU_frac",
                 ]
             else:
-                self.viz_optional_names = []  # keep modular; add others here if needed
+                self.viz_optional_names = ["H_norm"]  # keep modular; add others here if needed
             
             # make all optional names visible but unticked in the panel
             if self.viz_optional_names:
@@ -1009,6 +1009,23 @@ class Trainer:
                     optional_builders = {
                         n: (lambda name=n: build_uncertainty_layers(alpha_dev, [name], idx=idx0, mask=mask)[name])
                         for n in self.viz_optional_names
+                    }
+                else:
+                    # Predictive entropy: H[p_bar] = -Sum_c {p_bar}_c * log( {p_bar}_c )
+                    probs = outputs[idx0].detach().cpu()   # [C, H, W], already softmax
+                    p_bar = probs
+                    entropy = -(p_bar * torch.clamp(p_bar, min=get_eps_value()).log()).sum(dim=0)   # [(H,W)]
+                    H_norm = entropy/ math.log(self.num_classes)    # [(H,W)]
+
+                    H_norm_map = (H_norm.numpy() * 255).astype(np.uint8)
+                    H_norm_colormap = cv2.applyColorMap(H_norm_map, cv2.COLORMAP_TURBO)
+                    if self.ignore_index is not None:
+                        H_norm_colormap[mask[:, 0], mask[:, 1]]=[0,0,0]
+                    
+                    images = [H_norm_colormap]
+                    optional_builders = {
+                        n: (lambda name=n: image)
+                        for n, image in zip(self.viz_optional_names, images)
                     }
     
                 create_ia_plots(
