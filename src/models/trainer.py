@@ -211,14 +211,20 @@ class Trainer:
         if self.loss_name=="Dirichlet": eval_on_outputkind = "alpha"
         elif self.use_mc_sampling: eval_on_outputkind = "probs"
         else: eval_on_outputkind = "probs"  # or logits if not used probs as argument
+        # EVALUATION inits
+        self.max_samples_reservoir_sampling = 500_000
         self.ece_eval = ECEAggregator(
                             n_bins=15,
                             mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
                             ignore_index=self.ignore_index,        
-                            max_samples=100_000_000,       # None or an int cap like 2_000_000 to bound memory
+                            max_samples=self.max_samples_reservoir_sampling,       # None or an int cap like 2_000_000 to bound memory
                             plot_style="classic+hist"
                         )
-        self.auroc_eval = AUROCAggregator(mode=eval_on_outputkind, score="entropy_norm", ignore_index=self.ignore_index)
+        self.auroc_eval = AUROCAggregator(mode=eval_on_outputkind, 
+                                          score="entropy_norm", 
+                                          ignore_index=self.ignore_index, 
+                                          max_samples=self.max_samples_reservoir_sampling)
+        self.ua_agg = UncertaintyAccuracyAggregator(max_samples=self.max_samples_reservoir_sampling)  # cap optional
         # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -260,9 +266,6 @@ class Trainer:
                 
         if self.loss_name=="Dirichlet":
             self._alpha_cache: torch.Tensor | None = None
-            
-        # EVALUATION inits
-        self.ua_agg = UncertaintyAccuracyAggregator(max_samples=100_000_000)  # cap optional
 
 
     # ------------------------------
@@ -1073,6 +1076,7 @@ class Trainer:
         self.iou_evaluator.reset()
         self.ua_agg.reset()
         self.ece_eval.reset()
+        self.auroc_eval.reset()
         
         self.model.eval()
         inference_times = []
