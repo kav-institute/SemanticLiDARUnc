@@ -169,49 +169,47 @@ class ECEAggregator:
 
         if save_plot_path is not None:
             fig = None
-            try:
-                fig, ax = plt.subplots(figsize=(6.8, 5.0), dpi=dpi)
-                x      = stats["center"].to_numpy()
-                widths = stats["width"].to_numpy()
+            
+            fig, ax = plt.subplots(figsize=(6.8, 5.0), dpi=dpi)
+            x      = stats["center"].to_numpy()
+            widths = stats["width"].to_numpy()
 
-                if self.plot_style in {"classic", "classic+hist"}:
-                    ax.plot([0, 1], [0, 1], label="perfect calibration", linewidth=2)
-                    ax.plot(x, acc, marker="o", label="accuracy")
-                    ax.plot(x, conf, marker="x", linestyle="--", label="avg. confidence")
-                    ax.set_xlabel("Confidence (bin center)")
-                    ax.set_ylabel("Accuracy / Avg. Confidence")
-                    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(True, alpha=0.3)
-                    ax.set_title(f"{title}\nECE={ece:.4f}  |  MCE={mce:.4f}")
-                    if self.plot_style == "classic+hist":
-                        ax2 = ax.twinx()
-                        widths = (stats["high"] - stats["low"]).to_numpy()  # exact bin widths (works for adaptive too)
-                        mass = stats["n"].to_numpy() / max(1, int(self._conf.numel()))
-                        ax2.bar(stats["center"].to_numpy(), mass, width=widths*0.9, alpha=0.25, color="#6baed6", edgecolor="none")
+            if self.plot_style in {"classic", "classic+hist"}:
+                ax.plot([0, 1], [0, 1], label="perfect calibration", linewidth=2)
+                ax.plot(x, acc, marker="o", label="accuracy")
+                ax.plot(x, conf, marker="x", linestyle="--", label="avg. confidence")
+                ax.set_xlabel("Confidence (bin center)")
+                ax.set_ylabel("Accuracy / Avg. Confidence")
+                ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(True, alpha=0.3)
+                ax.set_title(f"{title}\nECE={ece:.4f}  |  MCE={mce:.4f}")
+                if self.plot_style == "classic+hist":
+                    ax2 = ax.twinx()
+                    widths = (stats["high"] - stats["low"]).to_numpy()  # exact bin widths (works for adaptive too)
+                    mass = stats["n"].to_numpy() / max(1, int(self._conf.numel()))
+                    ax2.bar(stats["center"].to_numpy(), mass, width=widths*0.9, alpha=0.25, color="#6baed6", edgecolor="none")
 
-                        ax2.set_ylim(0, 1)                                   # fix to [0, 1]
-                        ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
-                        ax2.set_ylabel("Bin mass (% of samples)", color="gray")
-                        ax2.tick_params(axis="y", colors="gray")
-                    ax.legend(loc="lower right", frameon=True)
+                    ax2.set_ylim(0, 1)                                   # fix to [0, 1]
+                    ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+                    ax2.set_ylabel("Bin mass (% of samples)", color="gray")
+                    ax2.tick_params(axis="y", colors="gray")
+                ax.legend(loc="lower right", frameon=True)
 
-                elif self.plot_style == "gap":
-                    signed = conf - acc  # >0 over-confident, <0 under-confident
-                    colors = np.where(signed >= 0, "tab:red", "tab:green")
-                    ax.axhline(0.0, color="k", linewidth=1)
-                    ax.bar(x, signed, width=widths*0.9, color=colors)
-                    ax.set_xlim(0, 1)
-                    ax.set_xlabel("Confidence (bin center)")
-                    ax.set_ylabel("conf - acc  (positive = over-confident)")
-                    ax.set_title(f"{title}\nECE={ece:.4f}  |  MCE={mce:.4f}")
-                    ax.grid(True, alpha=0.3)
+            elif self.plot_style == "gap":
+                signed = conf - acc  # >0 over-confident, <0 under-confident
+                colors = np.where(signed >= 0, "tab:red", "tab:green")
+                ax.axhline(0.0, color="k", linewidth=1)
+                ax.bar(x, signed, width=widths*0.9, color=colors)
+                ax.set_xlim(0, 1)
+                ax.set_xlabel("Confidence (bin center)")
+                ax.set_ylabel("conf - acc  (positive = over-confident)")
+                ax.set_title(f"{title}\nECE={ece:.4f}  |  MCE={mce:.4f}")
+                ax.grid(True, alpha=0.3)
 
-                fig.tight_layout()
-                fig.savefig(save_plot_path, bbox_inches="tight", dpi=dpi)
-            finally:
-                if fig is not None:
-                    plt.close(fig)
+            fig.tight_layout()
+            fig.savefig(save_plot_path, bbox_inches="tight", dpi=dpi)
 
-        return (ece, mce), stats
+
+        return (ece, mce), stats, fig
 
 
 

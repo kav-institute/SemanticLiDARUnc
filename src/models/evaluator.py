@@ -809,7 +809,7 @@ class UncertaintyAccuracyAggregator:
                     color=colors, edgecolor="black", linewidth=0.8)
 
         ax.set_ylim(0.0, 1.0)
-        ax.set_title(title, fontsize=20, weight="bold", pad=10)
+        ax.set_title(title, fontsize=18, weight="bold", pad=10)
         ax.set_xlabel(x_label, fontsize=12)
         ax.set_ylabel(y_label, fontsize=12)
         ax.tick_params(axis="x", rotation=45)
