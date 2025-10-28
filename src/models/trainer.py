@@ -42,6 +42,7 @@ from utils.viz_panel import (
 )
 
 from metrics.ece import ECEAggregator
+from metrics.auroc import AUROCAggregator
 
 from losses.dirichlet_losses import _valid_mask
 from utils.grad_norm import (
@@ -209,7 +210,7 @@ class Trainer:
         # eval_on_outputkind in {"alpha", "logits", "probs"}
         if self.loss_name=="Dirichlet": eval_on_outputkind = "alpha"
         elif self.use_mc_sampling: eval_on_outputkind = "probs"
-        else: eval_on_outputkind = "logits"
+        else: eval_on_outputkind = "probs"  # or logits if not used probs as argument
         self.ece_eval = ECEAggregator(
                             n_bins=15,
                             mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
@@ -217,6 +218,7 @@ class Trainer:
                             max_samples=100_000_000,       # None or an int cap like 2_000_000 to bound memory
                             plot_style="classic+hist"
                         )
+        self.auroc_eval = AUROCAggregator(mode=eval_on_outputkind, score="entropy_norm", ignore_index=self.ignore_index)
         # device & writer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -1079,21 +1081,56 @@ class Trainer:
             self._start_timer()
             # --- inside test_one_epoch loop, MC path ---
             if self.use_mc_sampling:
+                @torch.no_grad()
+                def mc_predictive_entropy_norm(probs: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+                    # probs: [T,B,C,H,W]
+                    # Predictive entropy: H[p_bar] = -Sum_c {p_bar}_c * log( {p_bar}_c )
+                    p_bar = probs.mean(dim=0)                                # [B,C,H,W]
+                    H = -(p_bar.clamp_min(eps) * p_bar.clamp_min(eps).log()).sum(dim=1)
+                    return H / math.log(p_bar.size(1))    
+            
+                @torch.no_grad()
+                def mc_mutual_information_norm(probs: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+                    """
+                    probs: [T,B,C,H,W] where probs[t] is softmax(logits_t)
+                    returns: normalized epistemic MI in [B,H,W], scaled to [0,1]
+                    """
+                    # predictive mean
+                    p_bar = probs.mean(dim=0)  # [B,C,H,W]
+
+                    # total predictive entropy H[p_bar]
+                    H_bar = -(p_bar.clamp_min(eps) * p_bar.clamp_min(eps).log()).sum(dim=1)  # [B,H,W]
+
+                    # per-sample entropies H[p_t]
+                    H_t = -(probs.clamp_min(eps) * probs.clamp_min(eps).log()).sum(dim=2)    # [T,B,H,W]
+
+                    # expected entropy E_t[H[p_t]]
+                    EH = H_t.mean(dim=0)  # [B,H,W]
+
+                    # epistemic = mutual information
+                    C = p_bar.size(1)
+                    MI = H_bar - EH        # [B,H,W]
+
+                    # normalize epistemic by log(C) so it's ~= [0,1]
+                    MI_norm = (MI / math.log(C)).clamp_min(0.0)
+                    return MI_norm  # [B,H,W]
+                
                 mc_outputs = mc_forward(self.model, inputs, T=mc_T)     # [T,B,C,H,W]
                 
                 inference_times.append(self._stop_timer_ms())
                 
                 # debugging sanity check: print(mc_outputs.std().item(), mc_outputs.std(dim=0).mean().item())
-                log_probs = F.log_softmax(mc_outputs, dim=2)    # Log-softmax for numerical stability
-                probs = log_probs.exp()                             # get probs
+                log_probs = F.log_softmax(mc_outputs, dim=2)    # Log-softmax for numerical stability, [T,B,C,H,W]
+                probs = log_probs.exp()                         # get probs, [T,B,C,H,W]
 
                 # Predictive distribution
                 p_bar = probs.mean(dim=0)   # [B,C,H,W]
 
-                # Predictive entropy: H[p_bar] = -Sum_c {p_bar}_c * log( {p_bar}_c )
-                entropy = -(p_bar * (p_bar + get_eps_value()).log()).sum(dim=1)   # [B,(H,W)]
-                H_norm = entropy/ math.log(self.num_classes)    # [B,(H,W)]
-                
+                # Predictive entropy
+                H_norm = mc_predictive_entropy_norm(probs)
+                # MI/ Epistemic Uncertainty
+                MI_norm = mc_mutual_information_norm(probs)
+
                 preds = p_bar.argmax(dim=1) # [B,1,H,W]
                 
                 # Metric aggregator accumulation
@@ -1110,18 +1147,13 @@ class Trainer:
     
             else: # single pass (no MC)
                 outputs = self.model(*inputs)
+                inference_times.append(self._stop_timer_ms())
                 if self.loss_name == "Dirichlet":
                     shape_logits = outputs[:, :self.num_classes, ...]
                     scale_logits = outputs[:, self.num_classes:self.num_classes+1, ...] 
                     logits = shape_logits  # use shape logits only for prediction
-                inference_times.append(self._stop_timer_ms())
-                
-                if self._model_act_kind is None:
-                    self._model_act_kind = _classify_output_kind(outputs, class_dim=1)
-                
-                # if self.loss_name == "Dirichlet":
-                #     outputs = outputs[:, :self.num_classes, ...]  # use shape logits only for prediction
-                #logits = _to_logits(outputs, self._model_act_kind)  # [B,C,H,W]
+                else:
+                    logits = outputs
                 
                 log_probs = F.log_softmax(logits, dim=1)
                 probs = log_probs.exp() # [B,C,H,W]
@@ -1148,9 +1180,27 @@ class Trainer:
                     )
                     ## calibration
                     self.ece_eval.update(alpha, labels)
+                    ## auroc
+                    self.auroc_eval.update(alpha, labels)
                 else:
                     ## calibration
                     self.ece_eval.update(probs, labels)
+
+                    # Predictive entropy: H[p_bar] = -Sum_c {p_bar}_c * log( {p_bar}_c )
+                    p_bar = probs
+                    entropy = -(p_bar * torch.clamp(p_bar, min=get_eps_value()).log()).sum(dim=1)   # [B,(H,W)]
+                    H_norm = entropy/ math.log(self.num_classes)    # [B,(H,W)]
+
+                    ## H_norm vs accuracy
+                    self.ua_agg.update(
+                        labels=labels, 
+                        preds=preds, 
+                        uncertainty=H_norm, 
+                        ignore_ids=(0,)     # ignore unlabeled if ignore_ids==0
+                    )
+
+                    ## auroc
+                    self.auroc_eval.update(p_bar, labels)
         
         # @@@ END of Epoch
         
@@ -1172,29 +1222,41 @@ class Trainer:
             self.writer.add_scalar('mIoU_Test', mIoU*100, epoch)
             self.writer.add_scalar('Inference Time', np.median(inference_times), epoch)
         
-            if self.use_mc_sampling or self.loss_name=="Dirichlet":
-                fig_ua_agg, ax_ua_agg = self.ua_agg.plot_accuracy_vs_uncertainty_bins(
-                    bin_width=0.05, 
-                    show_percent_on_bars=True,
-                    title=f"Pixel Accuracy vs Predictive-Uncertainty (epoch {epoch:03d})",
-                    save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
-                )
-                # ECE plot
-                (ece, mce), ece_stats, fig_ece = self.ece_eval.compute(
-                    save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch:03d}.png"),
-                    title=f"Reliability (epoch {epoch:03d})"
-                )
-                self.writer.add_scalar('Calibration/ECE', ece, epoch)
-                self.writer.add_scalar('Calibration/Max_ECE', mce, epoch)
-                
-                # now mutate fig for TB
-                fig_ece.set_size_inches(4, 3)   # shrink physical size
-                fig_ece.set_dpi(100)            # lower dpi so final pixel dims ~600x450
-                fig_ua_agg.set_size_inches(4, 3)   # shrink physical size
-                fig_ua_agg.set_dpi(100)            # lower dpi so final pixel dims ~600x450
-                self.writer.add_figure('Calibration/ECE_Plot', fig_ece, epoch, close=True)
-                self.writer.add_figure('Calibration/Accuracy_vs_Entropy', fig_ua_agg, epoch, close=True)
-                print(f"Epoch {epoch} ECE: {ece:.4f}, Max_ECE: {mce:.4f}")
+            fig_ua_agg, ax_ua_agg = self.ua_agg.plot_accuracy_vs_uncertainty_bins(
+                bin_width=0.05, 
+                show_percent_on_bars=True,
+                title=f"Pixel Accuracy vs Predictive-Uncertainty (epoch {epoch:03d})",
+                save_path=os.path.join(out_dir, f"acc_vs_unc_bins_{epoch:03d}.png"),
+            )
+            # ECE plot
+            (ece, mce), ece_stats, fig_ece = self.ece_eval.compute(
+                save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch:03d}.png"),
+                title=f"Reliability (epoch {epoch:03d})"
+            )
+            self.writer.add_scalar('Calibration/ECE', ece, epoch)
+            self.writer.add_scalar('Calibration/Max_ECE', mce, epoch)
+            
+            # AUROC
+            auroc, _, fig_auroc = self.auroc_eval.compute(
+                save_plot_path=os.path.join(out_dir, f"auroc_epoch_{epoch:03d}.png"),
+            )
+            self.writer.add_scalar('Calibration/AUROC', auroc, epoch)
+
+            # now mutate fig for TB
+            fig_ece.set_size_inches(4, 3)   # shrink physical size
+            fig_ece.set_dpi(100)            # lower dpi so final pixel dims ~600x450
+
+            fig_ua_agg.set_size_inches(4, 3)   # shrink physical size
+            fig_ua_agg.set_dpi(100)            # lower dpi so final pixel dims ~600x450
+
+            fig_auroc.set_size_inches(4, 3)   # shrink physical size
+            fig_auroc.set_dpi(100)            # lower dpi so final pixel dims ~600x450
+
+            self.writer.add_figure('Calibration/ECE_Plot', fig_ece, epoch, close=True)
+            self.writer.add_figure('Calibration/Accuracy_vs_Entropy', fig_ua_agg, epoch, close=True)
+            self.writer.add_figure('Calibration/AUROC_Plot', fig_auroc, epoch, close=True)
+
+            print(f"Epoch {epoch} ECE: {ece:.4f}, Max_ECE: {mce:.4f}")
 
         return mIoU
 

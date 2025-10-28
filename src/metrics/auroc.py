@@ -38,7 +38,7 @@ class AUROCAggregator:
             p = preds / (a0 + self.eps)
         elif self.mode == "logits":
             p = preds.softmax(dim=1)
-        else:
+        else:   # probs
             p = preds.clamp_min(0)
             p = p / p.sum(dim=1, keepdim=True).clamp_min(self.eps)
         return p
@@ -161,4 +161,4 @@ class AUROCAggregator:
             ax.set_title(f"{title}\nAUROC = {auroc:.4f}")
             ax.grid(True, alpha=0.3)
             fig.tight_layout(); fig.savefig(save_plot_path, bbox_inches="tight", dpi=dpi); plt.close(fig)
-        return auroc, {"fpr": fpr, "tpr": tpr, "thresholds": thr}
+        return auroc, {"fpr": fpr, "tpr": tpr, "thresholds": thr}, fig
