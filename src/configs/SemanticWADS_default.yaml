@@ -1,28 +1,29 @@
 # path to SemanticWADS dataset (sequences), no tailing path seperator!
-dataset_dir: "/home/devuser/workspace/data/WADS/sequences"
+dataset_dir: "/home/devuser/workspace/data/semantic_datasets/WADS/sequences"
 dataset_name: "SemanticWADS"
 remap_adverse_label: False # when True remaps to unlabeled, if not handles it as own seperate class
 
 model_settings: {
   # Defines model backbone architecture
-  # Baseline model. type: str. options: SalsaNext | Reichert | SalsaNextAdf
-    baseline: "Reichert", 
-  # Backbone architecture
-    model_type: "efficientnet_v2_l",
-  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNextAdf
-    loss_function: "Dirichlet",
-  # Model Layer settings
-  ## toggle attention block. type: bool
-    attention: true,
-  ## inject meta data at multiple scales. type: bool
-    multi_scale_meta: true,
+  # Baseline model. type: str. options: SalsaNext | Reichert
+    baseline: "SalsaNext", 
+  # Loss function. type: str. options: Tversky | CE | Lovasz | Dirichlet | SalsaNext
+    loss_function: "SalsaNext",
+
+  # Model Layer settings, specific to "Reichert" baseline
+    ## Backbone architecture. Note: Reichert only
+      model_type: "efficientnet_v2_l",
+    ## toggle attention block. type: bool. Note: Reichert only
+      attention: true,
+    ## inject meta data at multiple scales. type: bool. Note: Reichert only
+      multi_scale_meta: true,
   
   # Define what optional input channel types are used
     # range (1 channel) and xyz (3 channels) are always considered -> min.4 channels
   ## toggle use of normals as input (+3 extra channels). type: bool
     normals: true,
   ## toggle use of reflectivity as input (+1 extra channels). type: bool
-    reflectivity: true,
+    reflectivity: false, # was true
 
   # AUGMENTATIONS
   ## rotation augmentation. type: bool
@@ -31,7 +32,7 @@ model_settings: {
     flip: true,
   
   # Toggle use of Dropout at inference
-  use_mc_sampling: true,
+  use_mc_sampling: false,
   mc_samples:  50,
 
   ## Image projection resolution
@@ -51,13 +52,20 @@ model_settings: {
 
 model_weights: {
   Dirichlet: {
-    w_ls:    0.25,   # add only if you want extra IoU (on softmax probs)
-    w_nll:   1.0,  # Dirichlet-categorical NLL or density based
-    w_imax:  3.5,   # 2.0
+    w_ls:    0.0,   # add only if you want extra IoU (on softmax probs), 0.5
+    w_nll:   0.0,  # Dirichlet-categorical NLL or density based
+    w_imax:  0.0,   # 2.0
     w_dce:   0.0,   # 1.0
-    w_kl:    0.8,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_kl:    0.05,  # KL evidence penalty for off-class evidence, 0.05
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  3.0    # shapes uncertainty on unsure pixels
+    w_comp:  0.0,    # shapes uncertainty on unsure pixels, 1.0
+    w_brier: 0.0,  # 0.5
+    w_evid_reg: 0.0,  # 1.e-1 for log_squared, 1.e-5 for one_sided
+    w_logit_reg: 0.0, # 3.e-4
+    w_wle: 0.0,  # 0.1
+    w_mse: 1.0,  # weight for the Dirichlet MSE loss term
+    w_digamma_ce: 0.0,  # weight for the Dirichlet Digamma loss term
+    target_shares: {"nll": 0.75, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.05, "brier": 0.20}  # for dynamic weight adjustment
   },
   SalsaNext: {
     w_nll:   1.0, 
@@ -73,11 +81,11 @@ train_params: {
   ## learning rate for training
     learning_rate: 5.e-4,
   ## Sets batch size for training
-    batch_size: 2,
+    batch_size: 7,
   ## Sets numbor of worker processes
-    num_workers: 4,
+    num_workers: 8,
   ## Sets number of total training epochs
-    num_epochs: 100,
+    num_epochs: 50,
   ## Sets weight decay
   weight_decay: 1.e-4,
   ## Gradually/Linearilly increases learning rate until base learning is reached for 'num_warmup_epochs' Epochs
