@@ -335,7 +335,7 @@ class Trainer:
             
             # Regualarizers
             from losses.regularizers import KL_offClasses_to_uniform
-            self.crit_kl = KL_offClasses_to_uniform(ignore_index=self.ignore_index)
+            self.crit_kl = KL_offClasses_to_uniform(ignore_index=self.ignore_index, gamma=1.0)
             self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=1.25, tau=0.65, sigma=0.15,   # gamma=2.0, tau=0.55, sigma=0.12
                                     s_target=None, normalize=True)
             
@@ -724,7 +724,7 @@ class Trainer:
                     w_kl_scheduled = _cosine_weight_ramp(
                         self.global_step, 
                         self.total_train_steps,
-                        w0=0.01 * base_w_kl,
+                        w0=0.001 * base_w_kl,
                         w_peak=base_w_kl,
                         w_end=base_w_kl,
                         warm_frac=0.1,  # 10% of total train steps is warmup
@@ -737,9 +737,9 @@ class Trainer:
                         kl_cap_ratio = _cosine_share_cap(
                             self.global_step,
                             self.total_train_steps,
-                            cap_start=0.15,
-                            cap_end=0.15,
-                            hold_frac=0.15
+                            cap_start=0.1,  # gentle at start 10% share
+                            cap_end=0.3,   # allow up to 30% share later
+                            hold_frac=0.15  # hold low cap for first 15% of training, a bit longer than warmup
                         )
 
                         w_kl_final = _apply_share_cap_vs_reference(
