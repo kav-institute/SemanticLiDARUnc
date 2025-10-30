@@ -38,23 +38,28 @@ model_settings: {
   # GENERAL SETTINGS
   ## path to pretrained model weights, if no pretrained option is desired set to pretrained: null
     ## type: str or null (NoneType), no tailing path seperator! expects .pt or .pth file
-    pretrained: null #"/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticTHAB/Reichert/Dirichlet_nram/25-10-14_23-56-50/model_final.pt"
-    # Salsanext Salsanext loss: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticTHAB/SalsaNext/test_split_0008/25-10-13_16-06-59/model_final.pt"
-    #Reichert dirichlet: "/home/devuser/workspace/data/Training_SemanticSegmentation/train_semanticTHAB/Reichert/test_split_0008/Dirichlet_nram/25-10-13_16-13-57/model_final.pt",
+    pretrained: null,
+    # Salsanext Salsanext: 
+      # "/home/devuser/workspace/data/Testing_SemanticSegmentation/train_semanticTHAB/SalsaNext/SalsaNext_nr/25-10-13_16-06-59/model_final.pt"
+    #Reichert dirichlet: 
+      # "/home/devuser/workspace/data/Testing_SemanticSegmentation/train_semanticTHAB/Reichert/Dirichlet_nram/25-10-30_01-00-52_brierMse-kl/model_final.pt"
 }
 
 model_weights: {
   Dirichlet: {
     w_ls:    0.0,   # add only if you want extra IoU (on softmax probs), 0.5
-    w_nll:   1.0,  # Dirichlet-categorical NLL or density based
+    w_nll:   0.0,  # Dirichlet-categorical NLL or density based
     w_imax:  0.0,   # 2.0
     w_dce:   0.0,   # 1.0
-    w_kl:    0.0,  # KL evidence term governs alpha0, keeps near prior_concentration
+    w_kl:    0.05,  # KL evidence penalty for off-class evidence, 0.05
     w_ir:    0.0,  # information regularization term, keeps off-class near 1
-    w_comp:  1.0,    # shapes uncertainty on unsure pixels, 1.0
-    w_brier: 0.5,  # 0.5
+    w_comp:  0.0,    # shapes uncertainty on unsure pixels, 1.0
+    w_brier: 0.0,  # 0.5
     w_evid_reg: 0.0,  # 1.e-1 for log_squared, 1.e-5 for one_sided
     w_logit_reg: 0.0, # 3.e-4
+    w_wle: 0.0,  # 0.1
+    w_mse: 1.0,  # weight for the Dirichlet brier MSE loss term
+    w_digamma_ce: 0.0,  # weight for the Dirichlet Digamma loss term
     target_shares: {"nll": 0.75, "ls": 0.0, "dce": 0.0, "imax": 0.0, "comp": 0.05, "brier": 0.20}  # for dynamic weight adjustment
   },
   SalsaNext: {
