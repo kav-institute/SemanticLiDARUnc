@@ -300,7 +300,20 @@ def main(args):
             case "SemanticSTF": pass    # TODO: get class distributions TBD
             case "SemanticTHAB": cfg["extras"]["test_mask"][7]=False; cfg["extras"]["test_mask"][8]=False   # bicyclist and motorcyclist not in test set
             case "Panoptic-CUDAL": pass # TODO: get class distributions TBD
-            case "SemanticWADS": cfg["extras"]["test_mask"][20]=True    # TODO: get class distributions TBD
+            case "SemanticWADS": 
+                cfg["extras"]["test_mask"][20]=True # snow
+                # all others classes are not present in test set (class other-ground, class 12, only 23 instances->dropped as well)
+                cfg["extras"]["test_mask"][2]=False
+                cfg["extras"]["test_mask"][3]=False
+                cfg["extras"]["test_mask"][5]=False
+                cfg["extras"]["test_mask"][6]=False
+                cfg["extras"]["test_mask"][7]=False
+                cfg["extras"]["test_mask"][8]=False
+                cfg["extras"]["test_mask"][11]=False
+                cfg["extras"]["test_mask"][12]=False
+                cfg["extras"]["test_mask"][14]=False
+                cfg["extras"]["test_mask"][17]=False
+
             case _: raise KeyError("in yaml config parameter dataset_name is invalid") 
         
     # train model
@@ -341,7 +354,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg_path', 
                         #action='store_true',
                         type=str, 
-                        default="/home/devuser/workspace/src/configs/SemanticKitti_default.yaml",
+                        default="/home/devuser/workspace/src/configs/SemanticWADS_default.yaml",
                         help='Path to the config file used for training')
     parser.add_argument('--mode', 
                         #action='store_true',
