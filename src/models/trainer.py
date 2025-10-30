@@ -1165,6 +1165,8 @@ class Trainer:
                         ignore_ids=(0,))
                 ## calibration
                 self.ece_eval.update(p_bar, labels)
+                ## auroc
+                self.auroc_eval.update(p_bar, labels)
     
             else: # single pass (no MC)
                 outputs = self.model(*inputs)
