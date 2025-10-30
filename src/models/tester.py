@@ -1,5 +1,6 @@
 # models/tester.py
 import os
+import warnings
 import math
 import json
 import tqdm
@@ -22,7 +23,7 @@ from models.evaluator import (
 )
 
 from models.probability_helper import (
-    to_alpha_concentrations, 
+    to_alpha_concentrations_from_shape_and_scale,
     get_predictive_entropy_norm,
     get_eps_value
 )
@@ -135,7 +136,9 @@ class Tester:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
-        self.num_classes = int(cfg["extras"]["num_classes"])
+
+        self.num_classes = int(cfg["extras"]["num_classes"])-1 if self.loss_name=="Dirichlet" else int(cfg["extras"]["num_classes"])
+        
         self.class_names = cfg["extras"]["class_names"]
         self.class_colors = cfg["extras"]["class_colors"]
         
@@ -161,8 +164,10 @@ class Tester:
         # ignore index
         self.ignore_idx = 0
         
-        self.unc_agg = UncertaintyPerClassAggregator(num_classes=self.num_classes, max_per_class=100_000_000)  # cap is optional
-        self.ua_agg = UncertaintyAccuracyAggregator(max_samples=100_000_000)  # cap optional
+        self.max_samples_reservoir_sampling = 1_000_000
+        self.unc_agg = UncertaintyPerClassAggregator(num_classes=self.num_classes, 
+                                                     max_per_class=self.max_samples_reservoir_sampling)  # cap is optional
+        self.ua_agg = UncertaintyAccuracyAggregator(max_samples=self.max_samples_reservoir_sampling)  # cap optional
         
         # ece_mode in {"alpha", "logits", "probs"}
         if self.loss_name=="Dirichlet": eval_on_outputkind = "alpha"
@@ -172,9 +177,20 @@ class Tester:
                             n_bins=15,
                             mode=eval_on_outputkind,          # "alpha" | "logits" | "probs" depending on what you feed
                             ignore_index=self.ignore_idx,        
-                            max_samples=100_000_000       # None or an int cap like 2_000_000 to bound memory
+                            max_samples=self.max_samples_reservoir_sampling       # None or an int cap like to bound memory
                         )
-        self.auroc_eval = AUROCAggregator(mode=eval_on_outputkind, score="entropy_norm", ignore_index=self.ignore_idx)
+        self.auroc_eval = AUROCAggregator(mode=eval_on_outputkind, 
+                                          score="entropy_norm", 
+                                          ignore_index=self.ignore_idx,
+                                          max_samples=self.max_samples_reservoir_sampling)
+        # Additional AUROC aggregator for epistemic MI (mutual information)
+        mi_mode = "alpha" if self.loss_name == "Dirichlet" else ("probs" if self.use_mc_sampling else eval_on_outputkind)
+        self.auroc_eval_mi = AUROCAggregator(
+            mode=mi_mode,
+            score="mi_norm",
+            ignore_index=self.ignore_idx,
+            max_samples=self.max_samples_reservoir_sampling
+        )
 
         self.checkpoint = checkpoint
         # Load checkpoint if provided
@@ -269,7 +285,93 @@ class Tester:
 
         inference_times = []
         self.model.eval()
-        self.iou_evaluator.reset()
+
+        # ----- Determine epoch name early and set output directories -----
+        try:
+            path, ext = os.path.splitext(self.checkpoint)
+            _, epoch_name = os.path.basename(path).split("_")
+            try:
+                epoch_name = f"{int(epoch_name):03d}"
+            except ValueError:
+                epoch_name = "final"
+        except Exception:
+            epoch_name = "final"
+
+        # standard plots/metrics dir
+        out_dir = os.path.join(os.path.dirname(self.checkpoint), "test"); os.makedirs(out_dir, exist_ok=True)
+        # new cached summary dir (to avoid re-running model inference)
+        summary_dir = os.path.join(os.path.dirname(self.checkpoint), "outputs_summary"); os.makedirs(summary_dir, exist_ok=True)
+        summary_file = os.path.join(summary_dir, f"summary_epoch_{epoch_name}.pt")
+
+        # If a cached summary exists, load it and skip the heavy inference loop
+        loaded_summary = False
+        if os.path.isfile(summary_file):
+            try:
+                cache = torch.load(summary_file, map_location="cpu")
+                if len(loader) * loader.batch_size != cache["meta"].get("num_frames", None):
+                    raise ValueError("Cached summary num_frames does not match current loader size.")
+
+                # Validate required keys before restoring anything; fall back to recompute if missing
+                need_uncert_things = bool(self.use_mc_sampling or self.loss_name == "Dirichlet")
+                required_keys = ["iou_confmat"]
+                if need_uncert_things:
+                    required_keys += [
+                        "ece_conf", "ece_correct",
+                        "auroc_scores", "auroc_is_error",
+                        "auroc_mi_scores", "auroc_mi_is_error",
+                        "ua_uncert", "ua_correct",
+                        "unc_values", "unc_seen_counts",
+                    ]
+                missing = [k for k in required_keys if cache.get(k) is None]
+                if missing:
+                    raise KeyError(f"Summary file missing keys: {missing}")
+
+                # Restore IoU confusion matrix
+                self.iou_evaluator.confmat = cache["iou_confmat"].to(self.iou_evaluator.device).clone().long()
+                
+                if need_uncert_things:
+                    # Restore ECE buffers
+                    if hasattr(self.ece_eval, "_conf"):
+                        self.ece_eval._conf = cache["ece_conf"].clone()
+                    if hasattr(self.ece_eval, "_correct"):
+                        self.ece_eval._correct = cache["ece_correct"].clone().to(torch.uint8)
+                    # Restore AUROC buffers
+                    if hasattr(self.auroc_eval, "_scores"):
+                        self.auroc_eval._scores = cache["auroc_scores"].clone()
+                    if hasattr(self.auroc_eval, "_is_error"):
+                        self.auroc_eval._is_error = cache["auroc_is_error"].clone().to(torch.uint8)
+                    # Restore AUROC-MI buffers
+                    if hasattr(self.auroc_eval_mi, "_scores"):
+                        self.auroc_eval_mi._scores = cache["auroc_mi_scores"].clone()
+                    if hasattr(self.auroc_eval_mi, "_is_error"):
+                        self.auroc_eval_mi._is_error = cache["auroc_mi_is_error"].clone().to(torch.uint8)
+                    # Restore UncertaintyAccuracy buffers
+                    if hasattr(self.ua_agg, "_uncert"):
+                        self.ua_agg._uncert = cache["ua_uncert"].clone()
+                    if hasattr(self.ua_agg, "_correct"):
+                        self.ua_agg._correct = cache["ua_correct"].clone().to(torch.uint8)
+                    # Restore per-class uncertainty values (ridgeline etc.)
+                    vals = cache["unc_values"]
+                    if isinstance(vals, list):
+                        self.unc_agg._values = [v.clone() for v in vals]
+                    self.unc_agg._seen_counts = list(cache["unc_seen_counts"])  # keep as list[int]
+
+                self.total_train_steps = len(loader) * self.cfg["train_params"]["batch_size"]
+                loaded_summary = True
+                print(f"[Tester] Loaded cached outputs summary: {summary_file}")
+            except Exception as e:
+                warnings.warn(
+                    f"[Tester] WARNING: Cached summary exists but could not be fully loaded (will recompute).\n{e}"
+                )
+
+        # reset aggregators (only if we computed them anew)
+        if not loaded_summary:
+            self.ece_eval.reset()
+            self.ua_agg.reset()
+            self.unc_agg.reset()
+            self.auroc_eval.reset()
+            self.auroc_eval_mi.reset()
+            self.iou_evaluator.reset()
 
         # toggles
         mc_T = int(self.cfg["model_settings"].get("mc_samples", 30))
@@ -281,6 +383,9 @@ class Tester:
         for step, (range_img, reflectivity, xyz, normals, labels) in enumerate(
             tqdm.tqdm(loader, desc=f"eval {epoch+1}")
         ):
+            if loaded_summary:
+                # Skip heavy per-batch inference if cache already available
+                break
             # --- inputs/labels prep (unchanged) ---
             range_img = range_img.to(self.device)
             reflectivity = reflectivity.to(self.device)
@@ -321,31 +426,29 @@ class Tester:
 
                 @torch.no_grad()
                 def mc_mutual_information_norm(probs: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-                    ''' MC-dropout epistemic uncertainty via Mutual Information (normalized).
-                    probs:  Per-sample predictive probabilities p_t = softmax(logits_t). T is the number of MC samples.
-                        # shape: [T,B,C,H,W]
-                    - Definitions
-                        p_bar   = E_t[p_t]                      # [B,C,H,W]   (predictive mean)
-                        H_bar   = H[p_bar]                      # total predictive entropy
-                                = -sum_c p_bar_c log p_bar_c
-                        EH      = E_t[ H[p_t] ]                 # expected data (aleatoric) entropy
-                        MI      = H_bar - EH                    # epistemic uncertainty
-                    - outputs: MI / log(C) in [0,1] with natural logs, shape [B,H,W].
-                    '''
+                    """
+                    probs: [T,B,C,H,W] where probs[t] is softmax(logits_t)
+                    returns: normalized epistemic MI in [B,H,W], scaled to [0,1]
+                    """
                     # predictive mean
                     p_bar = probs.mean(dim=0)  # [B,C,H,W]
 
-                    # H[p_bar] (total uncertainty)
+                    # total predictive entropy H[p_bar]
                     H_bar = -(p_bar.clamp_min(eps) * p_bar.clamp_min(eps).log()).sum(dim=1)  # [B,H,W]
 
-                    # E_t[H[p_t]] (aleatoric part)
-                    H_t = -(probs.clamp_min(eps) * probs.clamp_min(eps).log()).sum(dim=2)     # [T,B,H,W]
-                    EH  = H_t.mean(dim=0)                                                     # [B,H,W]
+                    # per-sample entropies H[p_t]
+                    H_t = -(probs.clamp_min(eps) * probs.clamp_min(eps).log()).sum(dim=2)    # [T,B,H,W]
 
-                    # epistemic = MI; normalize to [0,1] by log C
+                    # expected entropy E_t[H[p_t]]
+                    EH = H_t.mean(dim=0)  # [B,H,W]
+
+                    # epistemic = mutual information
                     C = p_bar.size(1)
-                    MI = (H_bar - EH) / math.log(C)
-                    return MI / math.log(p_bar.size(1))                      # [B,H,W]
+                    MI = H_bar - EH        # [B,H,W]
+
+                    # normalize epistemic by log(C) so it's ~= [0,1]
+                    MI_norm = (MI / math.log(C)).clamp_min(0.0)
+                    return MI_norm  # [B,H,W]
                 
                 # Predictive entropy norm
                 H_norm = mc_predictive_entropy_norm(probs)
@@ -361,11 +464,11 @@ class Tester:
                         ignore_ids=(0,))
                 ## calibration
                 self.ece_eval.update(p_bar, labels)
-                ## auroc
+                ## auroc (predictive entropy)
                 self.auroc_eval.update(p_bar, labels)
-                # # AUROC (MC-MI) # NOTE: currently not tested
-                # mi_norm = mc_mutual_information_norm(probs)                  # [B,H,W]
-                # self.auroc_eval_mi.update(p_bar, labels, score_override=mi_norm)
+                ## auroc (epistemic MI via override)
+                MI_norm = mc_mutual_information_norm(probs)                  # [B,H,W]
+                self.auroc_eval_mi.update(p_bar, labels, score_override=MI_norm)
                 
                 # log inference times
                 inference_times.append(self._start.elapsed_time(self._end))
@@ -376,21 +479,25 @@ class Tester:
             ###############################################
             else: # single pass (no MC)
                 outputs = self.model(*inputs)
-                
-                if self._model_act_kind is None:
-                    self._model_act_kind = _classify_output_kind(outputs, class_dim=1)
-                    
-                logits = _to_logits(outputs, self._model_act_kind)  # [B,C,H,W]
+                inference_times.append(self._stop_timer_ms())
+
+                if self.loss_name == "Dirichlet":
+                    # outputs are expected to be split: first K channels -> shape logits,
+                    # next 1 channel -> scale logits (same convention as Trainer)
+                    shape_logits = outputs[:, :self.num_classes, ...]
+                    scale_logits = outputs[:, self.num_classes:self.num_classes+1, ...] 
+                    logits = shape_logits  # use shape logits only for prediction
+                else:
+                    logits = outputs
+
                 probs = F.softmax(logits, dim=1)    # [B,C,H,W]
 
                 preds = probs.argmax(dim=1) # [B,1,H,W]
-                inference_times.append(self._stop_timer_ms())
                 
                 self.iou_evaluator.update(preds, labels)
                 
                 if self.loss_name=="Dirichlet":
-                    # alpha computed ONCE for all metrics
-                    alpha = to_alpha_concentrations(logits)
+                    alpha = to_alpha_concentrations_from_shape_and_scale(shape_logits, scale_logits)
                     H_norm = get_predictive_entropy_norm(alpha)
                     
                     self.ua_agg.update(
@@ -401,6 +508,8 @@ class Tester:
                     )
                     self.ece_eval.update(alpha, labels)
                     self.auroc_eval.update(alpha, labels)
+                    # AUROC using Dirichlet mutual information
+                    self.auroc_eval_mi.update(alpha, labels)
             
             # END of branches MC or standard
             if self.use_mc_sampling or self.loss_name=="Dirichlet":
@@ -490,18 +599,7 @@ class Tester:
                 )
         # @@@ END of Epoch
         
-        # --> METRICS
-            # get right repoch
-        try:
-            path, ext = os.path.splitext(self.checkpoint)
-            _, epoch_name = os.path.basename(path).split("_")
-            try:
-                epoch_name = f"{int(epoch_name):03d}"
-            except ValueError:
-                epoch_name = "final"
-        except:
-            print("Problem with getting right epoch number!")
-            epoch_name = "final"
+        # --> METRICS (epoch_name already computed above)
         
         # per class mIoU and overall mIoU
         mIoU, result_dict = self.iou_evaluator.compute(
@@ -512,8 +610,49 @@ class Tester:
             ignore_th=None
         )
         print(f"[eval] epoch {epoch + 1},  mIoU={mIoU:.4f}")
-        
-        out_dir = os.path.join(os.path.dirname(self.checkpoint), "test"); os.makedirs(out_dir, exist_ok=True)
+
+        # Save per-epoch summary (only if we actually ran the loop and built fresh stats)
+        if not loaded_summary:
+            try:
+                summary = {
+                    "meta": {
+                        "epoch_name": epoch_name,
+                        "checkpoint": self.checkpoint,
+                        "loss_name": self.loss_name,
+                        "use_mc": bool(self.use_mc_sampling),
+                        "num_frames": len(loader) * loader.batch_size,
+                    },
+                    # IoU
+                    "iou_confmat": self.iou_evaluator.confmat.detach().cpu(),
+                    # ECE
+                    "ece_conf": getattr(self.ece_eval, "_conf", torch.empty(0)).detach().cpu()
+                                  if hasattr(self.ece_eval, "_conf") else None,
+                    "ece_correct": getattr(self.ece_eval, "_correct", torch.empty(0, dtype=torch.uint8)).detach().cpu()
+                                     if hasattr(self.ece_eval, "_correct") else None,
+                    # AUROC
+                    "auroc_scores": getattr(self.auroc_eval, "_scores", torch.empty(0)).detach().cpu()
+                                       if hasattr(self.auroc_eval, "_scores") else None,
+                    "auroc_is_error": getattr(self.auroc_eval, "_is_error", torch.empty(0, dtype=torch.uint8)).detach().cpu()
+                                        if hasattr(self.auroc_eval, "_is_error") else None,
+                    # AUROC (MI)
+                    "auroc_mi_scores": getattr(self.auroc_eval_mi, "_scores", torch.empty(0)).detach().cpu()
+                                           if hasattr(self.auroc_eval_mi, "_scores") else None,
+                    "auroc_mi_is_error": getattr(self.auroc_eval_mi, "_is_error", torch.empty(0, dtype=torch.uint8)).detach().cpu()
+                                            if hasattr(self.auroc_eval_mi, "_is_error") else None,
+                    # UA aggregator
+                    "ua_uncert": getattr(self.ua_agg, "_uncert", torch.empty(0)).detach().cpu()
+                                   if hasattr(self.ua_agg, "_uncert") else None,
+                    "ua_correct": getattr(self.ua_agg, "_correct", torch.empty(0, dtype=torch.uint8)).detach().cpu()
+                                    if hasattr(self.ua_agg, "_correct") else None,
+                    # Per-class uncertainty for ridgeline plots
+                    "unc_values": [v.detach().cpu() for v in getattr(self.unc_agg, "_values", [])],
+                    "unc_seen_counts": list(getattr(self.unc_agg, "_seen_counts", [])),
+                }
+                torch.save(summary, summary_file)
+                print(f"✅ Saved outputs summary to {summary_file}")
+            except Exception as e:
+                print(f"[Tester] WARNING: Failed to save summary file.\n{e}")
+
         self.save_results(result_dict, out_dir)
         
         if self.use_mc_sampling or self.loss_name=="Dirichlet":
@@ -526,11 +665,11 @@ class Tester:
             )
             
             # ECE plot
-            ece_value, _ = self.ece_eval.compute(
+            (ece, mce), ece_stats, fig_ece = self.ece_eval.compute(
                 save_plot_path=os.path.join(out_dir, f"ece_epoch_{epoch_name}.png"),
                 title=f"Reliability (epoch {epoch_name})"
             )
-            print(f"Epoch {epoch} ECE: {ece_value:.4f}")
+            print(f"Epoch {epoch} ECE: {ece:.4f}, MCE: {mce:.4f}")
             
             # AUROC
                 # sanity check, after auroc_eval.compute(), before reset
@@ -541,17 +680,17 @@ class Tester:
             print("mean(score|error):   ", scores[errs].mean(),  "±", scores[errs].std())
             print("mean(score|correct): ", scores[~errs].mean(), "±", scores[~errs].std())
             
-            auroc, _ = self.auroc_eval.compute(
+            auroc, _, fig_auroc = self.auroc_eval.compute(
                 save_plot_path=os.path.join(out_dir, f"roc_epoch_{epoch_name}.png"),
                 title=f"Error detection ROC (epoch {epoch_name})"
             )
             print(f"Epoch {epoch} AUROC: {auroc:.4f}")
-            
-        # reset aggregators
-        self.ece_eval.reset()
-        self.ua_agg.reset()
-        self.auroc_eval.reset()
-        
+            # AUROC (Epistemic MI)
+            auroc_mi, _, fig_auroc_mi = self.auroc_eval_mi.compute(
+                save_plot_path=os.path.join(out_dir, f"roc_mi_epoch_{epoch_name}.png"),
+                title=f"Error detection ROC (MI, epoch {epoch_name})"
+            )
+            print(f"Epoch {epoch} AUROC (MI): {auroc_mi:.4f}")
 
         #--> IoU vs thresholded predictive uncertainty
         # self.unc_agg.plot_boxplot(
