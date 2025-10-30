@@ -1,2 +1,5 @@
 /docker/user.env
 /data/
+__pycache__/
+*.pyc
+src/legacy/
