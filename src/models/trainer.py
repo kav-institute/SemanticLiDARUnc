@@ -333,12 +333,11 @@ class Trainer:
             self.crit_digamma_ce = DigammaDirichletCE(ignore_index=self.ignore_index)
             self.criterion_lovasz = LovaszSoftmaxStable(ignore_index=self.ignore_index)
             
-            # Regualarizers
+            # Regularizers
             from losses.regularizers import KL_offClasses_to_uniform
-            self.crit_kl = KL_offClasses_to_uniform(ignore_index=self.ignore_index, gamma=1.0)
+            self.crit_kl = KL_offClasses_to_uniform(ignore_index=self.ignore_index)
             self.crit_comp = ComplementKLUniform(ignore_index=self.ignore_index, gamma=1.25, tau=0.65, sigma=0.15,   # gamma=2.0, tau=0.55, sigma=0.12
                                     s_target=None, normalize=True)
-            
             
             # loss weights
             defaults = dict(w_nll=1.0, 
@@ -737,9 +736,9 @@ class Trainer:
                         kl_cap_ratio = _cosine_share_cap(
                             self.global_step,
                             self.total_train_steps,
-                            cap_start=0.1,  # gentle at start 10% share
-                            cap_end=0.3,   # allow up to 30% share later
-                            hold_frac=0.15  # hold low cap for first 15% of training, a bit longer than warmup
+                            cap_start=0.15,  # gentle at start 10% share
+                            cap_end=0.15,   # allow up to 30% share later
+                            hold_frac=1.0  # hold low cap for first 15% of training, a bit longer than warmup
                         )
 
                         w_kl_final = _apply_share_cap_vs_reference(

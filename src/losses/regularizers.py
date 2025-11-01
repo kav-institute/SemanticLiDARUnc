@@ -296,10 +296,14 @@ class KL_offClasses_to_uniform(nn.Module):
     
     def __init__(self,
                  ignore_index: Optional[int] = None,
+                 with_conf_weighting: bool = False,
+                 gamma: float = 1.0,
                  eps: float=1e-8):
         super().__init__()
         self.ignore_index = ignore_index
         self.eps = eps
+        self.with_conf_weighting = with_conf_weighting
+        self.gamma = gamma
     
     @staticmethod
     def _dirichlet_kl_to_uniform(alpha_tilde: torch.Tensor,
@@ -314,6 +318,13 @@ class KL_offClasses_to_uniform(nn.Module):
         Formula:
         KL = logGamma(sum_k a_k) - sum_k logGamma(a_k)
             + sum_k (a_k - 1) * (digamma(a_k) - digamma(sum_k a_k))
+
+        Additionally multiplies the per-pixel off-class Dirichlet KL by an
+        error-aware weight:
+            w_i = (1 - p_hat_y[i]) ** gamma
+        where p_hat_y = alpha_y / sum_k alpha_k.
+        Effect: focus KL pressure on wrong/uncertain pixels and back off when the
+        model is confident-and-correct. gamma > 1.0 increases the focus on uncertain pixels.
 
         returns kl_per_sample: [N]
         """
@@ -359,6 +370,20 @@ class KL_offClasses_to_uniform(nn.Module):
         
         kl_each = self._dirichlet_kl_to_uniform(alpha_tilde_flat,
                                             eps=self.eps)  # [N_valid]
-        kl_mean = kl_each.mean()                          # scalar
+
+        # ---- compute per-pixel weight w = (1 - p_hat_y)**gamma ----
+        if self.with_conf_weighting:
+            a0 = alpha.sum(dim=1, keepdim=True)                     # [B,1,H,W]
+            p_hat = alpha / (a0 + self.eps)                         # [B,C,H,W]
+            p_hat_y = p_hat.gather(1, target.unsqueeze(1)).squeeze(1)  # [B,H,W]
+            one_minus = (1.0 - p_hat_y).clamp(0.0, 1.0)
+            w_pix = one_minus ** self.gamma                         # [B,H,W]
+            # match weights to flattened valid pixels
+            w_flat = w_pix.view(B, -1)[valid_flat].reshape(-1)      # [N_valid]
+            w_flat = w_flat.detach()                             # no grad on weighting
+        
+            kl_mean = (kl_each * w_flat).sum() / w_flat.sum().clamp_min(1.0) 
+        else:
+            kl_mean = kl_each.mean()
 
         return kl_mean
